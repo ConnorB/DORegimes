@@ -1,0 +1,3 @@
+[submodule "Data/EXO_QAQC"]
+	path = Data/EXO_QAQC
+	url = git@github.com:AIMS-Project/EXO_QAQC.git

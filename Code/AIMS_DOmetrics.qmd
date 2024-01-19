@@ -1,0 +1,298 @@
+---
+title: "DO Metrics"
+author: "CLB"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+library(data.table)
+library(tidyverse, warn.conflicts = F)
+options(readr.show_col_types = F)
+library(googlesheets4)
+library(ggthemes)
+library(ggpmisc)
+library(here)
+library(styler)
+library(streamMetabolizer)
+library(rstan)
+options(mc.cores = parallel::detectCores())
+library(dataRetrieval)
+library(scales)
+library(knitr)
+library(lubridate)
+library(zoo)
+library(nasapower)
+library(imputeTS)
+library(rgbif)
+```
+
+## SF Kings Creek
+
+```{r}
+#Path to QAQC pipeline
+datPath <- here("Data/EXO_QAQC/01_data/04_postQaqc/KMZ/")
+#List qaqc files
+datPath <- list.files(datPath, "*.csv", full.names = T, recursive = T)
+#Read in csvs from aims-exo-qaqc repo
+kmzDat <- rbindlist(sapply(datPath, fread, simplify = F, colClasses = c("timestamp" = "character")), idcol = "exportFile")
+#Clean up
+kmzDat <- kmzDat %>% 
+  select(-exportFile, -parameterId, -yearMonth) %>% 
+  filter(betaQfSd == 0 & wetQf == 0) %>% 
+  rename(dateTime = timestamp) %>% 
+  select(dateTime, parameterName, value) %>% 
+  mutate(dateTime = parse_date_time(dateTime, orders = c("ymd HMS", "mdy HM"), tz = "UTC")) %>% 
+  pivot_wider(names_from = parameterName, values_from = value) %>% 
+  select(dateTime, starts_with("ODO"), starts_with("Temp"), starts_with("SW_Level")) %>%
+  mutate(across(where(is.numeric), ~ replace(.x, .x < 0.01, NA))) %>% 
+  select(!(where(is.numeric) & where(~ all(is.na(.x)))))
+
+kmzDat <- kmzDat %>% 
+  select(-`ODOSat_%`, -`Temp_s-can_C`) %>% 
+  rename(DO.obs = ODO_mg_L, temp.water = Temp_EXO_C)
+
+#Lets check and fix the DF timesteps
+#Date and time sequence running every 10 minutes
+timeSeq <- seq(as.POSIXct(min(as_date(kmzDat$dateTime)), tz = "UTC"),
+                as.POSIXct(max(as_date(kmzDat$dateTime)), tz = "UTC"),
+                by = ("10 min"))
+  
+# simply a data frame of date and time running the course of the data set
+timeSeq <- data.frame(dateTime = timeSeq)
+
+#merge the time df
+kmzDat <- merge(timeSeq, kmzDat, by = "dateTime", all = T) %>% 
+  mutate(Site = "KMZ",
+         solar.time = convert_UTC_to_solartime(dateTime, longitude = -96.587238, time.type = "mean solar"),
+         isDaytime = calc_is_daytime(dateTime, 39.092353))
+
+##NASA Dat
+kmzLat <- 39.092353
+kmzLong <- -96.587238
+kmzElev <- 351.4344
+
+sDate <- as_date(min(kmzDat$dateTime)) -1
+eDate <- as_date(max(kmzDat$dateTime)) +1
+#download from nasa power
+kmzBP <- get_power(
+  community = "sb",
+  pars = c("PSC"),
+  temporal_api = "hourly",
+  lonlat = c(kmzLong, kmzLat),
+  dates = c(sDate, eDate),
+  site_elevation = kmzElev,
+  time_standard = "UTC")
+
+# add zeros to hour col to go from 1 to 01
+kmzBP$Hour <- str_pad(kmzBP$HR, 2, side = "left", pad = 0)
+#Merge YEAR, MO, DY, and Hour col to dateTime
+kmzBP <- kmzBP %>% 
+  unite(dateTime, YYYYMMDD, Hour, sep = " ") 
+#Fix timestamp and convert to datetime
+kmzBP$dateTime <- paste0(kmzBP$dateTime, ":00:00")
+kmzBP$dateTime <- as_datetime(kmzBP$dateTime)
+
+#Convert kilopascals to millibar
+kmzBP$BP <- kmzBP$PSC * 10
+
+#Date and time sequence running every 15 minutes
+date_seq <- seq(as.POSIXct(min(kmzBP$dateTime), tz = "UTC"),
+                  as.POSIXct(max(kmzBP$dateTime), tz = "UTC"),
+                  by = ("10 min"))
+# simply a data frame of date and time running the course of the data set
+min.fill <- data.frame(dateTime = date_seq)
+kmzBP <- merge(min.fill, kmzBP, all.x = T)
+#Interp Gaps
+kmzBP$BP <- na.approx(kmzBP$BP, na.rm = F, maxgap = 5) 
+
+kmzBP <- kmzBP %>% 
+  select(dateTime, BP)
+kmzDat <- kmzDat %>% 
+  left_join(kmzBP, by = "dateTime")
+```
+
+## Shane Creek
+
+```{r}
+#Path to QAQC pipeline
+datPath <- here("Data/EXO_QAQC/01_data/04_postQaqc/SHN/")
+#List qaqc files
+datPath <- list.files(datPath, "*.csv", full.names = T, recursive = T)
+#Read in csvs from aims-exo-qaqc repo
+shnDat <- rbindlist(sapply(datPath, fread, simplify = F, colClasses = c("timestamp" = "character")), idcol = "exportFile")
+
+#Long to wide and clean up
+shnDat <- shnDat %>% 
+  filter(alphaQf == 0 & betaQfSd == 0) %>% 
+  rename(dateTime = timestamp) %>% 
+  select(dateTime, parameterName, value) %>% 
+  mutate(dateTime = parse_date_time(dateTime, orders = c("ymd HMS"), tz = "UTC")) %>% 
+  pivot_wider(names_from = parameterName, values_from = value) %>% 
+  select(dateTime, Temp_EXO_C, ODO_mg_L, SW_Level_ft) %>% 
+  rename(DO.obs = ODO_mg_L, temp.water = Temp_EXO_C) %>% 
+  filter(DO.obs > 0)
+
+#Lets check and fix the DF timesteps
+#Date and time sequence running every 10 minutes
+timeSeq <- seq(as.POSIXct(min(as_date(shnDat$dateTime)), tz = "UTC"),
+                as.POSIXct(max(as_date(shnDat$dateTime)), tz = "UTC"),
+                by = ("10 min"))
+  
+# simply a data frame of date and time running the course of the data set
+timeSeq <- data.frame(dateTime = timeSeq)
+
+#merge the time df
+shnDat <- merge(timeSeq, shnDat, by = "dateTime", all = T)
+
+shnDat <- shnDat %>%
+  mutate(DO.obs = na.approx(DO.obs, maxgap = 6),
+         temp.water = na.approx(temp.water, maxgap = 6),
+         SW_Level_ft = na.approx(SW_Level_ft, maxgap = 6),
+         Site = "SHN",
+         solar.time = convert_UTC_to_solartime(dateTime, longitude = -96.558380, time.type = "mean solar"),
+         isDaytime = calc_is_daytime(dateTime, 39.115220)) %>%
+  right_join(timeSeq, by = "dateTime") %>% 
+  drop_na(DO.obs)
+
+##NASA Dat
+shnLat <- 39.115220
+shnLong <- -96.558380
+shnCoords <- elevation(latitude = shnLat, longitude = shnLong, username = "conbro")
+
+sDate <- as_date(min(shnDat$dateTime)) -1
+eDate <- as_date(max(shnDat$dateTime)) +1
+#download from nasa power
+shnBP <- get_power(
+  community = "sb",
+  pars = c("PSC"),
+  temporal_api = "hourly",
+  lonlat = c(shnLong, shnLat),
+  dates = c(sDate, eDate),
+  site_elevation = shnCoords$elevation_geonames,
+  time_standard = "UTC")
+
+# add zeros to hour col to go from 1 to 01
+shnBP$Hour <- str_pad(shnBP$HR, 2, side = "left", pad = 0)
+#Merge YEAR, MO, DY, and Hour col to dateTime
+shnBP <- shnBP %>% 
+  unite(dateTime, YYYYMMDD, Hour, sep = " ") 
+#Fix timestamp and convert to datetime
+shnBP$dateTime <- paste0(shnBP$dateTime, ":00:00")
+shnBP$dateTime <- as_datetime(shnBP$dateTime)
+
+#Convert kilopascals to millibar
+shnBP$BP <- shnBP$PSC * 10
+
+#Date and time sequence running every 15 minutes
+date_seq <- seq(as.POSIXct(min(shnBP$dateTime), tz = "UTC"),
+                  as.POSIXct(max(shnBP$dateTime), tz = "UTC"),
+                  by = ("10 min"))
+# simply a data frame of date and time running the course of the data set
+min.fill <- data.frame(dateTime = date_seq)
+shnBP <- merge(min.fill, shnBP, all.x = T)
+#Interp Gaps
+shnBP$BP <- na.approx(shnBP$BP, na.rm = F, maxgap = 5) 
+
+shnBP <- shnBP %>% 
+  select(dateTime, BP)
+shnDat <- shnDat %>% 
+  left_join(shnBP, by = "dateTime")
+```
+
+## Merge Sites
+
+```{r}
+doDat <- merge(kmzDat, shnDat, all = T) %>% 
+  drop_na(DO.obs) %>% 
+  mutate(DO.sat = calc_DO_sat(
+      temp.water = temp.water,
+      pressure.air = BP,
+      model = "garcia-benson"
+    ),
+    DO.pctsat = (DO.obs/DO.sat)*100)
+```
+
+## Calc DO Metrics
+
+```{r}
+# Daily metrics
+dailyDO <- doDat %>% 
+  mutate(Date = floor_date(dateTime, "1 day")) %>%
+  group_by(Date, Site) %>%
+  summarize(
+    minDO.obs = min(DO.obs, na.rm = T),
+    maxDO.obs = max(DO.obs, na.rm = T),
+    minDO.sat = min(DO.sat, na.rm = T),
+    maxDO.sat = max(DO.sat, na.rm = T),
+    minDO.pctsat = min(DO.pctsat, na.rm = T),
+    maxDO.pctsat = max(DO.pctsat, na.rm = T),
+    avgDO.obs = mean(DO.obs, na.rm = T),
+    avgDO.sat = mean(DO.sat, na.rm = T),
+    avgDO.pctsat = mean(DO.pctsat, na.rm = T)
+    ) %>% 
+  mutate(DO.amp = maxDO.obs - minDO.obs,
+         DOsat.amp = maxDO.sat - minDO.sat,
+         DOpctsat.amp = maxDO.pctsat - minDO.pctsat)
+
+#Prob of hypoxia
+probHyp <- doDat %>% 
+  group_by(Site) %>% 
+  summarise(totalDO = n(),
+            DO.hyp = sum(DO.obs <= 2, na.rm = T)) %>% 
+  mutate(prHyp = DO.hyp / totalDO)
+
+nightHypRat <- doDat %>% 
+  group_by(Site, isDaytime) %>% 
+  summarise(DO.hyp = sum(DO.obs <= 2, na.rm = T)) %>% 
+  pivot_wider(names_from = isDaytime, values_from = DO.hyp, names_prefix = "DO_hyp_") %>%
+  rename(DayHyp = DO_hyp_TRUE, NightHyp = DO_hyp_FALSE) %>% 
+  mutate(NHR = NightHyp / DayHyp)
+```
+
+## Figures
+
+```{r}
+dailyDO %>%
+  ggplot(aes(x = avgDO.obs, fill = Site)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_brewer(palette = "Dark2") +
+  geom_vline(xintercept = 2, linetype = "dashed") +
+  labs(x = "DO (mg/L)", y = "Density") +
+  theme_few() +
+  theme(legend.title = element_blank(), legend.position = "bottom")
+
+dailyDO %>%
+  ggplot(aes(x = avgDO.pctsat, fill = Site)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_brewer(palette = "Dark2") +
+  geom_vline(xintercept = 2, linetype = "dashed") +
+  labs(x = "DO (mg/L)", y = "Density") +
+  theme_few() +
+  theme(legend.title = element_blank(), legend.position = "bottom")
+
+doDat %>%
+  ggplot(aes(x = DO.obs, fill = isDaytime)) +
+  geom_density(alpha = 0.7) +
+  scale_fill_manual(breaks = c("TRUE", "FALSE"),
+                    labels = c("Daytime", "Nighttime"),
+                    values = c("#FFA726", "#0D47A1")) +
+  geom_vline(xintercept = 2, linetype = "dashed") +
+  labs(x = "DO (mg/L)", y = "Density") +
+  theme_few() +
+  theme(legend.title = element_blank(), legend.position = "bottom") +
+  facet_wrap(~Site, ncol = 2)
+
+doDat %>%
+  ggplot(aes(x = DO.obs, fill = isDaytime)) +
+  geom_density(alpha = 0.7) +
+  scale_fill_manual(breaks = c("TRUE", "FALSE"),
+                    labels = c("Daytime", "Nighttime"),
+                    values = c("#FFA726", "#0D47A1")) +
+  geom_vline(xintercept = 2, linetype = "dashed") +
+  labs(x = "DO (mg/L)", y = "Density") +
+  theme_few() +
+  theme(legend.title = element_blank(), legend.position = "bottom") +
+  facet_wrap(~Site, ncol = 2)
+```
