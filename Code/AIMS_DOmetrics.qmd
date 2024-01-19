@@ -251,6 +251,15 @@ nightHypRat <- doDat %>%
   mutate(NHR = NightHyp / DayHyp)
 ```
 
+### Use 50% Sat for Hypoxia
+
+```{r}
+hpyPercSat <- doDat %>% 
+  filter(DO.pctsat <= 50) %>% 
+  group_by(Site) %>% 
+  summarise(AvgDO_50pctSat = mean(DO.obs, na.rm = T))
+```
+
 ## Figures
 
 ```{r}
@@ -267,8 +276,17 @@ dailyDO %>%
   ggplot(aes(x = avgDO.pctsat, fill = Site)) +
   geom_density(alpha = 0.5) +
   scale_fill_brewer(palette = "Dark2") +
-  geom_vline(xintercept = 2, linetype = "dashed") +
-  labs(x = "DO (mg/L)", y = "Density") +
+  geom_vline(xintercept = 50, linetype = "dashed") +
+  labs(x = "DO % Sat", y = "Density") +
+  theme_few() +
+  theme(legend.title = element_blank(), legend.position = "bottom")
+
+dailyDO %>%
+  ggplot(aes(x = DOpctsat.amp, fill = Site)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_brewer(palette = "Dark2") +
+  #geom_vline(xintercept = 50, linetype = "dashed") +
+  labs(x = "DO % Sat Daily Amplitude", y = "Density") +
   theme_few() +
   theme(legend.title = element_blank(), legend.position = "bottom")
 
@@ -285,14 +303,25 @@ doDat %>%
   facet_wrap(~Site, ncol = 2)
 
 doDat %>%
-  ggplot(aes(x = DO.obs, fill = isDaytime)) +
+  ggplot(aes(x = DO.pctsat, fill = isDaytime)) +
   geom_density(alpha = 0.7) +
   scale_fill_manual(breaks = c("TRUE", "FALSE"),
                     labels = c("Daytime", "Nighttime"),
                     values = c("#FFA726", "#0D47A1")) +
-  geom_vline(xintercept = 2, linetype = "dashed") +
-  labs(x = "DO (mg/L)", y = "Density") +
+  geom_vline(xintercept = 50, linetype = "dashed") +
+  labs(x = "DO % Sat", y = "Density") +
   theme_few() +
   theme(legend.title = element_blank(), legend.position = "bottom") +
   facet_wrap(~Site, ncol = 2)
+
+doDat %>%
+  ggplot(aes(x = DO.pctsat, fill = isDaytime)) +
+  geom_density(alpha = 0.7) +
+  scale_fill_manual(breaks = c("TRUE", "FALSE"),
+                    labels = c("Daytime", "Nighttime"),
+                    values = c("#FFA726", "#0D47A1")) +
+  geom_vline(xintercept = 50, linetype = "dashed") +
+  labs(x = "DO % Sat", y = "Density") +
+  theme_few() +
+  theme(legend.title = element_blank(), legend.position = "bottom")
 ```
