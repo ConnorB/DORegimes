@@ -1,0 +1,190 @@
+---
+title: "USGS DO and Hydro Metrics"
+author: "CLB"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+library(data.table)
+library(tidyverse, warn.conflicts = F)
+options(readr.show_col_types = F)
+library(googlesheets4)
+library(ggthemes)
+library(ggpmisc)
+library(here)
+library(styler)
+library(streamMetabolizer)
+library(rstan)
+options(mc.cores = parallel::detectCores())
+library(dataRetrieval)
+library(scales)
+library(knitr)
+library(lubridate)
+library(zoo)
+library(nasapower)
+library(imputeTS)
+library(rgbif)
+library(foreach)
+library(doParallel)
+```
+
+# Find Data
+
+```{r}
+# Get site data from USGS
+usgsSites <- readNWISsite(c("02264000","02266200","08052700","11128500")) %>%
+  transmute(site_no,
+            siteName = case_when(
+              site_no == "02264000" ~ "Cypress Creek",
+              site_no == "02266200" ~ "Whittenhorse Creek",
+              site_no == "08052700" ~ "Little Elm Creek",
+              site_no == "11128500" ~ "Santa Ynez River"),
+            lat = dec_lat_va,
+            long = dec_long_va,
+            elev = alt_va * 0.3048, # ft to m
+            drain_area_va = drain_area_va / 0.38610216) # sqmi to sqkm
+
+# Get start and end dates from USGS
+avalDat <- whatNWISdata(siteNumber = usgsSites$site_no, parameterCd = "00300", service = "uv") %>%
+  transmute(site_no,
+            startDate = begin_date,
+            endDate = end_date)
+
+usgsSites <- left_join(usgsSites, avalDat, by = "site_no")
+```
+
+# Download
+
+```{r}
+#Leaves one core free for system use
+registerDoParallel(cores = detectCores() - 1)
+
+usgsRaw <- foreach(i=1:nrow(usgsSites), .combine='rbind', .packages=c("dataRetrieval")) %dopar% {
+  parameterCd <- c("00060")
+  tempDat <- readNWISdv(usgsSites$site_no[i], parameterCd, usgsSites$startDate[i], usgsSites$endDate[i])
+  #Rename cols to make sense
+  tempDat <- renameNWISColumns(tempDat)
+  return(tempDat)
+}
+#Stop cluster
+stopImplicitCluster()
+
+
+usgsDat <- usgsRaw %>% 
+    transmute(Date,
+              numDate = as.numeric(Date),
+              site_no,
+              siteName = case_when(
+                site_no == "02264000" ~ "Cypress Creek",
+                site_no == "02266200" ~ "Whittenhorse Creek",
+                site_no == "08052700" ~ "Little Elm Creek",
+                site_no == "11128500" ~ "Santa Ynez River"),
+              Q_cms = Flow * 0.028316847) %>% # Convert CFS to CMS
+  drop_na()
+```
+
+```{r}
+ggplot(usgsDat, aes(Date, Q_cms))+
+  geom_line(color = "#0000FF") +
+  labs(y = expression(Discharge~("m"^3*"s"^{-1})))+
+  theme_few()+
+  scale_x_date()+
+  theme(axis.title.x = element_blank(),
+        legend.position = "none",
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))+
+  facet_wrap(~siteName, ncol=2, scales = "free")
+```
+
+```{r}
+# 1. Dry-down Duration
+dryDownDur <- usgsDat %>% 
+  group_by(site_no) %>%
+  mutate(peakFlow = Q_cms > quantile(Q_cms, 0.25, na.rm = T)) %>%
+  arrange(numDate) %>%
+  mutate(noFlow = Q_cms <= 0, 
+         time2NoFlow = ifelse(noFlow, numDate, NA)) %>%
+  fill(time2NoFlow, .direction = "updown") %>%
+  filter(peakFlow) %>%
+  mutate(drydownDuration = time2NoFlow - numDate) %>%
+  summarise(meanDuration = mean(drydownDuration, na.rm = T))
+
+# 2. Drying Rate
+dryingRate <- usgsDat %>%  
+  group_by(site_no) %>%
+  mutate(logQ = log(Q_cms + 0.01),
+         dQ = c(NA, diff(Q_cms)), 
+         dt = c(NA, diff(Date))) %>%
+  filter(!is.na(dQ) & dQ < 0) %>%
+  mutate(dQ_dt = -dQ / dt) %>%
+  summarise(drying_rate = lm(log(dQ_dt) ~ logQ)$coefficients[2])
+
+
+# 3. No-Flow Duration
+noQDur <- usgsDat %>% 
+  group_by(site_no) %>%
+  mutate(no_flow = Q_cms <= 0, 
+         no_flow_group = cumsum(c(0, diff(no_flow) != 0))) %>%
+  filter(no_flow) %>%
+  group_by(no_flow_group) %>%
+  summarise(duration = n()) %>%
+  ungroup() %>%
+  summarise(mean_duration = mean(duration))
+
+# 4. Antecedent Peak Quantile
+APQ <- usgsDat %>% 
+  group_by(site_no) %>%
+  mutate(peak = Q_cms > lag(Q_cms) & Q_cms > lead(Q_cms),
+         no_flow = Q_cms <= 0) %>%
+  arrange(Date) %>%
+  fill(no_flow, .direction = "up") %>%
+  filter(peak & no_flow) %>%
+  summarise(antecedent_peak_quantile = quantile(Q_cms, probs = 0.25, na.rm = TRUE))
+
+# 5. No-Flow Start Date
+nfStartDate <- usgsDat %>% 
+  group_by(site_no) %>%
+  mutate(no_flow = Q_cms <= 0) %>%
+  filter(no_flow) %>%
+  summarise(start_date = min(Date))
+
+
+```
+
+```{r}
+# Define the 25% quantile for each site
+quantile_25 <- usgsDat %>% 
+  group_by(site_no) %>% 
+  summarise(Q_25 = quantile(Q_cms, probs = 0.25))
+
+# Join the quantile back to the main dataframe
+usgsDat <- left_join(usgsDat, quantile_25, by = "site_no")
+
+# Identify peaks
+usgsDat <- usgsDat %>% 
+  group_by(site_no) %>%
+  mutate(peak = ifelse(Q_cms >= Q_25, 1, 0))
+
+# Calculate metrics for each peak
+# Note: This assumes 'no flow' is represented as 0 in Q_cms
+results <- usgsDat %>% 
+  group_by(site_no) %>%
+  mutate(
+    # 1. Dry-down duration
+    dry_down_duration = ifelse(peak == 1, lead(which(Q_cms == 0)) - which(Q_cms == max(Q_cms)), NA),
+
+    # 2. Drying rate - Calculated later due to complexity
+
+    # 3. No-flow duration
+    no_flow_duration = ifelse(Q_cms == 0, 1, 0),
+    no_flow_duration = sum(no_flow_duration),
+
+    # 4. Antecedent peak quantile
+    antecedent_peak_quantile = lag(Q_cms[which(Q_cms == max(Q_cms))]),
+
+    # 5. No-flow start date
+    no_flow_start_date = min(Date[which(Q_cms == 0)])
+  ) %>%
+  ungroup()
+```
