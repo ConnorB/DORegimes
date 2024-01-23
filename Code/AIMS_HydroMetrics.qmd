@@ -1,0 +1,154 @@
+---
+title: "AIMS_HydroMetrics"
+author: "CLB"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+library(data.table)
+library(tidyverse, warn.conflicts = F)
+options(readr.show_col_types = F)
+library(googlesheets4)
+library(ggthemes)
+library(ggpmisc)
+library(here)
+library(styler)
+library(streamMetabolizer)
+library(rstan)
+options(mc.cores = parallel::detectCores())
+library(dataRetrieval)
+library(scales)
+library(knitr)
+library(lubridate)
+library(zoo)
+library(nasapower)
+library(imputeTS)
+library(rgbif)
+```
+
+# Data
+
+## SF Kings Creek
+
+```{r}
+#Path to QAQC pipeline
+datPath <- here("Data/EXO_QAQC/01_data/04_postQaqc/KMZ/")
+#List qaqc files
+datPath <- list.files(datPath, "*.csv", full.names = T, recursive = T)
+#Read in csvs from aims-exo-qaqc repo
+kmzDat <- rbindlist(sapply(datPath, fread, simplify = F, colClasses = c("timestamp" = "character")), idcol = "exportFile")
+#Clean up
+kmzDat <- kmzDat %>% 
+  select(-exportFile, -parameterId, -yearMonth) %>% 
+  filter(betaQfSd == 0 & wetQf == 0) %>% 
+  rename(dateTime = timestamp) %>% 
+  select(dateTime, parameterName, value) %>% 
+  mutate(dateTime = parse_date_time(dateTime, orders = c("ymd HMS", "mdy HM"), tz = "UTC")) %>% 
+  pivot_wider(names_from = parameterName, values_from = value) %>% 
+  select(dateTime, SW_Level_ft) %>%
+  mutate(across(where(is.numeric), ~ replace(.x, .x < 0.01, NA))) %>% 
+  select(!(where(is.numeric) & where(~ all(is.na(.x)))))
+
+#Lets check and fix the DF timesteps
+#Date and time sequence running every 10 minutes
+timeSeq <- seq(as.POSIXct(min(as_date(kmzDat$dateTime)), tz = "UTC"),
+                as.POSIXct(max(as_date(kmzDat$dateTime)), tz = "UTC"),
+                by = ("10 min"))
+  
+# simply a data frame of date and time running the course of the data set
+timeSeq <- data.frame(dateTime = timeSeq)
+
+#merge the time df
+kmzDat <- merge(timeSeq, kmzDat, by = "dateTime", all = T) %>% 
+  mutate(SW_Level_ft = na.approx(SW_Level_ft, maxgap = 6),
+         Site = "KMZ",
+         solar.time = convert_UTC_to_solartime(dateTime, longitude = -96.587238, time.type = "mean solar"),
+         isDaytime = calc_is_daytime(dateTime, 39.092353))
+```
+
+## Shane Creek
+
+```{r}
+#Path to QAQC pipeline
+datPath <- here("Data/EXO_QAQC/01_data/04_postQaqc/SHN/")
+#List qaqc files
+datPath <- list.files(datPath, "*.csv", full.names = T, recursive = T)
+#Read in csvs from aims-exo-qaqc repo
+shnDat <- rbindlist(sapply(datPath, fread, simplify = F, colClasses = c("timestamp" = "character")), idcol = "exportFile")
+
+#Long to wide and clean up
+shnDat <- shnDat %>% 
+  filter(alphaQf == 0 & betaQfSd == 0) %>% 
+  rename(dateTime = timestamp) %>% 
+  select(dateTime, parameterName, value) %>% 
+  mutate(dateTime = parse_date_time(dateTime, orders = c("ymd HMS"), tz = "UTC")) %>% 
+  filter(dateTime > "2023-03-24" & dateTime < "2023-06-30") %>% 
+  pivot_wider(names_from = parameterName, values_from = value) %>% 
+  select(dateTime, SW_Level_ft) %>% 
+  mutate(SW_Level_cor = 0.99754 * SW_Level_ft + 0.21948)
+
+#Lets check and fix the DF timesteps
+#Date and time sequence running every 10 minutes
+timeSeq <- seq(as.POSIXct(min(as_date(shnDat$dateTime)), tz = "UTC"),
+                as.POSIXct(max(as_date(shnDat$dateTime)), tz = "UTC"),
+                by = ("10 min"))
+  
+# simply a data frame of date and time running the course of the data set
+timeSeq <- data.frame(dateTime = timeSeq)
+
+#merge the time df
+shnDat <- merge(timeSeq, shnDat, by = "dateTime", all = T)
+
+shnDat <- shnDat %>%
+  mutate(SW_Level_cor = na.approx(SW_Level_cor, maxgap = 6),
+         Site = "SHN",
+         solar.time = convert_UTC_to_solartime(dateTime, longitude = -96.558380, time.type = "mean solar"),
+         isDaytime = calc_is_daytime(dateTime, 39.115220)) %>%
+  right_join(timeSeq, by = "dateTime")
+```
+
+## Get Rating Curve 
+
+```{r}
+#KMZ
+kmzRC <- read_sheet("https://docs.google.com/spreadsheets/d/1DkF2Ugr6tEgnZHOGJ_UY2kW9JWH4ce8xbyzSyyA6-CI/edit#gid=0", col_types = "cDcddddddddcccc") %>% 
+  filter(SiteName %in% c("SFM01") & Quality %in% c("Maybe", "Good")) %>% 
+  drop_na(ManualStage_ft) %>% 
+  lm(log(Q_Ls) ~ log(ManualStage_ft), .)
+summary(kmzRC)
+kmzRC <- coef(kmzRC)
+
+kmzDat <- kmzDat %>% 
+  mutate(Q_Ls = (kmzRC[["log(ManualStage_ft)"]] * SW_Level_ft) + kmzRC[["(Intercept)"]])
+
+#SHN
+shnRC <- read_sheet("https://docs.google.com/spreadsheets/d/1DkF2Ugr6tEgnZHOGJ_UY2kW9JWH4ce8xbyzSyyA6-CI/edit#gid=0", col_types = "cDcddddddddcccc") %>% 
+  filter(SiteName %in% c("SHM01") & Quality %in% c("Maybe", "Good")) %>% 
+  drop_na(ManualStage_ft) %>% 
+  lm(Q_Ls ~ ManualStage_ft, .)
+summary(shnRC)
+shnRC <- coef(shnRC)
+
+shnDat <- shnDat %>% 
+  mutate(Q_Ls = (shnRC[["ManualStage_ft"]] * SW_Level_cor) + shnRC[["(Intercept)"]])
+```
+
+```{r}
+ggplot(kmzDat, aes(dateTime, Q_Ls))+
+  geom_line() +
+  labs(title = "Kings Creek Discharge",
+       y = expression(Discharge~("L s"^{-1})))+
+  theme_bw()+
+  theme(text = element_text(size = 15), axis.title.x = element_blank())+
+  scale_x_datetime()
+
+ggplot(shnDat, aes(dateTime, Q_Ls))+
+  geom_line() +
+  labs(title = "Shane Creek Discharge",
+       y = expression(Discharge~("L s"^{-1})))+
+  theme_bw()+
+  theme(text = element_text(size = 15), axis.title.x = element_blank())+
+  scale_x_datetime()
+```
