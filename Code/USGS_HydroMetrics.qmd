@@ -82,12 +82,63 @@ usgsDat <- usgsRaw %>%
                 site_no == "08052700" ~ "Little Elm Creek",
                 site_no == "11128500" ~ "Santa Ynez River"),
               Q_cms = Flow * 0.028316847) %>% # Convert CFS to CMS
-  drop_na()
+  drop_na() %>% 
+  mutate(Q_cms = round(Q_cms, 1))#Round to nearest tenth
+```
+
+## Find start of drying event
+
+```{r}
+usgsDat <- usgsDat %>%
+  mutate(
+    IsDry = Q_cms == 0,
+    PreviousIsDry = lag(IsDry, default = FALSE),
+    FlagDryStart = IsDry & !PreviousIsDry
+  )
+```
+
+## Price
+
+```{r}
+usgsDat %>%
+  ggplot(aes(Date, Q_cms)) +
+  geom_line(color = "#0000FF") +
+  ylab("Q (cms)") +
+  theme_few() +
+  geom_rect(data = usgsDat %>% filter(Q_cms <= 0), aes(xmin = Date, xmax = Date + 1, ymin = -Inf, ymax = +Inf),
+    fill = "#ff7f50",
+    alpha = 0.3) +
+  scale_x_date() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap( ~ siteName, scales = "free")
+```
+
+```{r}
+#Create new column with 25% quantile for peak id
+usgsDat <- usgsDat %>%
+  mutate(quant25 = if_else(Q_cms > quantile(Q_cms, 0.25), Q_cms, 0)) #25% quantile thresholds
+
+#Define peaks using slope break method
+usgsDat <- usgsDat %>% 
+  #Define forward and backward slope at each point
+  mutate(
+    slp_b = (quant25 - lag(quant25)) / (numDate - lag(numDate)), 
+    slp_f = (lead(quant25) - quant25) / (lead(numDate) - numDate)) %>% 
+  #now flag those derivative changes
+  mutate(peak_flag = if_else(slp_b > 0.0001 & slp_f<0, 1,0),
+         peak_flag = if_else(is.na(peak_flag), 0, peak_flag)) 
+
+#Define initiation of no flow
+usgsDat <- usgsDat %>%   
+  mutate(event_id = cumsum(peak_flag)+1) %>% #Define individual storm events
+  mutate(nf_start = if_else(Q_cms == 0 & lag(Q_cms) != 0, 1, 0)) #Flag initiation of no flow
 ```
 
 ```{r}
 ggplot(usgsDat, aes(Date, Q_cms))+
   geom_line(color = "#0000FF") +
+  geom_rect(data = usgsDat %>% filter(nf_start == 1), aes(xmin = Date, xmax = Date + 1, ymin = -Inf, ymax = +Inf), fill = "#ff7f50", alpha = 0.8)+
   labs(y = expression(Discharge~("m"^3*"s"^{-1})))+
   theme_few()+
   scale_x_date()+
@@ -95,7 +146,10 @@ ggplot(usgsDat, aes(Date, Q_cms))+
         legend.position = "none",
         axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))+
   facet_wrap(~siteName, ncol=2, scales = "free")
+
 ```
+
+## Trash?
 
 ```{r}
 # 1. Dry-down Duration

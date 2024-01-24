@@ -109,7 +109,7 @@ shnDat <- shnDat %>%
   right_join(timeSeq, by = "dateTime")
 ```
 
-## Get Rating Curve 
+## Get Rating Curve
 
 ```{r}
 #KMZ
