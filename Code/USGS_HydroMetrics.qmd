@@ -90,11 +90,31 @@ usgsDat <- usgsRaw %>%
 
 ```{r}
 usgsDat <- usgsDat %>%
+  group_by(siteName) %>% 
   mutate(
     IsDry = Q_cms == 0,
-    PreviousIsDry = lag(IsDry, default = FALSE),
-    FlagDryStart = IsDry & !PreviousIsDry
+    DryPeriod = cumsum(Q_cms != 0)
   )
+
+dryPeriods <- usgsDat %>%
+  filter(IsDry) %>%
+  group_by(siteName, DryPeriod) %>%
+  summarise(
+    StartDate = first(Date),
+    EndDate = last(Date),
+    NumberOfDryDays = n()
+  ) %>%
+  filter(NumberOfDryDays > 1)
+
+falseDryPeriods <- usgsDat %>%
+  filter(IsDry) %>%
+  group_by(siteName, DryPeriod) %>%
+  summarise(
+    StartDate = first(Date),
+    EndDate = last(Date),
+    NumberOfDryDays = n()
+  ) %>%
+  filter(NumberOfDryDays == 1)
 ```
 
 ## Price
