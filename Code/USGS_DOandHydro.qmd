@@ -1,0 +1,347 @@
+---
+title: "USGS DO Metrics"
+author: "CLB"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+library(data.table)
+library(tidyverse, warn.conflicts = F)
+options(readr.show_col_types = F)
+library(googlesheets4)
+library(ggthemes)
+library(ggpmisc)
+library(here)
+library(styler)
+library(streamMetabolizer)
+library(rstan)
+options(mc.cores = parallel::detectCores())
+library(dataRetrieval)
+library(scales)
+library(knitr)
+library(lubridate)
+library(zoo)
+library(nasapower)
+library(imputeTS)
+library(rgbif)
+library(foreach)
+library(doParallel)
+```
+
+# Find USGS Data
+
+```{r}
+# Get site data from USGS
+usgsSites <- readNWISsite(c("02264000","02266200","08052700","11128500")) %>%
+  transmute(site_no,
+            siteName = case_when(
+              site_no == "02264000" ~ "Cypress Creek",
+              site_no == "02266200" ~ "Whittenhorse Creek",
+              site_no == "08052700" ~ "Little Elm Creek",
+              site_no == "11128500" ~ "Santa Ynez River"),
+            lat = dec_lat_va,
+            long = dec_long_va,
+            elev = alt_va * 0.3048, # ft to m
+            drain_area_va = drain_area_va / 0.38610216) # sqmi to sqkm
+
+# Get start and end dates from USGS
+avalDat <- whatNWISdata(siteNumber = usgsSites$site_no, parameterCd = "00300", service = "uv") %>%
+  transmute(site_no,
+            startDate = begin_date,
+            endDate = end_date)
+
+usgsSites <- left_join(usgsSites, avalDat, by = "site_no")
+```
+
+## Download DO Data
+
+```{r}
+#Leaves one core free for system use
+registerDoParallel(cores = detectCores() - 1)
+
+usgsRaw <- foreach(i=1:nrow(usgsSites), .combine='rbind', .packages=c("dataRetrieval")) %dopar% {
+  parameterCd <- c("00300", "00010", "00060")
+  tempDat <- readNWISuv(usgsSites$site_no[i], parameterCd, usgsSites$startDate[i], usgsSites$endDate[i])
+  #Rename cols to make sense
+  tempDat <- renameNWISColumns(tempDat)
+  return(tempDat)
+}
+#Stop cluster
+stopImplicitCluster()
+
+
+usgsDat <- usgsRaw %>% 
+    transmute(dateTime,
+              site_no,
+              siteName = factor(
+                case_when(
+                  site_no == "02264000" ~ "Cypress Creek",
+                  site_no == "02266200" ~ "Whittenhorse Creek",
+                  site_no == "08052700" ~ "Little Elm Creek",
+                  site_no == "11128500" ~ "Santa Ynez River"),
+                levels = c("Cypress Creek", "Whittenhorse Creek", "Little Elm Creek", "Santa Ynez River"),
+                ordered = T),
+              DO.obs = DO_Inst,
+              temp.water = Wtemp_Inst,
+              Q_cfs = Flow_Inst,
+              Q_cms = round(Q_cfs * 0.028316847, 4), # Convert CFS to CMS and round to Ten-Thousandths to match usgs 0
+              flowQuantile = rank(Q_cms) / n()) %>%  
+    drop_na() %>% 
+    arrange(siteName, dateTime)
+
+interpolated_df <- usgsDat %>%
+  group_by(siteName) %>%
+  do({
+    site_data <- .
+    
+    # Generate a complete 15-minute sequence for the date range of this site
+    time_sequence <- data.frame(
+      dateTime = seq(from = min(site_data$dateTime), 
+                     to = max(site_data$dateTime), 
+                     by = "15 min")
+    )
+    
+    # Left join with the original data
+    site_data <- left_join(time_sequence, site_data, by = "dateTime")
+    
+    # Interpolate missing data using `across` with `maxgap` parameter
+    site_data %>%
+      mutate(across(c(DO.obs, temp.water, Q_cfs, Q_cms, flowQuantile), 
+                    ~ na.approx(., na.rm = FALSE, maxgap = 4)))
+  }) %>%
+  ungroup()
+
+
+```
+
+## Check out data
+
+```{r}
+usgsDat %>%
+  ggplot(aes(dateTime, Q_cms)) +
+  geom_line(color = "#0000FF") +
+  ylab("Q (cms)") +
+  theme_few() +
+  geom_rect(data = usgsDat %>% filter(Q_cms <= 0), aes(xmin = dateTime, xmax = dateTime + 1, ymin = -Inf, ymax = +Inf),
+    fill = "#ff7f50",
+    alpha = 0.3) +
+  scale_x_datetime() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap( ~ siteName, scales = "free")
+```
+
+# Download NASA
+
+```{r}
+#Download shortwave radiation, barometric presssure, and temperature from NASAPower for each site
+nasaDat <- list()
+for(i in 1:nrow(usgsSites)) {
+  #All sky shortwave downward radiation
+  cat(paste("Downloading data for", usgsSites$siteName[i],"\n"))
+  
+  tempDat <- get_power(
+    community = "sb",
+    pars = c("PSC"),
+    temporal_api = "hourly",
+    lonlat = c(usgsSites$long[i], usgsSites$lat[i]),
+    dates = c(usgsSites$startDate[i], usgsSites$endDate[i]),
+    site_elevation = usgsSites$elev[i],
+    time_standard = "UTC")
+  
+  cat(paste("Finished downloading data for", usgsSites$siteName[i], "\n"))
+  #Fix date time stamp and convert kilopascals to millibar
+  tempDat <- tempDat %>%
+    mutate(Time = paste0(str_pad(HR, 2, side = "left", pad = "0"), ":00")) %>% 
+    unite("dateTime", YYYYMMDD, Time, sep = " ") %>% 
+    mutate(dateTime = ymd_hm(dateTime, tz = "UTC"),
+           BP = PSC * 10) %>% 
+    select(dateTime, BP)
+
+  # Simply a data frame of date and time running the course of the data set
+  min.fill <- data.frame(dateTime = seq(
+    from = floor_date(min(tempDat$dateTime), "15 mins"), 
+    to = ceiling_date(max(tempDat$dateTime), "15 mins"),
+    by = "15 mins"))
+  
+  # Merge and interpolate gaps
+  tempDat <- merge(min.fill, tempDat, by = "dateTime", all = T) %>%
+    mutate(siteName = usgsSites$siteName[i],
+           BP = na.approx(BP, na.rm = F, maxgap = 5))
+  #Save to list
+  nasaDat[[i]] <- tempDat
+  #Break loop on last iteration
+  if(i == nrow(usgsSites)){break}
+} 
+
+nasaDat <- do.call(rbind, nasaDat)
+nasaDat <- nasaDat %>% 
+  arrange(dateTime, siteName)
+```
+
+# Merge
+
+```{r}
+# Merge usgsDat with nasaDat
+allDat <- usgsDat %>% 
+  left_join(nasaDat, by = c("dateTime", "siteName")) %>%
+  # Get lat and long from usgsSites
+  left_join(usgsSites %>% select(siteName, lat, long), by = "siteName") %>% 
+  rename(utc.time = dateTime) %>%
+  mutate(
+    # Calc dissolved oxygen saturation and percentage saturation
+    DO.sat = calc_DO_sat(
+      temp.water = temp.water,
+      pressure.air = BP,
+      model = "garcia-benson"),
+    # Calc % DO sat
+    DO.pctsat = (DO.obs/DO.sat)*100, 
+    # Convert UTC time to mean solar time based on longitude
+    solar.time = convert_UTC_to_solartime(
+      date.time = utc.time, 
+      longitude = long,
+      time.type = "mean solar"),
+    # Determine if it is daytime
+    isDaytime = calc_is_daytime(solar.time, lat = lat)) %>% 
+  select(utc.time, solar.time, siteName, DO.obs, DO.sat, DO.pctsat, temp.water, BP, isDaytime, Q_cms) %>% 
+  drop_na()
+```
+
+# Calc DO Metrics
+
+```{r}
+# Daily metrics
+dailyDO <- allDat %>% 
+  mutate(Date = floor_date(solar.time, "1 day")) %>%
+  group_by(Date, siteName) %>%
+  summarize(
+    minDO.obs = min(DO.obs, na.rm = T),
+    maxDO.obs = max(DO.obs, na.rm = T),
+    minDO.sat = min(DO.sat, na.rm = T),
+    maxDO.sat = max(DO.sat, na.rm = T),
+    minDO.pctsat = min(DO.pctsat, na.rm = T),
+    maxDO.pctsat = max(DO.pctsat, na.rm = T),
+    avgDO.obs = mean(DO.obs, na.rm = T),
+    avgDO.sat = mean(DO.sat, na.rm = T),
+    avgDO.pctsat = mean(DO.pctsat, na.rm = T),
+    totalDO = n(),
+    DO.hyp = sum(DO.obs <= 2, na.rm = T)
+    ) %>% 
+  mutate(DO.amp = maxDO.obs - minDO.obs,
+         DOsat.amp = maxDO.sat - minDO.sat,
+         DOpctsat.amp = maxDO.pctsat - minDO.pctsat,
+         probHyp = DO.hyp / totalDO)
+
+#nighttime hypoxia ratio
+nightHypRat <- allDat %>% 
+  mutate(Date = floor_date(solar.time, "1 day")) %>%
+  group_by(Date, siteName, isDaytime) %>% 
+  summarise(DO.hyp = sum(DO.obs <= 2, na.rm = T)) %>% 
+  pivot_wider(names_from = isDaytime, values_from = DO.hyp, names_prefix = "DO_hyp_") %>%
+  rename(DayHyp = DO_hyp_TRUE, NightHyp = DO_hyp_FALSE) %>% 
+  mutate(NHR = NightHyp / DayHyp)
+
+#Merge DO Metrics
+doMet <- dailyDO %>% 
+  full_join(nightHypRat, by = c("Date", "siteName"))
+```
+
+# Calc Hydro Metrics
+
+```{r}
+#Flag wet and dry, find change between wet and dry period, and group each wet period into a group
+usgsQ <- usgsQ %>%
+  mutate(status = ifelse(Q_cms > 0, "wet", "dry")) %>%
+  group_by(siteName) %>%
+  mutate(change = status != lag(status, default = first(status)),
+         group = cumsum(change),
+         duration = 1:n()) %>%
+  group_by(siteName, group) %>%
+  mutate(duration = n()) %>%
+  ungroup()
+
+
+# Calculate drying metrics
+wetDur <- usgsQ %>%
+  filter(status == "wet") %>%
+  group_by(siteName, group) %>%
+  mutate(peakDayIndex = which.max(Q_cms),
+         timeSincePeak = row_number() - peakDayIndex,
+         startDate = min(Date),
+         endDate = max(Date)) %>%
+  mutate(logQ = log(Q_cms)) %>%
+  filter(!is.infinite(logQ) & !is.nan(logQ)) %>%
+  do({
+    linearModel = lm(logQ ~ timeSincePeak, data = .)
+    slope = coef(linearModel)[["timeSincePeak"]]
+    data.frame(., recessionRate = slope)
+  }) %>%
+  summarize(startDate = min(Date),
+            endDate = max(Date),
+            minQ = min(Q_cms, na.rm = TRUE),
+            avgQ = mean(Q_cms, na.rm = TRUE),
+            maxQ = max(Q_cms),
+            numWetDays = n(), 
+            peakToDryDays = abs(first(timeSincePeak)),
+            peakQuantile = first(flowQuantile[which.max(Q_cms)]),
+            dryingRate = first(recessionRate)) %>%
+  filter(numWetDays > 10)
+
+```
+
+## Merge DO metrics and Q
+
+```{r}
+allDat <- allDat %>%
+  mutate(status = ifelse(Q_cms > 0, "wet", "dry")) %>%
+  group_by(siteName) %>%
+  mutate(change = status != lag(status, default = first(status)),
+         group = cumsum(change),
+         duration = 1:n()) %>%
+  group_by(siteName, group) %>%
+  mutate(duration = n()) %>%
+  ungroup()
+
+# Calculate all metrics
+testDur <- allDat %>%
+  #filter(status == "wet") %>%
+  group_by(siteName, group) %>%
+  mutate(peakDayIndex = which.max(Q_cms),
+         timeSincePeak = row_number() - peakDayIndex,
+         startDate = min(Date),
+         endDate = max(Date)) %>%
+  mutate(logQ = log(Q_cms)) %>%
+  summarise(minDO.obs = min(DO.obs, na.rm = T),
+            maxDO.obs = max(DO.obs, na.rm = T),
+            minDO.sat = min(DO.sat, na.rm = T),
+            maxDO.sat = max(DO.sat, na.rm = T),
+            minDO.pctsat = min(DO.pctsat, na.rm = T),
+            maxDO.pctsat = max(DO.pctsat, na.rm = T),
+            avgDO.obs = mean(DO.obs, na.rm = T),
+            avgDO.sat = mean(DO.sat, na.rm = T),
+            avgDO.pctsat = mean(DO.pctsat, na.rm = T),
+            totalDO = n(),
+            DO.hyp = sum(DO.obs <= 2, na.rm = T)) %>% 
+  filter(!is.infinite(logQ) & !is.nan(logQ)) %>%
+  do({
+    linearModel = lm(logQ ~ timeSincePeak, data = .)
+    slope = coef(linearModel)[["timeSincePeak"]]
+    data.frame(., recessionRate = slope)
+  }) %>%
+  summarize(startDate = min(Date),
+            endDate = max(Date),
+            minQ = min(Q_cms, na.rm = TRUE),
+            avgQ = mean(Q_cms, na.rm = TRUE),
+            maxQ = max(Q_cms),
+            numWetDays = n(), 
+            peakToDryDays = abs(first(timeSincePeak)),
+            peakQuantile = first(flowQuantile[which.max(Q_cms)]),
+            dryingRate = first(recessionRate)) %>%
+  mutate(DO.amp = maxDO.obs - minDO.obs,
+         DOsat.amp = maxDO.sat - minDO.sat,
+         DOpctsat.amp = maxDO.pctsat - minDO.pctsat,
+         probHyp = DO.hyp / totalDO) %>% 
+  filter(numWetDays > 10)
+```
