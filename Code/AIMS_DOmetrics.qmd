@@ -201,6 +201,121 @@ shnDat <- shnDat %>%
   left_join(shnBP, by = "dateTime")
 ```
 
+# WHR
+
+```{r}
+#Path to QAQC pipeline
+datPath <- here("Data/EXO_QAQC/01_data/04_postQaqc/WHR/")
+#List qaqc files
+datPath <- list.files(datPath, "*.csv", full.names = T, recursive = T)
+#Read in csvs from aims-exo-qaqc repo
+whrDat <- rbindlist(sapply(datPath, fread, simplify = F, colClasses = c("timestamp" = "character")), idcol = "exportFile")
+
+#Long to wide and clean up
+whrDat <- whrDat %>% 
+  filter(alphaQf == 0 & betaQfSd == 0) %>% 
+  rename(dateTime = timestamp) %>% 
+  select(dateTime, parameterName, value) %>% 
+  mutate(dateTime = parse_date_time(dateTime, orders = c("ymd HMS"), tz = "UTC")) %>% 
+  pivot_wider(names_from = parameterName, values_from = value) %>% 
+  select(dateTime, Temp_EXO_C, ODO_mg_L, SW_Level_ft) %>% 
+  rename(DO.obs = ODO_mg_L, temp.water = Temp_EXO_C) %>% 
+  filter(DO.obs > 0)
+
+whrDat %>%
+  ggplot(aes(dateTime, DO.obs)) +
+  geom_point() +
+  ylab("DO (mg/L)") +
+  theme_few() +
+  scale_x_datetime() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+whrDat %>%
+  ggplot(aes(dateTime, SW_Level_ft)) +
+  geom_point() +
+  ylab("Surface Water (ft)") +
+  theme_few() +
+  scale_x_datetime() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# TAL
+
+```{r}
+#Path to QAQC pipeline
+datPath <- here("Data/EXO_QAQC/01_data/04_postQaqc/TAL/")
+#List qaqc files
+datPath <- list.files(datPath, "*.csv", full.names = T, recursive = T)
+#Read in csvs from aims-exo-qaqc repo
+talDat <- rbindlist(sapply(datPath, fread, simplify = F, colClasses = c("timestamp" = "character")), idcol = "exportFile")
+
+#Long to wide and clean up
+talDat <- talDat %>% 
+  filter(alphaQf == 0 & betaQfSd == 0) %>% 
+  rename(dateTime = timestamp) %>% 
+  select(dateTime, parameterName, value) %>% 
+  mutate(dateTime = parse_date_time(dateTime, orders = c("ymd HMS"), tz = "UTC")) %>% 
+  pivot_wider(names_from = parameterName, values_from = value) %>% 
+  select(dateTime, Temp_EXO_C, ODO_mg_L, SW_Level_ft) %>% 
+  rename(DO.obs = ODO_mg_L, temp.water = Temp_EXO_C) %>% 
+  filter(DO.obs > 0)
+
+talDat %>%
+  ggplot(aes(dateTime, DO.obs)) +
+  geom_point() +
+  ylab("DO (mg/L)") +
+  theme_few() +
+  scale_x_datetime() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+talDat %>%
+  ggplot(aes(dateTime, SW_Level_ft)) +
+  geom_point() +
+  ylab("Surface Water (ft)") +
+  theme_few() +
+  scale_x_datetime() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+#Path to QAQC pipeline
+datPath <- here("Data/EXO_QAQC/01_data/04_postQaqc/PRF/")
+#List qaqc files
+datPath <- list.files(datPath, "*.csv", full.names = T, recursive = T)
+#Read in csvs from aims-exo-qaqc repo
+prfDat <- rbindlist(sapply(datPath, fread, simplify = F, colClasses = c("timestamp" = "character")), idcol = "exportFile")
+
+#Long to wide and clean up
+prfDat <- prfDat %>% 
+  filter(alphaQf == 0 & betaQfSd == 0) %>% 
+  rename(dateTime = timestamp) %>% 
+  select(dateTime, parameterName, value) %>% 
+  mutate(dateTime = parse_date_time(dateTime, orders = c("ymd HMS"), tz = "UTC")) %>% 
+  pivot_wider(names_from = parameterName, values_from = value) %>% 
+  select(dateTime, Temp_EXO_C, ODO_mg_L, SW_Level_ft) %>% 
+  rename(DO.obs = ODO_mg_L, temp.water = Temp_EXO_C) %>% 
+  filter(DO.obs > 0)
+
+prfDat %>%
+  ggplot(aes(dateTime, DO.obs)) +
+  geom_point() +
+  ylab("DO (mg/L)") +
+  theme_few() +
+  scale_x_datetime() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+prfDat %>%
+  ggplot(aes(dateTime, SW_Level_ft)) +
+  geom_point() +
+  ylab("Surface Water (ft)") +
+  theme_few() +
+  scale_x_datetime() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
 ## Merge Sites
 
 ```{r}
