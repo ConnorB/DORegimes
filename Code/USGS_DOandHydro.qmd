@@ -126,7 +126,7 @@ usgsQ %>%
   geom_line(color = "#0000FF") +
   ylab("Q (cfs)") +
   theme_few() +
-  geom_rect(data = usgsQ %>% filter(Flow > quantile(Flow, 0.25)), aes(xmin = Date, xmax = Date + 1, ymin = -Inf, ymax = +Inf),
+  geom_rect(data = usgsQ %>% filter(round(Flow, 1) <= 0), aes(xmin = Date, xmax = Date + 1, ymin = -Inf, ymax = +Inf),
     fill = "#ff7f50",
     alpha = 0.3) +
   scale_x_date() +
@@ -258,6 +258,20 @@ doMet %>%
   theme_few() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
   facet_wrap( ~ siteName, scales = "free")
+
+doMet %>%
+  ggplot(aes(Date, DOpctsat.amp)) +
+  geom_point() +
+  theme_few() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap( ~ siteName, scales = "free")
+
+doMet %>%
+  ggplot(aes(Date, DO.hyp)) +
+  geom_point() +
+  theme_few() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap( ~ siteName, scales = "free")
 ```
 
 # Calc Hydro Metrics
@@ -279,6 +293,22 @@ hydroTS <- usgsQ %>%
                   site_no == "11128500" ~ "Santa Ynez River"),
                 levels = c("Cypress Creek", "Whittenhorse Creek", "Little Elm Creek", "Santa Ynez River"),
                 ordered = T))
+
+hydroTS %>%
+  ggplot(aes(Date, q)) +
+  geom_line(color = "#0000FF") +
+  ylab("Q (cfs)") +
+  theme_few() +
+  geom_rect(data = usgsQ %>% filter(peak_flag == 1), aes(xmin = Date, xmax = Date + 1, ymin = -Inf, ymax = +Inf),
+    fill = "#ff7f50",
+    alpha = 0.8) +
+  geom_rect(data = usgsQ %>% filter(q <= 0), aes(xmin = Date, xmax = Date + 1, ymin = -Inf, ymax = +Inf),
+    fill = "#696969",
+    alpha = 0.5) +
+  scale_x_date() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap( ~ site_no, scales = "free")
 ```
 
 ## Merge DO metrics and Q
@@ -287,13 +317,58 @@ hydroTS <- usgsQ %>%
 allMet <- hydroTS %>%
   full_join(doMet, by = c("siteName", "Date"))
 
-test <- allMet %>% 
-  drop_na(peak2zero, probHyp)
-
 allMet %>%
-  ggplot(aes(peak_value, probHyp)) +
+  ggplot(aes(drying_rate, DO.hyp)) +
   geom_point() +
   theme_few() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
   facet_wrap( ~ siteName, scales = "free")
+```
+
+# Testing 2 weeks before drying
+
+```{r}
+testQ <- usgsQ %>% 
+  mutate(siteName = factor(
+                case_when(
+                  site_no == "02264000" ~ "Cypress Creek",
+                  site_no == "02266200" ~ "Whittenhorse Creek",
+                  site_no == "08052700" ~ "Little Elm Creek",
+                  site_no == "11128500" ~ "Santa Ynez River"),
+                levels = c("Cypress Creek", "Whittenhorse Creek", "Little Elm Creek", "Santa Ynez River"),
+                ordered = T))
+  
+usgsQ %>%
+  ggplot(aes(Date, q)) +
+  geom_line(color = "#0000FF") +
+  ylab("Q (cfs)") +
+  theme_few() +
+  geom_rect(data = usgsQ %>% filter(peak_flag == 1), aes(xmin = Date, xmax = Date + 1, ymin = -Inf, ymax = +Inf),
+    fill = "#ff7f50",
+    alpha = 0.8) +
+  geom_rect(data = usgsQ %>% filter(q <= 0), aes(xmin = Date, xmax = Date + 1, ymin = -Inf, ymax = +Inf),
+    fill = "#696969",
+    alpha = 0.5) +
+  scale_x_date() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap( ~ site_no, scales = "free")
+
+wk2dry <- testQ %>% 
+  mutate(dQ = lag(Flow) - Flow) %>% 
+  filter(Flow == 0 & dQ <= 0.01 & lead(Flow) > 0) %>% 
+  mutate(TwoWkPrior = Date - weeks(2)) %>% 
+  rename(dryDate = date) %>% 
+  select(Date, siteName, dryDate, TwoWkPrior)
+
+wk2DO <- dailyDO %>% 
+  group_by(siteName, Date) %>% 
+  left_join(wk2dry, by = c("siteName", "Date")) %>% 
+  filter(Date >= TwoWkPrior & Date <= dryDate)
+
+testDO <- dailyDO %>% 
+  filter(siteName == "Whittenhorse Creek" & Date >= "2011-04-07" & Date <= "2012-05-31")
+Whittenhorse Creek
+
+
 ```
