@@ -21,7 +21,8 @@ metrics_fun <- function(df) {
   metrics <- df %>%
     #Rename columns
     mutate(date=as_date(Date), 
-           num_date = as.numeric(Date), 
+           num_date = as.numeric(Date),
+           #q = Flow) %>% 
            q = round(Flow, 1)) %>% 
     na.omit() %>% 
     # Split the data by site_no
@@ -29,8 +30,8 @@ metrics_fun <- function(df) {
     # Perform the calculations on each group
     group_modify( ~ {
       .x <- .x %>%
-        mutate(q_peak = if_else(q > 0.1,  q, 0)) %>%
-        #mutate(q_peak = if_else(q > quantile(q, 0.25),  q, 0)) %>%
+        #mutate(q_peak = if_else(q > 0.1,  q, 0)) %>%
+        mutate(q_peak = if_else(q > quantile(q, 0.25),  q, 0)) %>%
         mutate(
           slp_b = (q_peak - lag(q_peak)) / (num_date - lag(num_date)),
           slp_f = (lead(q_peak) - q_peak) / (lead(num_date) - num_date)
@@ -241,8 +242,9 @@ eventID <- function(df){
     mutate(date=as_date(Date), 
            num_date = as.numeric(Date), 
            q = round(Flow, 1),
-           q_peak = if_else(q > 0.1,  q, 0))
-           #q_peak = if_else(q>quantile(q,0.25),  q, 0))
+           #q = Flow,
+           #q_peak = if_else(q > 0.1,  q, 0))
+           q_peak = if_else(q>quantile(q,0.25),  q, 0))
   
   #Define peaks using slope break method
   df<-df %>% 
@@ -259,7 +261,6 @@ eventID <- function(df){
   df<-df %>%   
     #Define individual storm events
     mutate(event_id = cumsum(peak_flag)+1,
-           nf_start = if_else(q == 0 & lag(q) != 0, 1, 0)) %>% 
-    select(-date, -num_date, -q, -q_peak, -slp_b, -slp_f, -peak_flag)
-}
+           nf_start = if_else(q == 0 & lag(q) != 0, 1, 0))
+  }
  

@@ -112,7 +112,8 @@ stopImplicitCluster()
 usgsQ <- usgsRawQ %>% 
     transmute(Date,
               site_no,
-              Flow) %>% 
+              Flow,
+              Flow_cms = Flow * 0.028316847) %>% 
     drop_na() %>% 
     arrange(site_no, Date)
 ```
@@ -125,7 +126,7 @@ usgsQ %>%
   geom_line(color = "#0000FF") +
   ylab("Q (cfs)") +
   theme_few() +
-  geom_rect(data = usgsQ %>% filter(Flow <= 0), aes(xmin = Date, xmax = Date + 1, ymin = -Inf, ymax = +Inf),
+  geom_rect(data = usgsQ %>% filter(Flow > quantile(Flow, 0.25)), aes(xmin = Date, xmax = Date + 1, ymin = -Inf, ymax = +Inf),
     fill = "#ff7f50",
     alpha = 0.3) +
   scale_x_date() +
@@ -182,7 +183,7 @@ nasaDat <- nasaDat %>%
   arrange(dateTime, siteName)
 ```
 
-## Merge with DO 
+## Merge with DO
 
 ```{r}
 # Merge usgsDat with nasaDat
