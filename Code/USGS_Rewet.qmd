@@ -1,0 +1,100 @@
+---
+title: "USGS Wetting"
+author: "CLB"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+library(data.table)
+library(tidyverse, warn.conflicts = F)
+options(readr.show_col_types = F)
+library(googlesheets4)
+library(ggthemes)
+library(ggpmisc)
+library(here)
+library(styler)
+library(streamMetabolizer)
+library(rstan)
+options(mc.cores = parallel::detectCores())
+library(dataRetrieval)
+library(scales)
+library(knitr)
+library(lubridate)
+library(zoo)
+library(nasapower)
+library(imputeTS)
+library(rgbif)
+library(foreach)
+library(doParallel)
+library(broom)
+#source(here("Code/priceDrying.R"))
+```
+
+# Download USGS Q Data
+
+```{r}
+usgsSites <- read_csv(here("Data/usgsSites.csv")) %>% 
+  rename(gage = site_no)
+```
+
+```{r}
+#Leaves one core free for system use
+registerDoParallel(cores = detectCores() - 1)
+
+usgsRawQ <- foreach(i=1:nrow(usgsSites), .combine='rbind', .packages=c("dataRetrieval")) %dopar% {
+  parameterCd <- c("00060")
+  tempDat <- readNWISdv(usgsSites$gage[i], parameterCd, usgsSites$startDate[i], usgsSites$endDate[i])
+  #Rename cols to make sense
+  tempDat <- renameNWISColumns(tempDat)
+  return(tempDat)
+}
+#Stop cluster
+stopImplicitCluster()
+
+
+usgsQ <- usgsRawQ %>% 
+    transmute(Date,
+              gage = site_no,
+              Flow) %>% 
+    drop_na() %>% 
+    arrange(gage, Date)
+```
+
+## Find Rewetting Days
+
+```{r}
+
+wetEvents <- usgsQ %>% 
+  group_by(gage) %>% 
+  mutate(
+    dQ = lag(Flow) - Flow,
+    rewet = Flow != 0 & lag(Flow) == 0,
+    dryDays = cumsum(Flow == 0) - cummax((Flow != 0) * cumsum(Flow == 0)),
+    wetDays = cumsum(Flow != 0) - cummax((Flow == 0) * cumsum(Flow != 0)),
+    priorDryDays = ifelse(rewet, lag(dryDays), NA_integer_),
+    dryingEvent = Flow == 0 & lag(Flow) != 0,
+    totalWetDays = ifelse(dryingEvent, lag(wetDays), NA_integer_),
+    totalWetDays = zoo::na.locf(totalWetDays, na.rm = FALSE),
+  ) %>% 
+  filter(rewet) %>% 
+  select(Date, gage, Flow, priorDryDays, totalWetDays) %>% 
+  mutate(wetLengthDate = Date + days(totalWetDays),
+         event = row_number(),
+         Q_threshold = 0.25) %>% 
+  rename(wet_date = Date)
+```
+
+```{r}
+rewetMet <- list()
+for (n in 1:nrow(wetEvents)) {
+  rewetMet[[n]] <- metrics_fun(n)
+}
+rewetMet <- do.call(rbind, rewetMet)
+
+for (n in 1:nrow(wetEvents)) {
+  print(wetEvents$gage[n])
+}
+
+```
