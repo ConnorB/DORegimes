@@ -26,6 +26,7 @@ library(zoo)
 library(nasapower)
 library(imputeTS)
 library(rgbif)
+source(here("Code/priceDrying_15min.R"))
 ```
 
 # Data
@@ -84,7 +85,7 @@ shnDat <- shnDat %>%
   rename(dateTime = timestamp) %>% 
   select(dateTime, parameterName, value) %>% 
   mutate(dateTime = parse_date_time(dateTime, orders = c("ymd HMS"), tz = "UTC")) %>% 
-  filter(dateTime > "2023-03-24" & dateTime < "2023-06-30") %>% 
+  filter(dateTime > "2023-03-24" & dateTime < "2023-07-01") %>% 
   pivot_wider(names_from = parameterName, values_from = value) %>% 
   select(dateTime, SW_Level_ft) %>% 
   mutate(SW_Level_cor = 0.99754 * SW_Level_ft + 0.21948)
@@ -102,14 +103,13 @@ timeSeq <- data.frame(dateTime = timeSeq)
 shnDat <- merge(timeSeq, shnDat, by = "dateTime", all = T)
 
 shnDat <- shnDat %>%
-  mutate(SW_Level_cor = na.approx(SW_Level_cor, maxgap = 6),
+  right_join(timeSeq, by = "dateTime") %>% 
+    mutate(SW_Level_cor = na.approx(SW_Level_cor, maxgap = 6),
          Site = "SHN",
-         solar.time = convert_UTC_to_solartime(dateTime, longitude = -96.558380, time.type = "mean solar"),
-         isDaytime = calc_is_daytime(dateTime, 39.115220)) %>%
-  right_join(timeSeq, by = "dateTime")
+         solar.time = convert_UTC_to_solartime(dateTime, longitude = -96.558380, time.type = "mean solar"))
 ```
 
-## Get Rating Curve
+# Calculate Discharge
 
 ```{r}
 #KMZ
@@ -136,19 +136,62 @@ shnDat <- shnDat %>%
 ```
 
 ```{r}
-ggplot(kmzDat, aes(dateTime, Q_Ls))+
+kmzDat %>% 
+  ggplot(aes(dateTime, Q_Ls))+
   geom_line() +
   labs(title = "Kings Creek Discharge",
        y = expression(Discharge~("L s"^{-1})))+
-  theme_bw()+
+  theme_few()+
   theme(text = element_text(size = 15), axis.title.x = element_blank())+
   scale_x_datetime()
 
-ggplot(shnDat, aes(dateTime, Q_Ls))+
+shnDat %>% 
+  ggplot(aes(dateTime, Q_Ls))+
   geom_line() +
   labs(title = "Shane Creek Discharge",
        y = expression(Discharge~("L s"^{-1})))+
-  theme_bw()+
+  theme_few()+
   theme(text = element_text(size = 15), axis.title.x = element_blank())+
   scale_x_datetime()
+```
+
+# Calculate Hydro Metrics
+
+```{r}
+shnDaily <- shnDat %>% 
+  mutate(Date = solar.time,
+         site_no = "SHN",
+         Flow = ifelse(Q_Ls < 0, 0, Q_Ls)) %>% 
+  select(Date, site_no, Flow) %>% 
+  drop_na(Flow) %>%
+  {
+    # Find the date of the first non-zero flow
+    first_nonzero_date <- .$Date[which(.$Flow > 0)[1]]
+
+    # Truncate the date to remove time component
+    first_nonzero_date <- floor_date(first_nonzero_date, "day")
+
+    # Include data from the day before the first non-zero flow date
+    start_date <- first_nonzero_date - days(1)
+
+    # Filter the dataset to include only the rows from this start date onwards
+    .[.$Date >= start_date, ]
+  }
+shnHydro <- metrics_fun(shnDaily) 
+shnEvents <- eventID(shnDaily)
+shnEvents <- shnEvents %>% 
+  full_join(shnHydro, by = c("site_no", "event_id"))
+
+shnEvents %>%
+  ggplot(aes(Date, q)) +
+  geom_line(color = "#0000FF") +
+  ylab("Q (L/s)") +
+  theme_few() +
+  geom_rect(data = shnEvents %>% filter(peak_flag == 1), aes(xmin = datetime, xmax = datetime + 1440, ymin = -Inf, ymax = +Inf),
+    fill = "#ff7f50",
+    alpha = 1) +
+  scale_x_datetime() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap( ~ site_no, scales = "free")
 ```
