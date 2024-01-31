@@ -46,7 +46,7 @@ usgsSites <- readNWISsite(c("02264000","02266200","08052700","11128500")) %>%
             lat = dec_lat_va,
             long = dec_long_va,
             elev = alt_va * 0.3048, # ft to m
-            drain_area_va = drain_area_va / 0.38610216) # sqmi to sqkm
+            drainArea = drain_area_va / 0.38610216) # sqmi to sqkm
 
 # Get start and end dates from USGS
 avalDat <- whatNWISdata(siteNumber = usgsSites$site_no, parameterCd = "00300", service = "uv") %>%
@@ -55,6 +55,7 @@ avalDat <- whatNWISdata(siteNumber = usgsSites$site_no, parameterCd = "00300", s
             endDate = end_date)
 
 usgsSites <- left_join(usgsSites, avalDat, by = "site_no")
+write_csv(usgsSites, here("Data/usgsSites.csv"))
 ```
 
 ## Download DO Data
