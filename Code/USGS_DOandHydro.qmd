@@ -117,6 +117,8 @@ usgsQ <- usgsRawQ %>%
               Flow_cms = Flow * 0.028316847) %>% 
     drop_na() %>% 
     arrange(site_no, Date)
+
+write_csv(usgsQ, here("Data/USGS_DailyQ.csv"))
 ```
 
 ## Check out data
