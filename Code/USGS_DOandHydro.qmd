@@ -118,7 +118,12 @@ usgsQ <- usgsRawQ %>%
     drop_na() %>% 
     arrange(site_no, Date)
 
-write_csv(usgsQ, here("Data/USGS_DailyQ.csv"))
+for (i in 1:nrow(usgsSites)) {
+  tempDat <- usgsQ %>% 
+    filter(site_no == usgsSites$site_no[i]) %>% 
+    rename(gage = site_no) %>% 
+    write_csv(paste0(here("Data/USGS_Q"), usgsSites$site_no[i], ".csv"))
+}
 ```
 
 ## Check out data

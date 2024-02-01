@@ -1,12 +1,46 @@
-metrics_fun <- function(df){
+#####################################################################
+##
+## Script name: 3_wettingRegimes_GetSubEventsRate.R
+##
+## Author: Adam N. Price
+##
+## Date Created: 2022-02-25
+##
+## Copyright (c) Adam N. Price, 2022
+## Email: adnprice@ucsc.edu
+##
+############################# Description ##########################
+##
+## Code to extract rewetting events at different flow thresholds
+##   22-02-25: Current threholds are Q5,10,15,25,50, and peaks after
+##             those thresholds are met
+##
+############################# Packages #############################
+library(parallel)
+library(lubridate)
+library(tidyverse)
+library(dataRetrieval)
+library(here)
+##   
+##
+############################# Code ################################
+
+# Load wetting date data
+wetEvents = read_csv(here("Data/wettingRegimes_wettingLengths.csv")) %>%
+  drop_na(event)
+
+## Define the function to extract revwetting events
+
+
+metrics_fun <- function(n){
   library(lubridate)
   library(tidyverse)
   
   
-  siteNumber = str_pad(df$gage[n], 8, pad = "0")
+  siteNumber = str_pad(wetEvents$gage[n], 8, pad = "0")
   parameterCd = "00060"
-  startDate = df$wet_date[n]-1
-  endDate = df$wetLengthDate[n]
+  startDate = wetEvents$wet_date[n]-1
+  endDate = wetEvents$wetLengthDate[n]
   
   dat = dataRetrieval::readNWISuv(
     siteNumber,
@@ -56,9 +90,9 @@ metrics_fun <- function(df){
     filter(peak_flag==1) %>%
     select(site_no,dateTime,X_00060_00000) %>%
     setNames(c("gage","wet_DateTime","q")) %>%
-    mutate(rewetting_event = df$event[n],
-           gage =  df$gage[n],
-           threshold = df$Q_threshold[n],
+    mutate(rewetting_event = wetEvents$event[n],
+           gage =  wetEvents$gage[n],
+           threshold = wetEvents$Q_threshold[n],
            weting_subevent = row_number(),
            total_false_starts = count(.),
            inital_rewetting_rate = inital_rewetting_rate,
@@ -71,9 +105,9 @@ metrics_fun <- function(df){
     tibble() %>%
     select(site_no,dateTime,X_00060_00000) %>%
     setNames(c("gage","wet_DateTime","q")) %>%
-    mutate(rewetting_event = df$event[n],
-           gage =  df$gage[n],
-           threshold = df$Q_threshold[n],
+    mutate(rewetting_event = wetEvents$event[n],
+           gage =  wetEvents$gage[n],
+           threshold = wetEvents$Q_threshold[n],
            weting_subevent = 0,
            total_false_starts = count(output),
            inital_rewetting_rate = inital_rewetting_rate,
@@ -86,3 +120,56 @@ metrics_fun <- function(df){
   ## Call output
   output
 }
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Step 3: Execute and write-----------------------------------------------------
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#Start timer
+t0<-Sys.time()
+
+#Create error handling function
+execute<-function(a){
+  tryCatch(metrics_fun(a), error=function(e){
+    tibble(
+      gage = NA,
+      threshold = NA,
+      wet_DateTime = NA,
+      q = NA,
+      rewetting_event =NA,
+      weting_subevent = NA,
+      total_false_starts = NA,
+      inital_rewetting_rate = NA,
+      p_value_i = NA,
+      rewetting_rate = NA,
+      p_value = NA,
+      sample_rate = NA)}
+  )
+}
+
+# get number of cores
+n.cores <- detectCores()
+
+#start cluster
+cl <-  makePSOCKcluster(n.cores)
+
+#Export file list to cluster
+clusterExport(cl, c('metrics_fun','wetEvents'), env=.GlobalEnv)
+
+# Use mpapply to exicute function
+x<-parLapply(cl,seq(1, nrow(wetEvents)),execute) #length(files)
+# x<-parLapply(cl,seq(1381, 1385),execute) #length(files)
+
+# Stop the cluster
+stopCluster(cl)
+
+#gather output
+output<-bind_rows(x) %>% 
+  drop_na(gage) %>% 
+  mutate(total_false_starts = total_false_starts$n)
+
+#Capture finishing time
+tf<-Sys.time()
+tf-t0
+
+# Write the data
+write_csv(output, here("Data/wettingRegimes_SubEvents.csv"))

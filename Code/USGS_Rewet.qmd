@@ -54,12 +54,14 @@ usgsRawQ <- foreach(i=1:nrow(usgsSites), .combine='rbind', .packages=c("dataRetr
 stopImplicitCluster()
 
 
-usgsQ <- usgsRawQ %>% 
-    transmute(Date,
-              gage = site_no,
-              Flow) %>% 
-    drop_na() %>% 
-    arrange(gage, Date)
+usgsQ <- usgsRawQ %>%
+  mutate(Date,
+         gage = site_no,
+         site_no = NULL,
+         Flow,
+         .keep = "used") %>%
+  drop_na() %>%
+  arrange(gage, Date)
 ```
 
 ## Find Rewetting Days
@@ -87,14 +89,60 @@ wetEvents <- usgsQ %>%
 ```
 
 ```{r}
+
+wetEvents <- wetEvents %>% 
+  filter(totalWetDays >= 5) %>% 
+  filter(!(gage == "11128500" & wet_date == "2016-04-09")) %>% 
+  filter(!(gage == "11128500" & wet_date == "2017-05-07")) %>% 
+  filter(!(gage == "11128500" & wet_date == "2019-12-04"))
+
 rewetMet <- list()
 for (n in 1:nrow(wetEvents)) {
-  rewetMet[[n]] <- metrics_fun(n)
+  row <- wetEvents[n, ]
+  cat(paste("Calculating Rewetting Metrics for", wetEvents$gage[n], "rewet date:", wetEvents$wet_date[n], "\n"))
+  rewetMet[[n]] <- rewet_metrics(gageNumber = row$gage,
+                                 startDate = row$wet_date,
+                                 endDate = row$wetLengthDate,
+                                 filePath = here("Figs/WettingEvents/"))
+  #Sys.sleep(sample(1:10, 1))
 }
 rewetMet <- do.call(rbind, rewetMet)
 
-for (n in 1:nrow(wetEvents)) {
-  print(wetEvents$gage[n])
-}
 
+
+#rewetMet <- rewet_metrics(gageNumber = "02264000", startDate = "2008-07-12", endDate = "2009-02-16")
+
+```
+
+# DO Metrics
+
+```{r}
+wetEvents <- wetEvents %>% 
+  left_join(usgsSites %>% select(-startDate, -endDate, -drainArea, -siteName), by = "gage") %>% 
+  filter(!(gage == "02264000" & wetLengthDate == "2025-04-27")) %>% 
+  filter(!(gage == "11128500" & wet_date == "2016-10-28")) %>% 
+  filter(!(gage == "11128500" & wet_date == "2017-08-24"))
+
+
+
+
+doMet <- list()
+for (n in 1:nrow(wetEvents)) {
+  row <- wetEvents[n, ]
+  cat(paste("Calculating DO Metrics for", wetEvents$gage[n], "rewet date:", wetEvents$wet_date[n], "\n"))
+  doMet[[n]] <- do_metrics(site_no = row$gage,
+                              start_date = row$wet_date,
+                              end_date = row$wetLengthDate,
+                              latitude = row$lat,
+                              longitude = row$long,
+                              elevation = row$elev)
+  #Sys.sleep(sample(1:10, 1))
+}
+doMet <- do.call(rbind, doMet)
+
+
+```
+
+```{r}
+gages2 <- foreign::read.dbf("/Users/connor/Downloads/gagesii_9322_sept30_2011.dbf")
 ```
