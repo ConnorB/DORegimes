@@ -101,7 +101,7 @@ registerDoParallel(cores = detectCores() - 1)
 
 usgsRawQ <- foreach(i=1:nrow(usgsSites), .combine='rbind', .packages=c("dataRetrieval")) %dopar% {
   parameterCd <- c("00060")
-  tempDat <- readNWISdv(usgsSites$site_no[i], parameterCd, usgsSites$startDate[i], usgsSites$endDate[i])
+  tempDat <- readNWISdv(usgsSites$site_no[i], parameterCd, startDate = "1979-01-01", usgsSites$endDate[i])
   #Rename cols to make sense
   tempDat <- renameNWISColumns(tempDat)
   return(tempDat)
@@ -282,7 +282,7 @@ doMet %>%
 ```{r}
 #Hydro metrics from Price et al.
 hydroMet <- metrics_fun(usgsQ)
-  
+write_csv(hydroMet, here("Data/gagesDryingMet.csv"))  
 #get event id from hydro metrics
 usgsQ <- eventID(usgsQ) 
 #Merge hydro metrics with ts
