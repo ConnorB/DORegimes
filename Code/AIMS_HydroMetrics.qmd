@@ -238,3 +238,71 @@ shnEvents %>%
         axis.text.x = element_text(angle = 45, hjust = 1)) +
   facet_wrap( ~ site_no, scales = "free")
 ```
+
+# Mountain West
+
+```{r}
+mwQ <- read_rds(here("Data/AIMS_ALL_Piezo_RatingCurve_datafile.rds")) %>% 
+  select(dateTime = DateTime, Site = site, Q_Ls = Q) %>% 
+  group_by(Site) %>% 
+  mutate(
+    dateTime = with_tz(dateTime, tzone = "UTC"),
+    Q = na.approx(Q, maxgap = 10),
+    siteName = case_when(
+    Site == "GSS01" ~ "Gibson Jack",
+    Site == "JSS01" ~ "Johnston Draw",
+    Site == "DSS01" ~ "Dry Creek"
+  ))
+
+
+
+mwQ %>%
+  ggplot(aes(dateTime, Q)) +
+  geom_line(color = "#0000FF") +
+  ylab("Q (L/s)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap( ~ siteName, scales = "free", ncol = 1)
+```
+
+## MW DO Data
+
+```{r}
+#Path to QAQC pipeline
+qaqcPath <- here("Data/EXO_QAQC/01_data/04_postQaqc/")
+#Site directories to read from
+mw <- c("DRC", "GBJ", "JDR")
+
+#Function to read data from a given site directory and add site name
+readEXOdata <- function(mw) {
+  sitePath <- file.path(qaqcPath, mw)
+  datFiles <- list.files(sitePath, pattern = "\\.csv$", full.names = TRUE, recursive = TRUE)
+  
+  if (length(datFiles) > 0) {
+    data <- rbindlist(lapply(datFiles, fread, colClasses = c("timestamp" = "character")), idcol = "exportFile")
+    data[, siteName := mw] # Add site name column
+    return(data)
+  } else {
+    return(NULL)
+  }
+}
+
+# Read data for each site and combine
+mwDO <- rbindlist(lapply(mw, readEXOdata), fill = TRUE)
+
+mwDO <- mwDO %>% 
+  filter(alphaQf == 0 & betaQfSd == 0) %>% 
+  select(siteName, dateTime = timestamp, parameterName, value) %>%
+  mutate(dateTime = parse_date_time(dateTime, orders = c("ymd HMS"), tz = "UTC")) %>%
+  pivot_wider(names_from = parameterName, values_from = value)
+
+mwDupes <- mwDO |>
+  select(siteName, dateTime = timestamp, parameterName, value) |>
+  group_by(siteName, dateTime, parameterName) |>
+  summarise(values = toString(unique(value)), .groups = "drop") |>
+  mutate(n = str_count(values, ",") + 1) |>
+  filter(n > 1)
+
+```
