@@ -48,9 +48,9 @@ kmzDat <- kmzDat %>%
   select(dateTime, parameterName, value) %>% 
   mutate(dateTime = parse_date_time(dateTime, orders = c("ymd HMS", "mdy HM"), tz = "UTC")) %>% 
   pivot_wider(names_from = parameterName, values_from = value) %>% 
-  select(dateTime, SW_Level_ft) %>%
-  mutate(across(where(is.numeric), ~ replace(.x, .x < 0.01, NA))) %>% 
-  select(!(where(is.numeric) & where(~ all(is.na(.x)))))
+  select(dateTime, SW_Level_ft, SpCond_uS_cm) 
+  #mutate(across(where(is.numeric), ~ replace(.x, .x < 0.01, NA))) %>% 
+  #select(!(where(is.numeric) & where(~ all(is.na(.x)))))
 
 #Lets check and fix the DF timesteps
 #Date and time sequence running every 10 minutes
@@ -64,6 +64,7 @@ timeSeq <- data.frame(dateTime = timeSeq)
 #merge the time df
 kmzDat <- merge(timeSeq, kmzDat, by = "dateTime", all = T) %>% 
   mutate(SW_Level_ft = na.approx(SW_Level_ft, maxgap = 6),
+         SpCond_uS_cm = na.approx(SpCond_uS_cm, maxgap = 6),
          Site = "KMZ",
          solar.time = convert_UTC_to_solartime(dateTime, longitude = -96.587238, time.type = "mean solar"),
          isDaytime = calc_is_daytime(dateTime, 39.092353))
@@ -123,6 +124,10 @@ kmzRC <- coef(kmzRC)
 kmzDat <- kmzDat %>% 
   mutate(Q_Ls = (kmzRC[["log(ManualStage_ft)"]] * SW_Level_ft) + kmzRC[["(Intercept)"]])
 
+maggieDat <- kmzDat %>% 
+  select(dateTime, SW_Level_ft, SpCond_uS_cm, Q_Ls) %>% 
+  write_csv("~/Desktop/KingsDat_20240219.csv")
+
 #SHN
 shnRC <- read_sheet("https://docs.google.com/spreadsheets/d/1DkF2Ugr6tEgnZHOGJ_UY2kW9JWH4ce8xbyzSyyA6-CI/edit#gid=0", col_types = "cDcddddddddcccc") %>% 
   filter(SiteName %in% c("SHM01") & Quality %in% c("Maybe", "Good")) %>% 
@@ -138,6 +143,15 @@ shnDat <- shnDat %>%
 ```{r}
 kmzDat %>% 
   ggplot(aes(dateTime, Q_Ls))+
+  geom_line() +
+  labs(title = "Kings Creek Discharge",
+       y = expression(Discharge~("L s"^{-1})))+
+  theme_few()+
+  theme(text = element_text(size = 15), axis.title.x = element_blank())+
+  scale_x_datetime()
+
+kmzDat %>% 
+  ggplot(aes(dateTime, SW_Level_ft))+
   geom_line() +
   labs(title = "Kings Creek Discharge",
        y = expression(Discharge~("L s"^{-1})))+
