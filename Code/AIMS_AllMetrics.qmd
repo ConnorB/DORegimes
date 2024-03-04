@@ -485,4 +485,9 @@ kmz2022 <- (qPlt / doPlt) + plot_layout(ncol = 1)
 kmz2022
 ggsave("kmz2022-2023.png", kmz2022, here("Figs/"), device = "png", width = 21, height = 15, units = "cm", dpi = "retina")
 
+
+allDat %>% 
+  filter(Site == "KMZ" & dateTime > "2022-01-01" & dateTime < "2023-01-01") %>% 
+  select(dateTime_UTC = dateTime, Site, SW_Level_ft, Q_Ls) %>% 
+  write_csv("~/Desktop/KMZ_Q_2022.csv")
 ```
