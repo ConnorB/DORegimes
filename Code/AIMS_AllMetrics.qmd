@@ -1,0 +1,488 @@
+---
+title: "MW DO Regimes"
+author: "CLB"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+library(data.table)
+library(tidyverse, warn.conflicts = F)
+options(readr.show_col_types = F)
+library(googlesheets4)
+library(ggthemes)
+library(ggpmisc)
+library(patchwork)
+library(here)
+library(styler)
+library(streamMetabolizer)
+library(rstan)
+options(mc.cores = parallel::detectCores())
+library(dataRetrieval)
+library(scales)
+library(knitr)
+library(lubridate)
+library(zoo)
+library(nasapower)
+library(imputeTS)
+library(rgbif)
+source(here("Code/priceDrying_15min.R"))
+source(here("Code/Functions/exoPipeline.R"))
+```
+
+# Site Data
+
+```{r}
+siteInfo <- tibble(Site = c("KMZ", "SHN", "YMR", "GBJ", "DRC", "JDR", "TAL", "WHR", "PRF"),
+                   Lat = c(39.092353, 39.115220, 37.56452, 42.78483889, 43.7184, 43.1226, 33.7621789, 32.98463, 34.968669),
+                   Long = c(-96.587238, -96.558380, -96.49102, -112.44484722, -116.137, -116.776, -85.595521, -88.012269, -86.165439))
+
+siteElev <-  elevation(latitude = siteInfo$Lat, longitude = siteInfo$Long, username = "conbro") %>% 
+  select(Elev = elevation_geonames)
+siteInfo$Elev_m <- siteElev$Elev
+```
+
+# Hydro Data
+
+## Mountain West
+
+```{r}
+mwQ <- read_rds(here("Data/AIMS_ALL_Piezo_RatingCurve_datafile.rds")) %>% 
+  select(dateTime = DateTime, Site = site, Q_Ls = Q) %>% 
+  group_by(Site) %>% 
+  mutate(
+    dateTime = with_tz(dateTime, tzone = "UTC"),
+    Q_Ls = na.approx(Q_Ls, maxgap = 10),
+    siteName = case_when(
+    Site == "GSS01" ~ "Gibson Jack",
+    Site == "JSS01" ~ "Johnston Draw",
+    Site == "DSS01" ~ "Dry Creek"),
+    Site = case_when(
+    Site == "GSS01" ~ "GBJ",
+    Site == "JSS01" ~ "JDR",
+    Site == "DSS01" ~ "DRC"
+  ))
+
+
+
+mwQ %>%
+  ggplot(aes(dateTime, Q_Ls)) +
+  geom_line(color = "#0000FF") +
+  ylab("Q (L/s)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap( ~ siteName, scales = "free", ncol = 1)
+```
+
+## South East
+
+```{r}
+seQ <- read_csv(here("Data/TAL/TLM01_Qwl_2021_2023.csv")) %>% 
+  select(dateTime_CT = datetime.local, stage_cm = level.cm, Q_Ls = Q.Ls) %>% 
+  mutate(
+    # Ensure dateTime_CT is a string to apply regex
+    dateTime_CT = as.character(dateTime_CT),
+    # Standardize time format to ensure two-digit hour
+    dateTime_CT = if_else(
+      str_detect(dateTime_CT, "\\d+/\\d+/\\d+ \\d:\\d{2}"), # Detects date formats with single-digit hour
+      str_replace(dateTime_CT, "(\\d+/\\d+/\\d+ )?(\\d):(\\d{2})", "\\1 0\\2:\\3"), # Prepend 0 to single-digit hour
+      dateTime_CT
+    ),
+    dateTime_CT = if_else(str_detect(dateTime_CT, "\\d{1,2}:\\d{2}"), 
+                               dateTime_CT, 
+                               paste(dateTime_CT, "00:00")),
+    dateTime = with_tz(mdy_hm(dateTime_CT, tz = "America/Chicago"), tzone = "UTC")) %>% 
+  select(-dateTime_CT) %>% 
+  drop_na(dateTime)
+
+# Get min and max dateTime
+# Create a data frame with a sequence of datetimes covering the min to max range
+dateSeq <- seQ %>%
+  summarise(minDate = min(dateTime), maxDate = max(dateTime)) %>%
+  mutate(dateTime = list(seq(from = minDate, to = maxDate, by = "15 min")), .keep = "none") %>%
+  unnest(dateTime)
+
+# Join with the original seQ to get df of all dates every 15 min
+# Interpolate numeric columns
+seQ <- dateSeq %>%
+  left_join(seQ, by = "dateTime") %>%
+  mutate(across(where(is.numeric), ~ na.approx(.x, maxgap = 10, na.rm = F)), 
+         Site = "TAL")
+
+
+seQ %>%
+  ggplot(aes(dateTime, Q_Ls)) +
+  geom_line(color = "#0000FF") +
+  ylab("Q (L/s)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Dissolved Oxygen
+
+## API Sites
+
+```{r}
+# Path to QAQC pipeline
+qaqcPath <- here("Data/EXO_QAQC/01_data/04_postQaqc/")
+# Site to load data
+Sites <- c("GBJ", "SHN", "KMZ")
+
+# Read data for each site and combine
+aimsDO <- rbindlist(lapply(Sites, read_QAQCdata), fill = TRUE) %>%
+  filter(alphaQf == 0 & betaQfSd == 0) %>%
+  select(Site, dateTime = timestamp, parameterName, value) %>%
+  pivot_wider(names_from = parameterName, values_from = value) %>%
+  mutate(
+    dateTime = parse_date_time(dateTime, orders = c("ymd HMS"), tz = "UTC"),
+    ODO_mg_L = if_else(ODO_mg_L == 0, NA, ODO_mg_L),
+    SW_Level_ft = if_else(is.na(SW_Level_ft) & !is.na(SW_Level_cm), 
+                          SW_Level_cm * 0.0328084, 
+                          SW_Level_ft)
+  ) %>% 
+  select(dateTime, Site, DO.obs = ODO_mg_L, DO.sat = `ODOSat_%`, water.temp = Temp_EXO_C, SW_Level_ft)
+
+# Get min and max dateTime
+# Create a data frame with a sequence of datetimes covering the min to max range
+dateSeq <- aimsDO %>%
+  group_by(Site) %>%
+  summarise(minDate = min(dateTime), maxDate = max(dateTime)) %>%
+  rowwise() %>% # Ensure operations within mutate are performed row-wise
+  mutate(dateTime = list(seq(from = minDate, to = maxDate, by = "10 min"))) %>%
+  unnest(dateTime) %>%
+  ungroup() # Remove the rowwise grouping
+
+
+# Join with the original aimsDO to get df of all dates every 15 min
+# Interpolate numeric columns
+aimsDO <- aimsDO %>%
+  left_join(dateSeq, by = c("Site", "dateTime")) %>%
+  group_by(Site) %>%
+  mutate(across(where(is.numeric), ~ na.approx(.x, maxgap = 10, na.rm = FALSE))) %>%
+  ungroup() %>% 
+  select(-minDate, -maxDate)
+
+aimsDO %>%
+  ggplot(aes(dateTime, DO.obs)) +
+  geom_line(color = "#0000FF") +
+  ylab("DO (mg/L)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~Site, ncol = 1, scales = "free")
+```
+
+## South East
+
+```{r}
+seDO <- read_csv(here("Data/TAL/TLM01_oxy_20210915_20231231.csv")) %>% 
+  select(dateTime_CT = datetime.local, water.temp = Temp.C, DO.obs = DO.mgL, DO.sat) %>% 
+  mutate(
+    # Ensure dateTime_CT is a string to apply regex
+    dateTime_CT = as.character(dateTime_CT),
+    # Standardize time format to ensure two-digit hour
+    dateTime_CT = if_else(
+      str_detect(dateTime_CT, "\\d+/\\d+/\\d+ \\d:\\d{2}"), # Detects date formats with single-digit hour
+      str_replace(dateTime_CT, "(\\d+/\\d+/\\d+ )?(\\d):(\\d{2})", "\\1 0\\2:\\3"), # Prepend 0 to single-digit hour
+      dateTime_CT
+    ),
+    dateTime_CT = if_else(str_detect(dateTime_CT, "\\d{1,2}:\\d{2}"), 
+                               dateTime_CT, 
+                               paste(dateTime_CT, "00:00")),
+    dateTime = with_tz(mdy_hm(dateTime_CT, tz = "America/Chicago"), tzone = "UTC")) %>% 
+  select(-dateTime_CT) %>% 
+  drop_na(dateTime)
+
+# Get min and max dateTime
+# Create a data frame with a sequence of datetimes covering the min to max range
+dateSeq <- seDO %>%
+  summarise(minDate = min(dateTime), maxDate = max(dateTime)) %>%
+  mutate(dateTime = list(seq(from = minDate, to = maxDate, by = "15 min")), .keep = "none") %>%
+  unnest(dateTime)
+
+# Join with the original seDO to get df of all dates every 15 min
+# Interpolate numeric columns
+seDO <- dateSeq %>%
+  left_join(seDO, by = "dateTime") %>%
+  mutate(across(where(is.numeric), ~ na.approx(.x, maxgap = 10, na.rm = F)), 
+         Site = "TAL")
+
+seDO %>%
+  ggplot(aes(dateTime, DO.obs)) +
+  geom_line(color = "#0000FF") +
+  ylab("DO (mg/L)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## GP Discharge
+
+```{r}
+#KMZ
+kmzRC <- read_sheet("https://docs.google.com/spreadsheets/d/1DkF2Ugr6tEgnZHOGJ_UY2kW9JWH4ce8xbyzSyyA6-CI/edit#gid=0", col_types = "cDcddddddddcccc") %>% 
+  filter(SiteName %in% c("SFM01") & Quality %in% c("Maybe", "Good")) %>% 
+  drop_na(ManualStage_ft) %>% 
+  lm(log(Q_Ls) ~ log(ManualStage_ft), data = .)
+kmzRC <- coef(kmzRC)
+
+shnRC <- read_sheet("https://docs.google.com/spreadsheets/d/1DkF2Ugr6tEgnZHOGJ_UY2kW9JWH4ce8xbyzSyyA6-CI/edit#gid=0", col_types = "cDcddddddddcccc") %>% 
+  filter(SiteName %in% c("SHM01") & Quality %in% c("Maybe", "Good")) %>% 
+  drop_na(ManualStage_ft) %>% 
+  lm(log(Q_Ls) ~ log(ManualStage_ft), data = .) %>%
+  coef()
+
+# Apply the coefficients to calculate Q_Ls for KMZ and SHN sites within the aimsDO data frame
+aimsDO <- aimsDO %>%
+  mutate(SW_Level_ft = case_when(Site == "SHN" ~ 0.99754 * SW_Level_ft + 0.21948, TRUE ~ SW_Level_ft),
+    Q_Ls = case_when(
+    Site == "KMZ" ~ kmzRC["(Intercept)"] + kmzRC["log(ManualStage_ft)"] * SW_Level_ft,
+    Site == "SHN" ~ shnRC["(Intercept)"] + shnRC["log(ManualStage_ft)"] * SW_Level_ft,
+    TRUE ~ NA_real_
+  ))
+
+kmzDat <- aimsDO %>% 
+  filter(Site == "KMZ")
+
+shnDat <- aimsDO %>% 
+  filter(Site == "SHN")
+
+aimsDO %>%
+  filter(Site %in% c("SHN", "KMZ")) %>% 
+  ggplot(aes(dateTime, Q_Ls)) +
+  geom_line(color = "#0000FF") +
+  ylab("Q (L/s)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~Site, ncol = 1, scales = "free")
+```
+
+# Combine Data
+
+## GBJ
+
+```{r}
+gbjDat <- left_join(aimsDO %>% filter(Site == "GBJ"), 
+                    mwQ %>% select(-siteName) %>% filter(Site == "GBJ"), 
+                    by = c("dateTime", "Site")) %>% 
+  select(-Q_Ls.x, Q_Ls = Q_Ls.y)
+
+# Plot for ODO_mg_L
+doPlt <- gbjDat %>%
+  ggplot(aes(x = dateTime, y = DO.obs)) +
+  geom_line(color = "#0000FF") +
+  scale_y_continuous(name = "DO (mg/L)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.text.x = element_blank(), # Hide x-axis text to make it look "broken"
+        axis.title.x = element_blank())
+
+# Plot for Q_Ls
+qPlt <- gbjDat %>%
+  ggplot(aes(x = dateTime, y = Q_Ls)) +
+  geom_line(color = "#FF0000", linetype = "dashed") +
+  scale_y_continuous(name = "Discharge (L/s)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Combine the plots, adjusting spacing as needed
+(doPlt / qPlt) + plot_layout(heights = c(2, 1))
+```
+
+## TAL
+
+```{r}
+talDat <- left_join(seDO, seQ, by = c("dateTime", "Site"))
+
+# Plot for DO
+doPlt <- talDat %>%
+  ggplot(aes(x = dateTime, y = DO.obs)) +
+  geom_line(color = "#0000FF") +
+  scale_y_continuous(name = "DO (mg/L)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.text.x = element_blank(), # Hide x-axis text to make it look "broken"
+        axis.title.x = element_blank())
+
+# Plot for Q_Ls
+qPlt <- talDat %>%
+  ggplot(aes(x = dateTime, y = Q_Ls)) +
+  geom_line(color = "#FF0000", linetype = "dashed") +
+  scale_y_continuous(name = "Discharge (L/s)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Combine the plots, adjusting spacing as needed
+(doPlt / qPlt) + plot_layout(heights = c(2, 1))
+```
+
+## KMZ
+
+```{r}
+# Plot for DO
+doPlt <- aimsDO %>%
+  filter(Site == "KMZ") %>% 
+  ggplot(aes(x = dateTime, y = DO.obs)) +
+  geom_line(color = "#0000FF") +
+  scale_y_continuous(name = "DO (mg/L)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.text.x = element_blank(), # Hide x-axis text to make it look "broken"
+        axis.title.x = element_blank())
+
+# Plot for Q_Ls
+qPlt <- aimsDO %>%
+  filter(Site == "KMZ") %>% 
+  ggplot(aes(x = dateTime, y = Q_Ls)) +
+  geom_line(color = "#FF0000", linetype = "dashed") +
+  scale_y_continuous(name = "Discharge (L/s)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Combine the plots, adjusting spacing as needed
+(doPlt / qPlt) + plot_layout(heights = c(2, 1))
+```
+
+## SHN
+
+```{r}
+# Plot for DO
+doPlt <- aimsDO %>%
+  filter(Site == "SHN") %>% 
+  ggplot(aes(x = dateTime, y = DO.obs)) +
+  geom_line(color = "#0000FF") +
+  scale_y_continuous(name = "DO (mg/L)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.text.x = element_blank(), # Hide x-axis text to make it look "broken"
+        axis.title.x = element_blank())
+
+# Plot for Q_Ls
+qPlt <- aimsDO %>%
+  filter(Site == "SHN") %>% 
+  ggplot(aes(x = dateTime, y = Q_Ls)) +
+  geom_line(color = "#FF0000", linetype = "dashed") +
+  scale_y_continuous(name = "Discharge (L/s)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Combine the plots, adjusting spacing as needed
+(doPlt / qPlt) + plot_layout(heights = c(2, 1))
+```
+
+## All Data
+
+```{r}
+datList <- list(gbjDat, talDat, kmzDat, shnDat)
+allDat <- reduce(datList, full_join)
+```
+
+# Get Site Info for Sites with Data
+
+```{r}
+selSites <- siteInfo %>% 
+  filter(Site %in% unique(allDat$Site))
+```
+
+# BP Data
+
+```{r}
+#Download barometric presssure from NASAPower for each site
+nasaDat <- list()
+for (i in 1:nrow(selSites)) {
+  cat(paste("Downloading data for", selSites$Site[i], "\n"))
+  tempDat <- allDat %>% 
+    filter(Site == selSites$Site[i])
+  sDate <- as_date(min(tempDat$dateTime, na.rm = T))
+  eDate <- as_date(max(tempDat$dateTime, na.rm = T))
+  
+  nasaDat[[i]] <- get_power(
+    community = "sb",
+    pars = c("PSC"),
+    temporal_api = "hourly",
+    lonlat = c(selSites$Long[i], selSites$Lat[i]),
+    dates = c(sDate, eDate),
+    site_elevation = selSites$Elev_m[i],
+    time_standard = "UTC"
+  )
+  nasaDat[[i]]$Site <- selSites$Site[i]
+  cat(paste("Finished downloading data for", selSites$Site[i], "\n"))
+  #Break loop on last iteration
+  if (i == nrow(selSites)) {
+    break
+  }
+}
+
+nasaDat <- do.call(rbind, nasaDat)
+nasaDat <- nasaDat %>% 
+  select(Site, YYYYMMDD, HR, PSC) %>% 
+  mutate(Hour = str_pad(HR, 2, side = "left", pad = 0)) %>% 
+  unite(dateTime, YYYYMMDD, Hour, sep = " ") %>% 
+  mutate(dateTime = ymd_hms(paste0(dateTime, ":00:00")),
+         PSC = PSC*10) %>% #Convert kilopascals to millibar
+  select(-HR)
+
+
+```
+
+## Merge Data with NASA Data
+
+```{r}
+allDat <- allDat %>% 
+  full_join(nasaDat, by = c("Site", "dateTime")) %>% 
+  group_by(Site) %>% 
+  mutate(PSC = na.approx(PSC, maxgap = 6, na.rm = F),
+         DO.sat = calc_DO_sat(temp.water = water.temp, PSC, model = "garcia-benson"),
+         DO.pctsat = 100 * (DO.obs/ DO.sat))
+```
+
+```{r}
+# Plot for DO
+doPlt <- allDat %>%
+  filter(Site == "KMZ" & dateTime > "2022-01-01") %>% 
+  drop_na(DO.pctsat) %>% 
+  ggplot(aes(x = dateTime, y = DO.pctsat)) +
+  geom_point(color = "#3170AC", alpha = 0.8) +
+  scale_y_continuous(name = expression(DO[sat]~"(%)" )) +
+  theme_bw() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 14),
+        text = element_text(size = 14))
+
+# Plot for Q_Ls
+qPlt <- allDat %>%
+  filter(Site == "KMZ" & dateTime > "2022-01-01") %>% 
+  drop_na(DO.pctsat) %>%
+  ggplot(aes(x = dateTime, y = Q_Ls)) +
+  geom_point(alpha = 0.5) +
+  scale_y_continuous(name = "Q (L/s)") +
+  theme_bw()+
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.text.x = element_blank(), # Hide x-axis text to make it look "broken"
+        axis.title.x = element_blank(),
+        text = element_text(size = 14))
+
+# Combine the plots, adjusting spacing as needed
+kmz2022 <- (qPlt / doPlt) + plot_layout(ncol = 1)
+kmz2022
+ggsave("kmz2022-2023.png", kmz2022, here("Figs/"), device = "png", width = 21, height = 15, units = "cm", dpi = "retina")
+
+```
