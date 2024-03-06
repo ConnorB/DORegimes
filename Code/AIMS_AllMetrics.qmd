@@ -308,7 +308,7 @@ gpQ %>%
 # Path to QAQC pipeline
 qaqcPath <- here("Data/EXO_QAQC/01_data/04_postQaqc/")
 # Site to load data
-Sites <- c("GBJ", "SHN", "KMZ", "YMR")
+Sites <- c("GBJ", "SHN", "KMZ", "YMR", "WHR")
 
 # Read data for each site and combine
 aimsDO <- rbindlist(lapply(Sites, read_QAQCdata), fill = TRUE) %>%
@@ -462,6 +462,36 @@ qPlt <- talDat %>%
 (doPlt / qPlt) + plot_layout(heights = c(2, 1))
 ```
 
+## WHR
+
+```{r}
+whrDat <- left_join(aimsDO %>% filter(Site == "WHR"), 
+                    gpQ %>% filter(Site == "WHR"), 
+                    by = c("dateTime", "Site"))
+# Plot for DO
+doPlt <- whrDat %>%
+  ggplot(aes(x = dateTime, y = DO.obs)) +
+  geom_line(color = "#0084a8") +
+  scale_y_continuous(name = "DO (mg/L)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.text.x = element_blank(), # Hide x-axis text to make it look "broken"
+        axis.title.x = element_blank())
+
+# Plot for Q_Ls
+qPlt <- whrDat %>%
+  ggplot(aes(x = dateTime, y = Q_Ls)) +
+  geom_line(color = "#FF0000", linetype = "dashed") +
+  scale_y_continuous(name = "Discharge (L/s)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Combine the plots, adjusting spacing as needed
+(doPlt / qPlt) + plot_layout(heights = c(2, 1))
+```
+
 ## KMZ
 
 ```{r}
@@ -527,13 +557,14 @@ qPlt <- shnDat %>%
 (doPlt / qPlt) + plot_layout(heights = c(2, 1))
 ```
 
+## YMR
+
 ```{r}
 ymrDat <- left_join(aimsDO %>% filter(Site == "YMR"), 
                     gpQ %>% filter(Site == "YMR"), 
                     by = c("dateTime", "Site"))
 # Plot for DO
 doPlt <- ymrDat %>%
-  filter(Site == "YMR") %>% 
   ggplot(aes(x = dateTime, y = DO.obs)) +
   geom_line(color = "#0084a8") +
   scale_y_continuous(name = "DO (mg/L)") +
@@ -544,7 +575,6 @@ doPlt <- ymrDat %>%
 
 # Plot for Q_Ls
 qPlt <- ymrDat %>%
-  filter(Site == "YMR") %>% 
   ggplot(aes(x = dateTime, y = Q_Ls)) +
   geom_line(color = "#FF0000", linetype = "dashed") +
   scale_y_continuous(name = "Discharge (L/s)") +
@@ -560,7 +590,7 @@ qPlt <- ymrDat %>%
 ## All Data
 
 ```{r}
-datList <- list(gbjDat, talDat, kmzDat, shnDat, ymrDat)
+datList <- list(gbjDat, talDat, whrDat, kmzDat, shnDat, ymrDat)
 allDat <- reduce(datList, full_join)
 ```
 
@@ -609,7 +639,6 @@ nasaDat <- nasaDat %>%
          PSC = PSC*10, #Convert kilopascals to millibar
          PAR.obs = convert_SW_to_PAR(ALLSKY_SFC_SW_DWN)) %>% 
   select(-HR, -ALLSKY_SFC_SW_DWN)
-
 ```
 
 ## Merge Data with NASA Data
