@@ -23,7 +23,8 @@ library(lubridate)
 library(tidyverse)
 library(here)
 # Get list of files
-files <- list.files(here("Data/USGS_Q/"),pattern = "*.csv",full.names = TRUE)
+#files <- list.files(here("Data/USGS_Q/"),pattern = "*.csv",full.names = TRUE)
+files <- list.files(here("Data/AIMS_Q/"),pattern = "*.csv",full.names = TRUE)
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Step 2: Create Function ------------------------------------------------------
@@ -462,4 +463,4 @@ tf-t0
 # write_csv(export,paste0('./data/metrics_by_gage.csv'))
 # 
 
-write_csv(output,here("Data/metrics_by_event.csv"))
+write_csv(output,here("Data/AIMS_metrics_by_event.csv"))

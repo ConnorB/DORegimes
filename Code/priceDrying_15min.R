@@ -24,12 +24,12 @@ metrics_fun <- function(df) {
            num_datetime = as.numeric(datetime),
            q = round(Flow, 1)) %>% 
     na.omit() %>%
-    # Split the data by site_no
-    group_by(site_no) %>%
+    # Split the data by Site
+    group_by(Site) %>%
     # Perform the calculations on each group
     group_modify( ~ {
       .x <- .x %>%
-        mutate(q_peak = if_else(q > quantile(q, 0.95),  q, 0)) %>%
+        mutate(q_peak = if_else(q > quantile(q, 0.25),  q, 0)) %>%
         mutate(
           # Calculate slope based on seconds
           slp_b = (q_peak - lag(q_peak)) / (num_datetime - lag(num_datetime)),
@@ -239,7 +239,7 @@ eventID <- function(df) {
     mutate(datetime = ymd_hms(Date),
            num_datetime = as.numeric(datetime),
            q = round(Flow, 1),
-           q_peak = if_else(q > quantile(q, 0.95), q, 0))
+           q_peak = if_else(q > quantile(q, 0.25), q, 0))
   
   # Define peaks using slope break method
   df <- df %>% 
