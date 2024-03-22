@@ -28,7 +28,8 @@ library(tidyverse)
 
 out = data.frame()
 
-files = list.files(here("Data/USGS_Q/"),pattern = '*csv',full.names = T)
+#files = list.files(here("Data/USGS_Q/"),pattern = '*csv',full.names = T)
+files = list.files(here("Data/AIMS_Q/"),pattern = '*csv',full.names = T)
 
 
 # files = files[1:5]
@@ -43,4 +44,4 @@ for (i in files){
 }
 
 
-write.csv(out,here("Data/gages_percentile.csv"))
+write.csv(out,here("Data/AIMS_percentile.csv"))

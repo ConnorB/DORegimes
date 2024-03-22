@@ -196,15 +196,15 @@ metrics_fun <- function(n){
         event_id = t$event_id[1],
         #Define Year 
         calendar_year = year(t$date[1]), 
-        #Define season
-        season = if_else(month(t$date[1])<=3, "Winter", 
-                         if_else(month(t$date[1])>3 & month(t$date[1])<=6, "Spring", 
-                                 if_else(month(t$date[1])>6 & month(t$date[1])<=9, "Summer", 
-                                         "Fall"))), 
-        #Define meterological year
-        meteorologic_year = if_else(season == 'Winter', 
-                                    calendar_year -1,
-                                    calendar_year),
+        # #Define season
+        # season = if_else(month(t$date[1])<=3, "Winter", 
+        #                  if_else(month(t$date[1])>3 & month(t$date[1])<=6, "Spring", 
+        #                          if_else(month(t$date[1])>6 & month(t$date[1])<=9, "Summer", 
+        #                                  "Fall"))), 
+        # #Define meterological year
+        # meteorologic_year = if_else(season == 'Winter', 
+        #                             calendar_year -1,
+        #                             calendar_year),
         #define dry date
         dry_date_start = as.POSIXlt(t$date, "%Y-%m-%d")$yday[1],
         #Define mean dry date
@@ -215,8 +215,8 @@ metrics_fun <- function(n){
       output<-tibble(
         event_id = t$event_id[1],
         calendar_year = NA, 
-        season = NA,
-        meteorologic_year = NA, 
+        # season = NA,
+        # meteorologic_year = NA, 
         dry_date_start = NA,
         dry_date_mean = NA,
         dry_dur = NA

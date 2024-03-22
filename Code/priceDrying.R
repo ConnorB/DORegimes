@@ -30,8 +30,8 @@ metrics_fun <- function(df) {
     # Perform the calculations on each group
     group_modify( ~ {
       .x <- .x %>%
-        #mutate(q_peak = if_else(q > 0.1,  q, 0)) %>%
-        mutate(q_peak = if_else(q > quantile(q, 0.25),  q, 0)) %>%
+        mutate(q_peak = if_else(q > 0.1,  q, 0)) %>%
+        mutate(q_peak = if_else(q > quantile(q, 0.15, na.rm = T),  q, 0)) %>%
         mutate(
           slp_b = (q_peak - lag(q_peak)) / (num_date - lag(num_date)),
           slp_f = (lead(q_peak) - q_peak) / (lead(num_date) - num_date)
@@ -196,22 +196,6 @@ dry_fun <- function(m, df) {
       event_id = t$event_id[1],
       #Define Year
       calendar_year = year(t$date[1]),
-      #Define season
-      season = if_else(
-        month(t$date[1]) <= 3,
-        "Winter",
-        if_else(
-          month(t$date[1]) > 3 & month(t$date[1]) <= 6,
-          "Spring",
-          if_else(month(t$date[1]) > 6 &
-                    month(t$date[1]) <= 9, "Summer",
-                  "Fall")
-        )
-      ),
-      #Define meterological year
-      meteorologic_year = if_else(season == 'Winter',
-                                  calendar_year - 1,
-                                  calendar_year),
       #define dry date
       dry_date_start = as.POSIXlt(t$date, "%Y-%m-%d")$yday[1],
       #Define mean dry date
@@ -243,8 +227,8 @@ eventID <- function(df){
            num_date = as.numeric(Date), 
            q = round(Flow, 1),
            #q = Flow,
-           #q_peak = if_else(q > 0.1,  q, 0))
-           q_peak = if_else(q>quantile(q,0.25),  q, 0))
+           q_peak = if_else(q > 0.1,  q, 0),
+           q_peak = if_else(q>quantile(q,0.15, na.rm = T),  q, 0))
   
   #Define peaks using slope break method
   df<-df %>% 

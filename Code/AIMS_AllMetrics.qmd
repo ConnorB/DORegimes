@@ -28,7 +28,7 @@ library(zoo)
 library(nasapower)
 library(imputeTS)
 library(rgbif)
-source(here("Code/priceDrying_15min.R"))
+source(here("Code/priceDrying.R"))
 source(here("Code/Functions/exoPipeline.R"))
 ```
 
@@ -55,15 +55,10 @@ mwQ <- read_rds(here("Data/AIMS_ALL_Piezo_RatingCurve_datafile.rds")) %>%
   mutate(
     dateTime = with_tz(dateTime, tzone = "UTC"),
     Q_Ls = na.approx(Q_Ls, maxgap = 10),
-    siteName = case_when(
-    Site == "GSS01" ~ "Gibson Jack",
-    Site == "JSS01" ~ "Johnston Draw",
-    Site == "DSS01" ~ "Dry Creek"),
     Site = case_when(
     Site == "GSS01" ~ "GBJ",
     Site == "JSS01" ~ "JDR",
-    Site == "DSS01" ~ "DRC"
-  ))
+    Site == "DSS01" ~ "DRC"))
 
 dateSeq <- mwQ %>%
   group_by(Site) %>%
@@ -298,6 +293,16 @@ gpQ %>%
   theme(axis.title.x = element_blank(),
         axis.text.x = element_text(angle = 45, hjust = 1))+
   facet_wrap(~Site, ncol = 1, scales = "free")
+
+gpQ %>%
+  #filter(Q_Ls > -10) %>% 
+  ggplot(aes(dateTime, SW_Level_ft)) +
+  ylab("SW Level (ft)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~Site, ncol = 1, scales = "free")
 ```
 
 # Dissolved Oxygen
@@ -308,7 +313,7 @@ gpQ %>%
 # Path to QAQC pipeline
 qaqcPath <- here("Data/EXO_QAQC/01_data/04_postQaqc/")
 # Site to load data
-Sites <- c("GBJ", "SHN", "KMZ", "YMR", "WHR")
+Sites <- c("GBJ", "DRC", "JDR", "SHN", "KMZ", "YMR", "WHR")
 
 # Read data for each site and combine
 aimsDO <- rbindlist(lapply(Sites, read_QAQCdata), fill = TRUE) %>%
@@ -403,47 +408,47 @@ seDO %>%
 ## MW
 
 ```{r}
-# Site to load data
-Sites <- c("DRC", "JDR")
-
-# Read data for each site and combine
-mwDO <- rbindlist(lapply(Sites, read_QAQCdata), fill = TRUE) %>%
-  filter(alphaQf == 0 & betaQfSd == 0) %>%
-  select(Site, dateTime = timestamp, parameterName, value) %>%
-  pivot_wider(names_from = parameterName, values_from = value, values_fn = mean) %>%
-  mutate(
-    dateTime = parse_date_time(dateTime, orders = c("ymd HMS"), tz = "UTC")) %>% 
-  select(dateTime, Site, DO.obs = ODO_mg_L, water.temp = Temp_EXO_C)
-
-# Get min and max dateTime
-# Create a data frame with a sequence of datetimes covering the min to max range
-dateSeq <- mwDO %>%
-  group_by(Site) %>%
-  summarise(minDate = min(dateTime), maxDate = max(dateTime)) %>%
-  rowwise() %>% # Ensure operations within mutate are performed row-wise
-  mutate(dateTime = list(seq(from = minDate, to = maxDate, by = "10 min"))) %>%
-  unnest(dateTime) %>%
-  ungroup() # Remove the rowwise grouping
-
-
-# Join with the original aimsDO to get df of all dates every 15 min
-# Interpolate numeric columns
-mwDO <- dateSeq %>%
-  left_join(aimsDO, by = c("Site", "dateTime")) %>%
-  group_by(Site) %>%
-  mutate(across(where(is.numeric), ~ na.approx(.x, maxgap = 10, na.rm = FALSE))) %>%
-  ungroup() %>% 
-  select(-minDate, -maxDate)
-
-mwDO %>%
-  ggplot(aes(dateTime, DO.obs)) +
-  geom_line(color = "#0084a8") +
-  ylab("DO (mg/L)") +
-  theme_few() +
-  scale_x_datetime(labels = date_format("%b '%y")) +
-  theme(axis.title.x = element_blank(),
-        axis.text.x = element_text(angle = 45, hjust = 1))+
-  facet_wrap(~Site, ncol = 2, scales = "free")
+# # Site to load data
+# Sites <- c("DRC", "JDR")
+# 
+# # Read data for each site and combine
+# mwDO <- rbindlist(lapply(Sites, read_QAQCdata), fill = TRUE) %>%
+#   filter(alphaQf == 0 & betaQfSd == 0) %>%
+#   select(Site, dateTime = timestamp, parameterName, value) %>%
+#   pivot_wider(names_from = parameterName, values_from = value, values_fn = mean) %>%
+#   mutate(
+#     dateTime = parse_date_time(dateTime, orders = c("ymd HMS"), tz = "UTC")) %>% 
+#   select(dateTime, Site, DO.obs = ODO_mg_L, water.temp = Temp_EXO_C)
+# 
+# # Get min and max dateTime
+# # Create a data frame with a sequence of datetimes covering the min to max range
+# dateSeq <- mwDO %>%
+#   group_by(Site) %>%
+#   summarise(minDate = min(dateTime), maxDate = max(dateTime)) %>%
+#   rowwise() %>% # Ensure operations within mutate are performed row-wise
+#   mutate(dateTime = list(seq(from = minDate, to = maxDate, by = "10 min"))) %>%
+#   unnest(dateTime) %>%
+#   ungroup() # Remove the rowwise grouping
+# 
+# 
+# # Join with the original aimsDO to get df of all dates every 15 min
+# # Interpolate numeric columns
+# mwDO <- dateSeq %>%
+#   left_join(aimsDO, by = c("Site", "dateTime")) %>%
+#   group_by(Site) %>%
+#   mutate(across(where(is.numeric), ~ na.approx(.x, maxgap = 10, na.rm = FALSE))) %>%
+#   ungroup() %>% 
+#   select(-minDate, -maxDate)
+# 
+# mwDO %>%
+#   ggplot(aes(dateTime, DO.obs)) +
+#   geom_line(color = "#0084a8") +
+#   ylab("DO (mg/L)") +
+#   theme_few() +
+#   scale_x_datetime(labels = date_format("%b '%y")) +
+#   theme(axis.title.x = element_blank(),
+#         axis.text.x = element_text(angle = 45, hjust = 1))+
+#   facet_wrap(~Site, scales = "free")
 ```
 
 # Combine Data
@@ -467,6 +472,33 @@ doPlt <- gbjDat %>%
 
 # Plot for Q_Ls
 qPlt <- gbjDat %>%
+  ggplot(aes(x = dateTime, y = Q_Ls)) +
+  geom_line(color = "#FF0000", linetype = "dashed") +
+  scale_y_continuous(name = "Discharge (L/s)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Combine the plots, adjusting spacing as needed
+(doPlt / qPlt) + plot_layout(heights = c(2, 1))
+
+jdrDat <- left_join(aimsDO %>% filter(Site == "JDR"), 
+                    mwQ %>% select(-siteName) %>% filter(Site == "JDR"), 
+                    by = c("dateTime", "Site"))
+
+# Plot for ODO_mg_L
+doPlt <- jdrDat %>%
+  ggplot(aes(x = dateTime, y = DO.obs)) +
+  geom_line(color = "#0084a8") +
+  scale_y_continuous(name = "DO (mg/L)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.text.x = element_blank(), # Hide x-axis text to make it look "broken"
+        axis.title.x = element_blank())
+
+# Plot for Q_Ls
+qPlt <- jdrDat %>%
   ggplot(aes(x = dateTime, y = Q_Ls)) +
   geom_line(color = "#FF0000", linetype = "dashed") +
   scale_y_continuous(name = "Discharge (L/s)") +
@@ -636,7 +668,7 @@ qPlt <- ymrDat %>%
 ## All Data
 
 ```{r}
-datList <- list(gbjDat, talDat, whrDat, kmzDat, shnDat, ymrDat)
+datList <- list(gbjDat, jdrDat, talDat, whrDat, kmzDat, shnDat, ymrDat)
 allDat <- reduce(datList, full_join)
 ```
 
@@ -824,7 +856,7 @@ allDat %>%
   labs(x = "DO (mg/L)", y = "Density") +
   theme_few() +
   theme(legend.title = element_blank(), legend.position = "bottom") +
-  facet_wrap(~Site, ncol = 2)
+  facet_wrap(~Site, ncol = 2, scale = "fixed")
 
 allDat %>%
   ggplot(aes(x = DO.pctsat, fill = isDaytime)) +
@@ -836,7 +868,7 @@ allDat %>%
   labs(x = expression(DO[sat]~"(%)" ), y = "Density") +
   theme_few() +
   theme(legend.title = element_blank(), legend.position = "bottom") +
-  facet_wrap(~Site, ncol = 2, scales = "free")
+  facet_wrap(~Site, ncol = 2, scales = "fixed")
 
 doMet %>%
   ggplot(aes(Date, probHyp)) +
@@ -864,10 +896,11 @@ doMet %>%
 
 ```{r}
 dailyQ <- allDat %>% 
-  mutate(Date = floor_date(solar.time, "1 day")) %>%
+  mutate(Date = ymd(floor_date(solar.time, "1 day"))) %>%
   group_by(Site, Date) %>%
   summarize(Flow = mean(Q_Ls, na.rm = T)) %>% 
-  mutate(Flow = ifelse(Flow < 0, 0, Flow)) %>% 
+  mutate(Flow = replace_na(Flow, 0),
+         Flow = ifelse(Flow < 0, 0, Flow)) %>% 
   select(gage = Site, Date, Flow)
 
 for (i in unique(dailyQ$gage)) {
@@ -876,28 +909,36 @@ for (i in unique(dailyQ$gage)) {
   write.csv(siteData, paste0(here("Data/AIMS_Q/"), fileName), row.names = FALSE)
 }
 
+## Run sub_annual_metrics script
+```
 
-#Hydro metrics from Price et al.
-hydroMet <- metrics_fun(dailyQ)
-#get event id from hydro metrics
-dailyQ <- eventID(dailyQ) 
+```{r}
+dryingMet <- read_csv(here("Data/AIMS_metrics_by_event.csv")) %>% 
+  drop_na(event_id) %>% 
+  mutate(dryDateStart = ymd(paste0(calendar_year, "-01-01")) + days(dry_date_start - 1),
+         Date = dryDateStart,
+         dryDateEnd = ymd(Date + days(dry_dur - 1)),
+         peakDate = ymd(paste0(calendar_year, "-01-01")) + days(peak_date - 1))
+
 #Merge hydro metrics with ts
 hydroTS <- dailyQ %>% 
-  full_join(hydroMet, by = c("site_no", "event_id"))
+  full_join(dryingMet, by = c("gage", "Date"))
+```
 
+```{r}
 hydroTS %>%
-  ggplot(aes(Date, q)) +
-  geom_line(color = "#0000FF") +
-  ylab("Q (cfs)") +
+  ggplot(aes(Date, Flow)) +
+  geom_line(color = "#0084a8") +
+  ylab("Q (L/s)") +
   theme_few() +
-  geom_rect(data = dailyQ %>% filter(peak_flag == 1), aes(xmin = Date, xmax = Date + 1, ymin = -Inf, ymax = +Inf),
-    fill = "#ff7f50",
-    alpha = 0.8) +
-  geom_rect(data = dailyQ %>% filter(q <= 0), aes(xmin = Date, xmax = Date + 1, ymin = -Inf, ymax = +Inf),
-    fill = "#696969",
+  geom_rect(aes(xmin = dryDateStart, xmax = dryDateEnd, ymin = -Inf, ymax = +Inf),
+    fill = "#d3d3d3",
     alpha = 0.5) +
+    geom_rect(aes(xmin = peakDate, xmax = peakDate + 1, ymin = -Inf, ymax = +Inf),
+    fill = "#ff0000",
+    alpha = 0.8) +
   scale_x_date() +
   theme(axis.title.x = element_blank(),
         axis.text.x = element_text(angle = 45, hjust = 1)) +
-  facet_wrap( ~ site_no, scales = "free")
+  facet_wrap( ~ gage, scales = "free")
 ```
