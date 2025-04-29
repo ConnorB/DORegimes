@@ -1,0 +1,387 @@
+---
+title: "Predict Stream and Benthic Light using StreamLight"
+author: "CLB"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+#| echo: false
+library(here)
+source(here("Code/paths+packages.R"))
+library(future)
+library(furrr)
+library(purrr)
+library(googlesheets4)
+#remotes::install_github("psavoy/StreamLightUtils")
+#remotes::install_github("psavoy/StreamLight", build_vignettes = T, build_manual = T)
+library(StreamLightUtils)
+library(StreamLight)
+okabeIto <- c("#0072B2", "#E69F00", "#CC79A7", "#009E73", "#56B4E9", "#D55E00", "#F0E442", "#999999", "#000000")
+
+pathDir <- here("Data/streamLight")
+```
+
+# Get Data
+
+## AIMS Sites
+
+```{r}
+siteInfo <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Sites") |> 
+  dplyr::filter(siteId %in% c("SFM01", "SHM01", "ENM01")) |> 
+  dplyr::rename(Site_ID = siteId) |> 
+  st_transform(crs = 4326) |>
+  dplyr::mutate(
+    Lon = st_coordinates(geom)[, 1],
+    Lat = st_coordinates(geom)[, 2]
+  ) |> 
+  mutate(
+    bank_height = (left_bank_height + right_bank_height) / 2,
+    bank_slope  = (left_bank_slope + right_bank_slope) / 2
+  )
+```
+
+## NLDAS
+
+```{r}
+#| include: false
+#| echo: false
+# #Download NLDAS data
+NLDAS_DL_bulk(
+    save_dir = file.path(pathDir, "NLDAS"),
+    site_locs = siteInfo,
+    startDate = "2021-01-01"
+  )
+
+#List of successfully downloaded sites
+nldasList <- stringr::str_sub(list.files(file.path(pathDir, "NLDAS")), 1, -11)
+  
+#Processing the downloaded NLDAS data
+NLDAS_processed <- StreamLightUtils::NLDAS_proc(read_dir = file.path(pathDir, "NLDAS"), nldasList)
+```
+
+## MODIS LAI
+
+```{r}
+#Make a table for the MODIS request 
+site_locs <- siteInfo |> dplyr::select("Site_ID", "Lat", "Lon")
+          
+#Export your sites as a .csv for the AppEEARS request  
+  write.table(
+    site_locs, 
+    file.path(pathDir, "sites.csv"), 
+    sep = ",", 
+    row.names = FALSE,
+    quote = FALSE, 
+    col.names = FALSE
+  )
+  
+# Unzip MODIS Data
+modDat  <- AppEEARS_unpack_QC(
+  zip_file = "AIMS_MODIS.zip", 
+  zip_dir = file.path(pathDir, "MODIS"), 
+  request_sites = site_locs$Site_ID)
+
+modDat <- modDat[names(modDat) != "" & !is.na(names(modDat))]
+```
+
+## Process MODIS
+
+```{r}
+# List of available fit methods from phenofit
+fit_methods <- c("AG", "Beck", "Elmore", "Gu", "Klos", "Zhang")
+
+# Function to calculate evaluation metrics
+calculate_metrics <- function(observed, predicted) {
+  # Remove NA values
+  valid <- !is.na(observed) & !is.na(predicted)
+  obs <- observed[valid]
+  pred <- predicted[valid]
+  
+  if (length(obs) == 0) return(list(RMSE = NA, R2 = NA))
+  
+  rmse <- sqrt(mean((obs - pred)^2))
+  r2 <- cor(obs, pred)^2
+  
+  return(list(RMSE = rmse, R2 = r2))
+}
+
+# Set up parallel plan
+plan(multisession) 
+# Alternative: plan() on Linux/Mac for potentially better performance
+
+# Main parallel processing using furrr
+results <- future_map(fit_methods, function(method) {
+  # Process data with current method
+  modProc <- suppressWarnings(AppEEARS_proc(unpacked_LAI = modDat, fit_method = method, plot = FALSE))
+  
+  # Calculate metrics for all sites
+  site_metrics <- map(names(modProc), function(site_name) {
+    site_data <- modProc[[site_name]]
+    calculate_metrics(site_data$Lai, site_data$LAI_proc)
+  })
+  
+  # Extract metrics
+  all_rmse <- map_dbl(site_metrics, "RMSE") |> na.omit()
+  all_r2 <- map_dbl(site_metrics, "R2") |> na.omit()
+  
+  # Return summary for this method
+  list(
+    Method = method,
+    RMSE_mean = mean(all_rmse),
+    R2_mean = mean(all_r2),
+    RMSE_sd = sd(all_rmse),
+    R2_sd = sd(all_r2)
+  )
+}, .options = furrr_options(seed = TRUE), .progress = T)  
+
+# Convert results to a data frame
+results_df <- map_dfr(results, as.data.frame)
+
+# Find the best method based on lowest RMSE and highest R2
+best_method <- results_df |> 
+  arrange(RMSE_mean, desc(R2_mean)) |> 
+  slice(1) |> 
+  pull(Method)
+
+# Clean up parallel workers
+plan(sequential)
+
+```
+
+### 
+
+```{r}
+MOD_processed <- AppEEARS_proc(
+  unpacked_LAI = modDat,  
+  fit_method = best_method, 
+  plot = T)
+```
+
+# Driver Files
+
+```{r}
+#Set coordinate reference system with EPSG code, "4326" is WGS84
+siteInfo$epsg_crs <- 4326
+siteInfo <- siteInfo |> 
+  as.data.frame()
+#Make driver file for StreamLight
+driverFile <- StreamLightUtils::make_driver(site_locs = siteInfo,
+            NLDAS_processed = NLDAS_processed,
+            MOD_processed = MOD_processed,
+            write_output = T,
+            save_dir = file.path(pathDir, "driverFiles")
+            )
+```
+
+# Parameter Files
+
+We need to make a parameter file for streamLight, parameters include:
+
+-   Lat: The site latitude
+-   Lon: The site longitude
+-   channel_azimuth: Channel azimuth
+-   bottom_width: Bottom width (m)
+-   BH: Bank height (m)
+-   BS: Bank slope
+-   WL: Water level (m)
+-   TH: Tree height (m)
+-   overhang: Maximum canopy overhang (m)
+-   overhang_height: Height of the maximum canopy overhang (m). If overhang_height = NA, then the model defaults to a value of 75% of tree height.
+-   x_LAD: Leaf angle distribution, default = 1
+
+```{r}
+extract_height <- function(Site_ID, Lat, Lon, site_crs){
+  #Import the Simard et al. (2011) dataset 
+    simard2011 <- raster::raster(paste0(.libPaths()[1], "/StreamLightUtils/data/simard2011.tif"))
+  
+  # #Import the Simard et al. (2011) dataset if it is not already loaded
+  #   if(!exists("simard2011")){data("simard2011", package = "StreamLightUtils")}
+
+  #Defining the min and max values (by default these are not associated with the raster)
+    map_ranges <- raster::setMinMax(simard2011)
+    
+  #Create a simple features object from the site location
+    site_location <- data.frame(Lat, Lon)
+    
+  #Check if the data is in WGS84, if not reproject to WGS84
+    if(site_crs == 4326){
+      xy_sf <- sf::st_as_sf(site_location, coords = c('Lon', 'Lat'), crs = site_crs)
+    } else{
+      xy_native <- sf::st_as_sf(site_location, coords = c('Lon', 'Lat'), crs = site_crs)
+      xy_sf <- sf::st_transform(xy_native, crs = 4326)
+    } #End if else statement    
+ 
+  #Extracting the canopy height at our site
+    suppressWarnings(TH <- raster::extract(map_ranges, xy_sf))
+
+  #Bind together the final information
+    bound <- setNames(data.frame(Site_ID, Lat, Lon, TH), c("Site_ID", "Lat", "Lon", "TH"))
+
+  return(bound)
+} #End extract_height function
+```
+
+```{r}
+#Get tree height from streamLightUtils
+treeHeight <- extract_height(
+    Site_ID = siteInfo$Site_ID, 
+    Lat = siteInfo$Lat,
+    Lon = siteInfo$Lon,
+    site_crs = 4326)
+setDT(treeHeight)
+treeHeight <- treeHeight[, .(Site_ID, TH)]
+
+waterDepth <- aims_read(input_dir = "~/Dropbox/AIMS/GP_SW-GW_QAQC/Data/Processed", 
+                        rType = "PRES",
+                        sublocation = "SW") |> 
+  rename(Site_ID = siteId) |> 
+  group_by(Site_ID) |>
+  summarise(avg_depth = mean(waterDepth_m, na.rm = TRUE)) |>
+  ungroup()
+
+
+siteInfo <- siteInfo |> 
+  left_join(waterDepth) |> 
+  left_join(treeHeight)
+```
+
+```{r}
+batch_model_to_csv <- function(sites, read_dir, save_path) {
+  # Initialize an empty list to store all results
+  all_results <- list()
+  
+  # Process each site
+  for (Site in sites) {
+    tryCatch({
+      # Construct the driver file path
+      driver_path <- file.path(read_dir, paste0(Site, "_driver.rds"))
+      
+      # Check if driver file exists
+      if (!file.exists(driver_path)) {
+        warning(paste("Driver file not found for site:", Site))
+        next
+      }
+      
+      # Get the model driver
+      driver_file <- readRDS(driver_path)
+      
+      # Get model parameters for the site
+      site_p <- siteInfo[siteInfo$Site_ID == Site, ]
+      
+      # Run the model
+      modeled <- stream_light(
+        driver_file, 
+        Lat = site_p$Lat, 
+        Lon = site_p$Lon,
+        channel_azimuth = site_p$azimuth, 
+        bottom_width = site_p$bottom_width_m, 
+        TH = site_p$TH, 
+        WL = site_p$avg_depth,
+        BH = site_p$bank_height,
+        BS = site_p$bank_slope,
+        overhang = site_p$TH * 0.1, #Assume overhang is 10% of Tree Height 
+        overhang_height = NA, 
+        x_LAD = 1
+      )
+      
+      # Add site ID to results
+      modeled$Site_ID <- Site
+      
+      # Convert all problematic columns to character
+      modeled <- modeled |>
+        mutate(across(where(~is.list(.) || is.matrix(.) || !is.atomic(.)), 
+               ~ sapply(.x, function(x) {
+                 if (is.null(x)) return(NA_character_)
+                 paste(as.character(x), collapse = "|")
+               })))
+      
+      # Store results
+      all_results[[Site]] <- modeled
+      
+      message("Successfully processed ", Site)
+      
+    }, error = function(e) {
+      warning(paste("Error processing site", Site, ":", e$message))
+    })
+  }
+  
+  # Combine all results into one data frame
+  combined_results <- bind_rows(all_results)
+  
+  # Create directory if it doesn't exist
+  dir.create(dirname(save_path), showWarnings = FALSE, recursive = TRUE)
+  
+  # Save to CSV - using data.table::fwrite which handles complex types better
+  if (!requireNamespace("data.table", quietly = TRUE)) {
+    install.packages("data.table")
+  }
+  data.table::fwrite(combined_results, save_path)
+  
+  message("All results saved to: ", save_path)
+  
+  return(combined_results)
+}
+
+# Run the model again
+results <- batch_model_to_csv(
+  sites = siteInfo$Site_ID,
+  read_dir = file.path(pathDir, "driverFiles"),
+  save_path = file.path(pathDir, "predLight/all_sites_results.csv")
+)
+```
+
+```{r}
+
+results |> 
+  ggplot(aes(local_time, PAR_surface))+
+  geom_line(color = "darkgoldenrod1")+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  labs(y = expression(PAR~(mu*"mol m"^-2*"s"^-1)))+
+  theme_bw()+
+  theme(axis.text = element_text(size = 10), axis.title = element_text(size = 12),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        legend.text = element_text(size = 8))+
+  facet_wrap(~Site_ID, ncol = 3, scales = "fixed")
+```
+
+```{r}
+waterDepth <- aims_read(input_dir = "~/Dropbox/AIMS/GP_SW-GW_QAQC/Data/Processed", 
+                        rType = "PRES",
+                        sublocation = "SW") |> 
+  rename(Site_ID = siteId) |> 
+  group_by(Site_ID) |>
+  summarise(avg_depth = mean(waterDepth_m, na.rm = TRUE)) |>
+  ungroup()
+```
+
+# Get Turb
+
+```{r}
+# Path to QAQC pipeline
+qaqcPath <- here("Data/EXO_QAQC/01_data/04_postQaqc/")
+# Site to load data
+Sites <- c("SHN", "KMZ", "YMR")
+# Read data for each site and combine
+gpTurb <- aims_read(input_dir = qaqcPath, siteId = Sites, rType = "EXOS") |> 
+  dplyr::filter(alphaQf == 0 & betaQfSd == 0, parameterName == "Turbidity_NTU") |>
+  dplyr::select(Site, dateTime = timestamp, Turbidity_NTU = value) |>
+  mutate(
+    dateTime = ymd_hms(dateTime)
+  ) |>
+  mutate(date = as_date(dateTime)) |> 
+  dplyr::filter(!(Site == "YMR" & dateTime < "2021-07-18"),
+         !(Site == "SHN" & dateTime < "2023-03-24"),
+         !(Site == "KMZ" & dateTime < "2021-06-10")
+         ) |> 
+  rename(Site_ID = Site) |> 
+  group_by(Site_ID, date) |>
+  summarise(turb = mean(Turbidity_NTU, na.rm = TRUE)) |>
+  ungroup()
+
+gpTurb <- gpTurb |> 
+  mutate(kd_pred = 0.52*log(turb)-0.26 )
+
+
+```

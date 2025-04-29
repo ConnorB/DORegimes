@@ -1,0 +1,1382 @@
+---
+title: "MW DO Regimes"
+author: "CLB"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+library(data.table)
+library(tidyverse, warn.conflicts = F)
+options(readr.show_col_types = F)
+library(googlesheets4)
+library(ggthemes)
+library(ggpmisc)
+library(ggpubr)
+library(patchwork)
+library(here)
+library(styler)
+library(streamMetabolizer)
+library(rstan)
+options(mc.cores = parallel::detectCores())
+library(dataRetrieval)
+library(scales)
+library(knitr)
+library(lubridate)
+library(zoo)
+library(nasapower)
+library(imputeTS)
+library(rgbif)
+library(dygraphs)
+source(here("Code/priceDrying.R"))
+source(here("Code/Functions/exoPipeline.R"))
+source(here("Code/Functions/BaseflowSeparation.R"))
+```
+
+# Site Data
+
+```{r}
+siteInfo <- tibble(Site = c("KMZ", "SHN", "YMR", "GBJ", "DRC", "JDR", "TAL", "WHR", "PRF"),
+                   Lat = c(39.092353, 39.115220, 37.56452, 42.78483889, 43.7184, 43.1226, 33.7621789, 32.98463, 34.968669),
+                   Long = c(-96.587238, -96.558380, -96.49102, -112.44484722, -116.137, -116.776, -85.595521, -88.012269, -86.165439))
+
+siteElev <-  elevation(latitude = siteInfo$Lat, longitude = siteInfo$Long, username = "conbro") %>% 
+  select(Elev = elevation_geonames)
+siteInfo$Elev_m <- siteElev$Elev
+```
+
+# Hydro Data
+
+## Mountain West
+
+```{r}
+mwQ <- read_rds(here("Data/AIMS_ALL_Piezo_RatingCurve_datafile.rds")) %>% 
+  select(dateTime = DateTime, Site = site, Q_Ls = Q, stage_cm = FS_stage) %>% 
+  group_by(Site) %>% 
+  mutate(
+    dateTime = with_tz(dateTime, tzone = "UTC"),
+    Q_Ls = na.approx(Q_Ls, maxgap = 10),
+    Site = case_when(
+    Site == "GSS01" ~ "GBJ",
+    Site == "JSS01" ~ "JDR",
+    Site == "DSS01" ~ "DRC")) %>% 
+  filter(year(dateTime) >= 2022) %>% 
+  filter(!is.na(Q_Ls))
+
+mwQ <- mwQ %>%
+  group_by(Site) %>%
+  complete(dateTime = seq(floor_date(min(dateTime), "10 min"), floor_date(max(dateTime), "10 min"), by = "10 min")) %>%
+  arrange(dateTime) %>%
+  mutate(across(where(is.numeric), ~ na.approx(.x, na.rm = F, maxgap = 10000))) %>%
+  filter(minute(dateTime) %% 10 == 0) %>%
+  ungroup()
+
+mwQ %>%
+  ggplot(aes(dateTime, Q_Ls)) +
+  geom_line(color = "#0084a8") +
+  ylab("Q (L/s)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y"), breaks = pretty_dates(mwQ$dateTime, n = 5)) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap( ~ Site, scales = "free_y", ncol = 1)
+```
+
+## South East
+
+```{r}
+seQ <- read_csv(here("Data/TAL/TLM01_Qwl_2021_2023.csv")) %>% 
+  select(dateTime_CT = datetime.local, stage_cm = level.cm, Q_Ls = Q.Ls) %>% 
+  mutate(
+    # Ensure dateTime_CT is a string to apply regex
+    dateTime_CT = as.character(dateTime_CT),
+    # Standardize time format to ensure two-digit hour
+    dateTime_CT = if_else(
+      str_detect(dateTime_CT, "\\d+/\\d+/\\d+ \\d:\\d{2}"), # Detects date formats with single-digit hour
+      str_replace(dateTime_CT, "(\\d+/\\d+/\\d+ )?(\\d):(\\d{2})", "\\1 0\\2:\\3"), # Prepend 0 to single-digit hour
+      dateTime_CT
+    ),
+    dateTime_CT = if_else(str_detect(dateTime_CT, "\\d{1,2}:\\d{2}"), 
+                               dateTime_CT, 
+                               paste(dateTime_CT, "00:00")),
+    dateTime = with_tz(mdy_hm(dateTime_CT, tz = "America/Chicago"), tzone = "UTC"),
+    Site = "TAL") %>% 
+  select(-dateTime_CT) %>% 
+  drop_na(dateTime)
+
+
+seQ <- seQ %>%
+  group_by(Site) %>%
+  complete(dateTime = seq(floor_date(min(dateTime), "10 min"), floor_date(max(dateTime), "10 min"), by = "10 min")) %>%
+  arrange(dateTime) %>%
+  mutate(across(where(is.numeric), ~ na.approx(.x, na.rm = F, maxgap = 10))) %>%
+  filter(minute(dateTime) %% 10 == 0) %>%
+  ungroup()
+```
+
+## Great Plains
+
+```{r}
+########### Discharge from PT Pipeline ########### 
+gpQ <- read_csv(here("Data/GP_Q/gpPrelimQ_20241002.csv"), col_types ="Tcddddd") %>% 
+  rename(dateTime = datetime_UTC, Site = siteId) %>% 
+  mutate(stage_cm = waterDepth_m *100)
+  # mutate(wetQf = case_when(Q_Ls > 0 ~ "Flowing",
+  #                        Q_Ls < 0 ~ "Pooled",
+  #                        waterHeight_m <= heightThresh ~ "Dry",
+  #                        waterLevel_m == heightThresh ~ "Dry"))
+
+#approach 2 metadata (use for dry/wet at site interpretation: if Date is present but Temp is NA, site is dry
+# Approach 2 Metadata
+appr2 <- read_csv(here("Metadata/Great Plains Seasonal Sampling Field Data.csv")) %>%
+  filter(Site %in% c("SFM01", "ENM01", "SHM01")) %>%
+  mutate(Date = mdy(Date),
+         wetdry = ifelse(is.finite(Date) & is.finite(`Temp (*C)`), "wet",
+                         ifelse(is.na(Date), "NA", "dry")),
+         wetQf = case_when(grepl("Y", `Connected?`) & grepl("Y", `Flowing?`) ~ "Flowing",
+                           grepl("N", `Connected?`) & grepl("N", `Flowing?`) ~ "Pooled",
+                           grepl("Y", `Connected?`) & grepl("N", `Flowing?`) ~ "Pooled",
+                           grepl("N", `Connected?`) & grepl("Y", `Flowing?`) ~ "Pooled",
+                           is.na(`Connected?`) & is.na(`Flowing?`) ~ "Dry")) %>%
+  mutate(Site = case_when(Site == "ENM01" ~ "YMR",
+                          Site == "SFM01" ~ "KMZ",
+                          Site == "SHM01" ~ "SHN")) %>%
+    select(Site, Date, Connected = `Connected?`, Flowing = `Flowing?`, wetdry, wetQf)
+
+## Sensor Maintence 
+sensMaint <- read_csv(here("Metadata/SensorMaint.csv")) %>% 
+  mutate(Date = mdy(`Date of Check`),
+         wetdry = ifelse(is.finite(Date) & is.finite(`Temp (*C)`), "wet", 
+                         ifelse(is.na(Date), "NA", "dry")),
+         wetQf = case_when(grepl("Y", `Connected?`) & grepl("Y", `Flowing?`) ~ "Flowing",
+                           grepl("N", `Connected?`) & grepl("N", `Flowing?`) ~ "Pooled",
+                           grepl("Y", `Connected?`) & grepl("N", `Flowing?`) ~ "Pooled",
+                           grepl("N", `Connected?`) & grepl("Y", `Flowing?`) ~ "Pooled",
+                           grepl("D", `Connected?`) & grepl("D", `Flowing?`) ~ "Dry")) %>% 
+  select(Site, Date, Connected = `Connected?`, Flowing = `Flowing?`, wetdry, wetQf)
+
+flowMeta <- sensMaint %>% 
+  full_join(appr2) %>%
+  filter(!is.na(wetQf)) %>% 
+  select(Site, Date, wetQf)
+
+```
+
+```{r}
+
+dateBreaks <- pretty_dates(gpQ$dateTime, n = 5)
+
+gpQ %>%
+  #filter(Q_Ls > -10) %>%
+  ggplot(aes(dateTime, waterHeight_m, color = wetQf)) +
+  #geom_line(color = "#0084a8") +
+  geom_point(size = 0.4)+
+ # geom_hline(yintercept = 0) +
+  ylab("Stage (m)") +
+  theme_few() +
+  scale_y_continuous(breaks = pretty_breaks(n = 3))+
+  scale_x_datetime(labels = date_format("%b '%y"), breaks = dateBreaks) +
+  scale_color_manual(values = c("Dry" = "#f58231", "Flowing" = "#0082c8", "Pooled" = "#3cb44b")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.title = element_blank())+
+  facet_wrap(~Site, ncol = 1, scales = "free")
+
+# Loop through each site to create a dygraph for each
+for (site in unique(gpQ$Site)) {
+  # Filter the data for the current site
+  gpQ_site <- gpQ %>% filter(Site == site) 
+
+  flowMetaSite <- flowMeta %>% filter(Site == site)
+  # Create separate xts objects for each wetQf state
+  gpQ_dry <- xts::xts(ifelse(gpQ_site$wetQf == "Dry", gpQ_site$waterHeight_m, NA), order.by = gpQ_site$dateTime)
+  gpQ_flowing <- xts::xts(ifelse(gpQ_site$wetQf == "Flowing", gpQ_site$waterHeight_m, NA), order.by = gpQ_site$dateTime)
+  gpQ_pooled <- xts::xts(ifelse(gpQ_site$wetQf == "Pooled", gpQ_site$waterHeight_m, NA), order.by = gpQ_site$dateTime)
+  
+  # Create the dygraph for the current site
+  dygraph(cbind(gpQ_dry, gpQ_flowing, gpQ_pooled), main = paste("Water Height (Stage) -", site)) %>%
+    dySeries("gpQ_dry", label = "Dry", color = "#f58231") %>%
+    dySeries("gpQ_flowing", label = "Flowing", color = "#0082c8") %>%
+    dySeries("gpQ_pooled", label = "Pooled", color = "#3cb44b") %>%
+    dyEvent(subset(flowMetaSite, wetQf == "Flowing")$Date, 
+              subset(flowMetaSite, wetQf == "Flowing")$wetQf, 
+              labelLoc = "bottom", color = "#0082c8") %>% 
+      dyEvent(subset(flowMetaSite, wetQf == "Dry")$Date, 
+              subset(flowMetaSite, wetQf == "Dry")$wetQf, 
+              labelLoc = "bottom", color = "#f58231") %>%
+    dyEvent(subset(flowMetaSite, wetQf == "Pooled")$Date, 
+              subset(flowMetaSite, wetQf == "Pooled")$wetQf, 
+              labelLoc = "bottom", color = "#3cb44b") %>%
+    dyAxis("y", label = "Stage (m)") %>%
+    dyRangeSelector() %>%
+    dyLegend(width = 400) %>%
+    dyHighlight(highlightCircleSize = 3, highlightSeriesBackgroundAlpha = 0.2) %>%
+    print()  # Print each dygraph
+}
+
+test <- gpQ %>% filter(is.na(wetQf))
+```
+
+# Dissolved Oxygen
+
+## API Sites
+
+```{r}
+# Path to QAQC pipeline
+qaqcPath <- here("Data/EXO_QAQC/01_data/04_postQaqc/")
+# Site to load data
+Sites <- c("GBJ", "DRC", "JDR", "SHN", "KMZ", "YMR", "WHR")
+
+# Read data for each site and combine
+aimsDO <- rbindlist(lapply(Sites, read_QAQCdata), fill = TRUE) %>%
+  filter(alphaQf == 0 & betaQfSd == 0) %>%
+  select(Site, dateTime = timestamp, parameterName, value) %>%
+  pivot_wider(names_from = parameterName, values_from = value, values_fn = mean) %>%
+  mutate(
+    dateTime = parse_date_time(dateTime, orders = c("ymd HMS"), tz = "UTC"),
+    ODO_mg_L = if_else(ODO_mg_L == 0, NA, ODO_mg_L)
+  ) %>% 
+  mutate(DO.obs = coalesce(ODO_mg_L, ODO_MiniDOT_mg_L),
+         temp.water = coalesce(Temp_EXO_C, `Temp_s-can_C`, SW_Temp_PT_C, Temp_MiniDOT_C)) %>% 
+  select(dateTime, Site, DO.obs, temp.water)
+
+# condMissing <- rawGP %>%
+#   filter((!is.na(SpCond_uS_cm) & is.na(Conductivity_uS_cm)) | (is.na(SpCond_uS_cm) & !is.na(Conductivity_uS_cm)))
+# 
+# rawGP <- rawGP %>% 
+#   mutate(SpCondCalc = Conductivity_uS_cm / (1 + 0.02 * (temp.water - 25)),
+#          CondCalc = SpCond_uS_cm * (1 + 0.02 * (temp.water - 25)),
+#          SpCond = coalesce(SpCond_uS_cm, SpCondCalc),
+#          Cond = coalesce(Conductivity_uS_cm, CondCalc)) %>% 
+#   select(-SpCond_uS_cm, -Conductivity_uS_cm, -SpCondCalc, -CondCalc)
+
+aimsDO <- aimsDO %>%
+  group_by(Site) %>%
+  complete(dateTime = seq(floor_date(min(dateTime), "10 min"), floor_date(max(dateTime), "10 min"), by = "10 min")) %>%
+  arrange(dateTime) %>%
+  mutate(across(where(is.numeric), ~ na.approx(.x, na.rm = F, maxgap = 10))) %>%
+  filter(minute(dateTime) %% 10 == 0) %>%
+  ungroup()
+
+aimsDO %>%
+  ggplot(aes(dateTime, DO.obs)) +
+  geom_line(color = "#0084a8") +
+  ylab("DO (mg/L)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~Site, ncol = 2, scales = "free")
+```
+
+## South East
+
+```{r}
+seDO <- read_csv(here("Data/TAL/TLM01_oxy_20210915_20231231.csv")) %>% 
+  select(dateTime_CT = datetime.local, temp.water = Temp.C, DO.obs = DO.mgL, DO.sat) %>% 
+  mutate(
+    # Ensure dateTime_CT is a string to apply regex
+    dateTime_CT = as.character(dateTime_CT),
+    # Standardize time format to ensure two-digit hour
+    dateTime_CT = if_else(
+      str_detect(dateTime_CT, "\\d+/\\d+/\\d+ \\d:\\d{2}"), # Detects date formats with single-digit hour
+      str_replace(dateTime_CT, "(\\d+/\\d+/\\d+ )?(\\d):(\\d{2})", "\\1 0\\2:\\3"), # Prepend 0 to single-digit hour
+      dateTime_CT
+    ),
+    dateTime_CT = if_else(str_detect(dateTime_CT, "\\d{1,2}:\\d{2}"), 
+                               dateTime_CT, 
+                               paste(dateTime_CT, "00:00")),
+    dateTime = with_tz(mdy_hm(dateTime_CT, tz = "America/Chicago"), tzone = "UTC"),
+    Site = "TAL") %>% 
+  select(-dateTime_CT) %>% 
+  drop_na(dateTime)
+
+
+seDO <- seDO %>%
+  group_by(Site) %>%
+  complete(dateTime = seq(floor_date(min(dateTime), "10 min"), floor_date(max(dateTime), "10 min"), by = "10 min")) %>%
+  arrange(dateTime) %>%
+  mutate(across(where(is.numeric), ~ na.approx(.x, na.rm = F, maxgap = 10))) %>%
+  filter(minute(dateTime) %% 10 == 0) %>%
+  ungroup()
+
+
+seDO %>%
+  ggplot(aes(dateTime, DO.obs)) +
+  geom_line(color = "#0084a8") +
+  ylab("DO (mg/L)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## MW
+
+```{r}
+# # Site to load data
+# Sites <- c("DRC", "JDR")
+# 
+# # Read data for each site and combine
+# mwDO <- rbindlist(lapply(Sites, read_QAQCdata), fill = TRUE) %>%
+#   filter(alphaQf == 0 & betaQfSd == 0) %>%
+#   select(Site, dateTime = timestamp, parameterName, value) %>%
+#   pivot_wider(names_from = parameterName, values_from = value, values_fn = mean) %>%
+#   mutate(
+#     dateTime = parse_date_time(dateTime, orders = c("ymd HMS"), tz = "UTC")) %>% 
+#   select(dateTime, Site, DO.obs = ODO_mg_L, water.temp = Temp_EXO_C)
+# 
+# # Get min and max dateTime
+# # Create a data frame with a sequence of datetimes covering the min to max range
+# dateSeq <- mwDO %>%
+#   group_by(Site) %>%
+#   summarise(minDate = min(dateTime), maxDate = max(dateTime)) %>%
+#   rowwise() %>% # Ensure operations within mutate are performed row-wise
+#   mutate(dateTime = list(seq(from = minDate, to = maxDate, by = "10 min"))) %>%
+#   unnest(dateTime) %>%
+#   ungroup() # Remove the rowwise grouping
+# 
+# 
+# # Join with the original aimsDO to get df of all dates every 15 min
+# # Interpolate numeric columns
+# mwDO <- dateSeq %>%
+#   left_join(aimsDO, by = c("Site", "dateTime")) %>%
+#   group_by(Site) %>%
+#   mutate(across(where(is.numeric), ~ na.approx(.x, maxgap = 10, na.rm = FALSE))) %>%
+#   ungroup() %>% 
+#   select(-minDate, -maxDate)
+# 
+# mwDO %>%
+#   ggplot(aes(dateTime, DO.obs)) +
+#   geom_line(color = "#0084a8") +
+#   ylab("DO (mg/L)") +
+#   theme_few() +
+#   scale_x_datetime(labels = date_format("%b '%y")) +
+#   theme(axis.title.x = element_blank(),
+#         axis.text.x = element_text(angle = 45, hjust = 1))+
+#   facet_wrap(~Site, scales = "free")
+```
+
+# Combine Data
+
+## GBJ
+
+```{r}
+gbjDat <- full_join(aimsDO %>% filter(Site == "GBJ"), 
+                    mwQ %>% filter(Site == "GBJ"), 
+                    by = c("dateTime", "Site"))
+
+# Plot for ODO_mg_L
+doPlt <- gbjDat %>%
+  ggplot(aes(x = dateTime, y = DO.obs)) +
+  geom_line(color = "#0084a8") +
+  scale_y_continuous(name = "DO (mg/L)") +
+  labs(title = "GBJ")+
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.text.x = element_blank(), # Hide x-axis text to make it look "broken"
+        axis.title.x = element_blank())
+
+# Plot for Q_Ls
+qPlt <- gbjDat %>%
+  ggplot(aes(x = dateTime, y = Q_Ls)) +
+  geom_line(color = "#FF0000", linetype = "dashed") +
+  scale_y_continuous(name = "Discharge (L/s)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Combine the plots, adjusting spacing as needed
+(doPlt / qPlt) + plot_layout(heights = c(2, 1))
+
+jdrDat <- full_join(aimsDO %>% filter(Site == "JDR"), 
+                    mwQ %>% filter(Site == "JDR"), 
+                    by = c("dateTime", "Site"))
+
+# Plot for ODO_mg_L
+doPlt <- jdrDat %>%
+  ggplot(aes(x = dateTime, y = DO.obs)) +
+  geom_line(color = "#0084a8") +
+  scale_y_continuous(name = "DO (mg/L)") +
+  labs(title = "JDR")+
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.text.x = element_blank(), # Hide x-axis text to make it look "broken"
+        axis.title.x = element_blank())
+
+# Plot for Q_Ls
+qPlt <- jdrDat %>%
+  ggplot(aes(x = dateTime, y = Q_Ls)) +
+  geom_line(color = "#FF0000", linetype = "dashed") +
+  scale_y_continuous(name = "Discharge (L/s)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Combine the plots, adjusting spacing as needed
+(doPlt / qPlt) + plot_layout(heights = c(2, 1))
+```
+
+## TAL
+
+```{r}
+talDat <- left_join(seDO, seQ, by = c("dateTime", "Site"))
+
+# Plot for DO
+doPlt <- talDat %>%
+  ggplot(aes(x = dateTime, y = DO.obs)) +
+  geom_line(color = "#0084a8") +
+  scale_y_continuous(name = "DO (mg/L)") +
+  labs(title = "TAL")+
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.text.x = element_blank(), # Hide x-axis text to make it look "broken"
+        axis.title.x = element_blank())
+
+# Plot for Q_Ls
+qPlt <- talDat %>%
+  ggplot(aes(x = dateTime, y = Q_Ls)) +
+  geom_line(color = "#FF0000", linetype = "dashed") +
+  scale_y_continuous(name = "Discharge (L/s)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Combine the plots, adjusting spacing as needed
+(doPlt / qPlt) + plot_layout(heights = c(2, 1))
+```
+
+## WHR
+
+```{r}
+whrDat <- left_join(aimsDO %>% filter(Site == "WHR"), 
+                    seQ %>% filter(Site == "WHR"), 
+                    by = c("dateTime", "Site"))
+# Plot for DO
+doPlt <- whrDat %>%
+  ggplot(aes(x = dateTime, y = DO.obs)) +
+  geom_line(color = "#0084a8") +
+  scale_y_continuous(name = "DO (mg/L)") +
+  labs(title = "WHR")+
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.text.x = element_blank(), # Hide x-axis text to make it look "broken"
+        axis.title.x = element_blank())
+
+# Plot for Q_Ls
+qPlt <- whrDat %>%
+  ggplot(aes(x = dateTime, y = Q_Ls)) +
+  geom_line(color = "#FF0000", linetype = "dashed") +
+  scale_y_continuous(name = "Discharge (L/s)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Combine the plots, adjusting spacing as needed
+(doPlt / qPlt) + plot_layout(heights = c(2, 1))
+```
+
+## KMZ
+
+```{r}
+kmzDat <- left_join(aimsDO %>% filter(Site == "KMZ"), 
+                    gpQ %>% filter(Site == "KMZ"), 
+                    by = c("dateTime", "Site")) %>% 
+  filter(wetQf != "Dry")
+
+kmzDat <- kmzDat %>% 
+  complete(dateTime = seq(floor_date(min(dateTime), "10 min"), floor_date(max(dateTime), "10 min"), by = "10 min")) %>%
+  arrange(dateTime) %>%
+  mutate(across(where(is.numeric), ~ na.approx(.x, na.rm = F, maxgap = 10))) %>%
+  mutate(Site = "KMZ") %>% 
+  filter(minute(dateTime) %% 10 == 0) 
+
+# Plot for DO
+doPlt <- kmzDat %>%
+  ggplot(aes(x = dateTime, y = DO.obs)) +
+  geom_line(color = "#0084a8") +
+  scale_y_continuous(name = "DO (mg/L)") +
+  labs(title = "KMZ")+
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.text.x = element_blank(), # Hide x-axis text to make it look "broken"
+        axis.title.x = element_blank())
+
+# Plot for Q_Ls
+qPlt <- kmzDat %>%
+  ggplot(aes(x = dateTime, y = Q_Ls)) +
+  geom_line(color = "#FF0000", linetype = "dashed") +
+  scale_y_continuous(name = "Discharge (L/s)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Combine the plots, adjusting spacing as needed
+(doPlt / qPlt) + plot_layout(heights = c(2, 1))
+```
+
+## SHN
+
+```{r}
+shnDat <- left_join(aimsDO %>% filter(Site == "SHN"), 
+                    gpQ %>% filter(Site == "SHN"), 
+                    by = c("dateTime", "Site")) %>% 
+  filter(wetQf != "Dry")
+
+shnDat <- shnDat %>% 
+  complete(dateTime = seq(floor_date(min(dateTime), "10 min"), floor_date(max(dateTime), "10 min"), by = "10 min")) %>%
+  arrange(dateTime) %>%
+  mutate(across(where(is.numeric), ~ na.approx(.x, na.rm = F, maxgap = 10))) %>%
+  mutate(Site = "SHN") %>% 
+  filter(minute(dateTime) %% 10 == 0) 
+
+# Plot for DO
+doPlt <- shnDat %>%
+  ggplot(aes(x = dateTime, y = DO.obs)) +
+  geom_line(color = "#0084a8") +
+  scale_y_continuous(name = "DO (mg/L)") +
+  labs(title = "SHN")+
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.text.x = element_blank(), # Hide x-axis text to make it look "broken"
+        axis.title.x = element_blank())
+
+# Plot for Q_Ls
+qPlt <- shnDat %>%
+  ggplot(aes(x = dateTime, y = Q_Ls)) +
+  geom_line(color = "#FF0000", linetype = "dashed") +
+  scale_y_continuous(name = "Discharge (L/s)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Combine the plots, adjusting spacing as needed
+(doPlt / qPlt) + plot_layout(heights = c(2, 1))
+```
+
+## YMR
+
+```{r}
+ymrDat <- left_join(aimsDO %>% filter(Site == "YMR"), 
+                    gpQ %>% filter(Site == "YMR"), 
+                    by = c("dateTime", "Site")) %>% 
+  filter(wetQf != "Dry")
+
+ymrDat <- ymrDat %>% 
+  complete(dateTime = seq(floor_date(min(dateTime), "10 min"), floor_date(max(dateTime), "10 min"), by = "10 min")) %>%
+  arrange(dateTime) %>%
+  mutate(across(where(is.numeric), ~ na.approx(.x, na.rm = F, maxgap = 10))) %>%
+  mutate(Site = "YMR") %>% 
+  filter(minute(dateTime) %% 10 == 0) 
+
+# Plot for DO
+doPlt <- ymrDat %>%
+  ggplot(aes(x = dateTime, y = DO.obs)) +
+  geom_line(color = "#0084a8") +
+  scale_y_continuous(name = "DO (mg/L)") +
+  labs(title = "YMR")+
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.text.x = element_blank(), # Hide x-axis text to make it look "broken"
+        axis.title.x = element_blank())
+
+# Plot for Q_Ls
+qPlt <- ymrDat %>%
+  ggplot(aes(x = dateTime, y = Q_Ls)) +
+  geom_line(color = "#FF0000", linetype = "dashed") +
+  scale_y_continuous(name = "Discharge (L/s)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Combine the plots, adjusting spacing as needed
+(doPlt / qPlt) + plot_layout(heights = c(2, 1))
+```
+
+## All Data
+
+```{r}
+datList <- list(gbjDat, jdrDat, talDat, whrDat, kmzDat, shnDat, ymrDat, jdrDat)
+allDat <- reduce(datList, full_join) %>% 
+  select(-DO.sat)
+```
+
+# Get Site Info for Sites with Data
+
+```{r}
+selSites <- siteInfo %>% 
+  filter(Site %in% unique(allDat$Site))
+```
+
+# BP Data
+
+```{r}
+#Download barometric presssure from NASAPower for each site
+nasaDat <- list()
+for (i in 1:nrow(selSites)) {
+  cat(paste("Downloading data for", selSites$Site[i], "\n"))
+  tempDat <- allDat %>% 
+    filter(Site == selSites$Site[i])
+  sDate <- as_date(min(tempDat$dateTime, na.rm = T))
+  eDate <- as_date(max(tempDat$dateTime, na.rm = T))
+  
+  nasaDat[[i]] <- get_power(
+    community = "sb",
+    pars = c("PSC", "ALLSKY_SFC_SW_DWN"),
+    temporal_api = "hourly",
+    lonlat = c(selSites$Long[i], selSites$Lat[i]),
+    dates = c(sDate, eDate),
+    site_elevation = selSites$Elev_m[i],
+    time_standard = "UTC"
+  )
+  nasaDat[[i]]$Site <- selSites$Site[i]
+  cat(paste("Finished downloading data for", selSites$Site[i], "\n"))
+  #Break loop on last iteration
+  if (i == nrow(selSites)) {
+    break
+  }
+}
+
+nasaDat <- do.call(rbind, nasaDat)
+nasaDat <- nasaDat %>% 
+  select(Site, YYYYMMDD, HR, PSC, ALLSKY_SFC_SW_DWN) %>% 
+  mutate(Hour = str_pad(HR, 2, side = "left", pad = 0)) %>% 
+  unite(dateTime, YYYYMMDD, Hour, sep = " ") %>% 
+  mutate(dateTime = ymd_hms(paste0(dateTime, ":00:00")),
+         PSC = PSC*10, #Convert kilopascals to millibar
+         PAR.obs = convert_SW_to_PAR(ALLSKY_SFC_SW_DWN)) %>% 
+  select(-HR, -ALLSKY_SFC_SW_DWN)
+```
+
+## Merge Data with NASA Data
+
+```{r}
+allDat <- allDat %>% 
+  mutate(across(where(is.numeric), ~na.approx(., maxgap = 6, na.rm = F)))
+allDat <- allDat %>% 
+  full_join(nasaDat, by = c("Site", "dateTime")) %>% 
+  left_join(selSites, by = "Site") %>% 
+  group_by(Site) %>% 
+  mutate(solar.time = convert_UTC_to_solartime(dateTime, longitude = Long, time.type = "mean solar"),
+         isDaytime = calc_is_daytime(solar.time, Lat),
+         PSC = na.approx(PSC, maxgap = 6, na.rm = F),
+         PAR.obs = na.approx(PAR.obs, maxgap = 6, na.rm = F),
+         DO.sat = calc_DO_sat(temp.water = temp.water, PSC, model = "garcia-benson"),
+         DO.pctsat = 100 * (DO.obs/ DO.sat),
+         WaterYear = calcWaterYear(dateTime))
+```
+
+```{r}
+allDat %>%
+  ggplot(aes(dateTime, DO.pctsat)) +
+  geom_line(color = "#5d782e") + 
+  ylab("DO (% Sat)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~Site, ncol = 2, scales = "free")
+
+allDat %>%
+  ggplot(aes(dateTime, PAR.obs)) +
+  geom_line(color = "darkgoldenrod1") +
+  ylab(expression(PAR~(mu*"mol m"^-2*"s"^-1))) +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~Site, ncol = 2, scales = "free")
+
+allDat %>%
+  ggplot(aes(dateTime, Q_Ls)) +
+  geom_line(color = "#0084a8") +
+  ylab("Discharge (L/s)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~Site, ncol = 2, scales = "free")
+```
+
+```{r}
+allDat %>%
+  filter(wetQf %in% c("Pooled", "Flowing")) %>% 
+  #filter(!Site == "SHN") %>% 
+  ggplot(aes(wetQf, DO.pctsat, color = Site)) +
+  geom_boxplot(position = position_dodge(width = 0.75)) +
+  #geom_jitter(position = position_jitterdodge(), alpha = 0.6) +
+  theme_few() +
+  labs(y = expression(DO["%Sat"]))+
+  scale_color_brewer(palette = "Dark2")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.title.x = element_blank())# +
+  #facet_wrap(~Site, ncol = 1, scales = "free")
+```
+
+## Get Season
+
+```{r}
+# Function to determine the season
+calcSeason <- function(date) {
+  m <- lubridate::month(date)
+  d <- lubridate::day(date)
+  if ((m == 12 && d >= 21) || (m %in% c(1, 2)) || (m == 3 && d < 21)) {
+    return("Winter")
+  } else if ((m == 3 && d >= 21) || (m %in% c(4, 5)) || (m == 6 && d < 21)) {
+    return("Spring")
+  } else if ((m == 6 && d >= 21) || (m %in% c(7, 8)) || (m == 9 && d < 21)) {
+    return("Summer")
+  } else if ((m == 9 && d >= 21) || (m %in% c(10, 11)) || (m == 12 && d < 21)) {
+    return("Fall")
+  }
+  return(NA)
+}
+```
+
+# Calc DO Metrics
+
+```{r}
+# Daily metrics
+dailyDO <- allDat %>% 
+  mutate(Date = floor_date(solar.time, "1 day")) %>%
+  group_by(Site, Date) %>%
+  summarize(
+    minDO.obs = min(DO.obs, na.rm = T),
+    maxDO.obs = max(DO.obs, na.rm = T),
+    minDO.pctsat = min(DO.pctsat, na.rm = T),
+    maxDO.pctsat = max(DO.pctsat, na.rm = T),
+    avgDO.obs = mean(DO.obs, na.rm = T),
+    avgDO.pctsat = mean(DO.pctsat, na.rm = T),
+    DOSat.hyp = sum(DO.pctsat <= 50, na.rm = T),
+    DO.hyp = sum(DO.obs <= 2, na.rm = T),
+    totalDO = n()
+    ) %>% 
+  mutate(across(where(is.numeric), ~ ifelse(is.finite(.), ., NA))) %>% 
+  mutate(across(where(is.numeric), ~ ifelse(if_any(everything(), is.na), NA, .))) %>% 
+  mutate(across(minDO.obs:avgDO.pctsat, ~ ifelse(. == 0, NA, .))) %>% 
+  mutate(DO.amp = maxDO.obs - minDO.obs,
+         DOpctsat.amp = maxDO.pctsat - minDO.pctsat,
+         probHyp = DO.hyp / totalDO,
+         probHypSat = DOSat.hyp / totalDO,
+         WaterYear = calcWaterYear(Date),
+         season = sapply(Date, calcSeason),
+         Year = year(Date))
+
+dailyDO <- allDat %>% 
+  mutate(Date = floor_date(solar.time, "1 day")) %>%
+  group_by(Site, Date) %>%
+  summarize(
+    minDO.obs = min(DO.obs, na.rm = TRUE),
+    maxDO.obs = max(DO.obs, na.rm = TRUE),
+    minDO.pctsat = min(DO.pctsat, na.rm = TRUE),
+    maxDO.pctsat = max(DO.pctsat, na.rm = TRUE),
+    avgDO.obs = mean(DO.obs, na.rm = TRUE),
+    avgDO.pctsat = mean(DO.pctsat, na.rm = TRUE),
+    sdDO.obs = sd(DO.obs, na.rm = TRUE),
+    sdDO.pctsat = sd(DO.pctsat, na.rm = TRUE),
+    DOSat.hyp = sum(DO.pctsat <= 50, na.rm = TRUE),
+    DO.hyp = sum(DO.obs <= 2, na.rm = TRUE),
+    totalDO = n()
+  ) %>% 
+  mutate(across(where(is.numeric), ~ ifelse(is.finite(.), ., NA))) %>% 
+  mutate(across(where(is.numeric), ~ ifelse(if_any(everything(), is.na), NA, .))) %>% 
+  mutate(across(minDO.obs:avgDO.pctsat, ~ ifelse(. == 0, NA, .))) %>% 
+  mutate(DO.amp = maxDO.obs - minDO.obs,
+         DOpctsat.amp = maxDO.pctsat - minDO.pctsat,
+         probHyp = DO.hyp / totalDO,
+         probHypSat = DOSat.hyp / totalDO,
+         WaterYear = calcWaterYear(Date),
+         season = sapply(Date, calcSeason),
+         Year = year(Date),
+         season = sapply(Date, calcSeason),
+         cvDO.obs = (sdDO.obs / avgDO.obs) * 100,
+         cvDO.pctsat = (sdDO.pctsat / avgDO.pctsat) * 100) %>% 
+  select(-sdDO.obs, -sdDO.pctsat) 
+
+#nighttime hypoxia ratio
+nightHypRat <- allDat %>% 
+  mutate(across(c("DO.obs", "DO.pctsat", "DO.sat"), ~ ifelse(. == 0, NA, .))) %>% 
+  select(Site, dateTime, solar.time, DO.obs, DO.pctsat, DO.sat, isDaytime) %>% 
+  mutate(Date = floor_date(solar.time, "1 day")) %>%
+  group_by(Date, Site, isDaytime) %>% 
+  summarise(DO.hyp.obs = sum(DO.obs <= 2, na.rm = TRUE),
+            DO.hyp.sat = sum(DO.pctsat <= 50, na.rm = TRUE), .groups = 'drop') %>% 
+  pivot_wider(names_from = isDaytime, 
+              values_from = c(DO.hyp.obs, DO.hyp.sat), 
+              names_prefix = "DO_hyp_", 
+              names_sep = "_") %>% 
+  rename(DayHyp_obs = DO.hyp.obs_DO_hyp_TRUE, 
+         NightHyp_obs = DO.hyp.obs_DO_hyp_FALSE,
+         DayHyp_sat = DO.hyp.sat_DO_hyp_TRUE, 
+         NightHyp_sat = DO.hyp.sat_DO_hyp_FALSE) %>% 
+  mutate(NHR_obs = NightHyp_obs / DayHyp_obs,
+         NHR_sat = NightHyp_sat / DayHyp_sat,
+         WaterYear = calcWaterYear(Date),
+         Year = year(Date)) %>% 
+  mutate(across(where(is.numeric), ~ ifelse(is.finite(.), ., NA))) %>% 
+  select(Date, Site, NHR_obs, NHR_sat)
+
+
+# Calculate probabilities for daytime
+dayHypProb <- allDat %>% 
+  mutate(across(c("DO.obs", "DO.pctsat", "DO.sat"), ~ ifelse(. == 0, NA, .))) %>% 
+  select(Site, dateTime, solar.time, DO.obs, DO.pctsat, DO.sat, isDaytime) %>% 
+  mutate(Date = floor_date(solar.time, "1 day")) %>%
+  filter(isDaytime) %>%
+  group_by(Site, Date) %>%
+  summarise(
+    dayProbConc = mean(DO.obs < 2, na.rm = TRUE),
+    dayProbSat = mean(DO.pctsat < 50, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Calculate probabilities for nighttime
+nightHypProb <- allDat %>%
+  mutate(across(c("DO.obs", "DO.pctsat", "DO.sat"), ~ ifelse(. == 0, NA, .))) %>% 
+  select(Site, dateTime, solar.time, DO.obs, DO.pctsat, DO.sat, isDaytime) %>% 
+  mutate(Date = floor_date(solar.time, "1 day")) %>%
+  filter(!isDaytime) %>%
+  group_by(Site, Date) %>%
+  summarise(
+    nightProbConc = mean(DO.obs < 2, na.rm = TRUE),
+    nightProbSat = mean(DO.pctsat < 50, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Join the daytime and nighttime probabilities
+nightHypRat <- dayHypProb %>%
+  inner_join(nightHypProb, by = c("Site", "Date")) %>% 
+  mutate(NHR_obs = nightProbConc/dayProbConc,
+         NHR_sat = nightProbSat/dayProbSat) %>% 
+  mutate(across(where(is.numeric), ~ ifelse(is.finite(.), ., NA))) %>% 
+  mutate(WaterYear = calcWaterYear(Date),
+         Year = year(Date))
+
+
+
+
+#Merge DO Metrics
+doMet <- dailyDO %>% 
+  full_join(nightHypRat) %>% 
+  arrange(Site, Date, WaterYear)
+```
+
+## DO Figures
+
+## DO Duration
+
+```{r}
+# Calculate the exceedance values
+doDur <- dailyDO %>%
+  mutate(WaterYear = calcWaterYear(Date)) %>% 
+  select(Site, WaterYear, avgDO.pctsat) %>% 
+  group_by(Site, WaterYear) %>%
+  filter(!is.na(avgDO.pctsat)) %>%
+  mutate(exceedance = 100 * (rank(-avgDO.pctsat) / (length(avgDO.pctsat) + 1)))
+
+# Calculate undersaturation
+underSat <- doDur %>%
+  group_by(Site, WaterYear) %>%
+  summarise(
+    modalUndersat = 100 - as.numeric(names(sort(table(avgDO.pctsat), decreasing = TRUE))[1]),
+    meanUndersat = mean(avgDO.pctsat)
+  )
+
+doDur <- doDur %>%
+  left_join(underSat)
+
+doDur %>% 
+  ggplot(aes(x = exceedance, y = avgDO.pctsat, color = factor(WaterYear))) +
+  geom_line() +
+  geom_hline(yintercept = 50, linetype = "dashed", alpha = 0.5)+
+  #scale_y_log10() +
+  scale_color_manual(values = c("2021" = "#1B9E77", "2022" = "#D95F02", "2023" = "#7570B3", "2024" = "#E7298A")) +
+  labs(title = "",
+       color = "Year",
+       x = "Exceedance Probability (%)",
+       y = expression(Daily ~ DO["%Sat"])) +
+  theme_few()+
+  theme(legend.position = "bottom", legend.title = element_blank()
+    )+
+  facet_wrap(~ Site)
+
+doDur %>% 
+  ggplot(aes(x = exceedance, y = avgDO.pctsat, color = factor(WaterYear))) +
+  geom_line() +
+  geom_hline(data = doDur, aes(yintercept = modalUndersat, color = factor(WaterYear), linetype = "Modal")) +
+  geom_hline(data = doDur, aes(yintercept = meanUndersat, color = factor(WaterYear), linetype = "Mean")) +
+  scale_color_manual(values = c("2021" = "#1B9E77", "2022" = "#D95F02", "2023" = "#7570B3", "2024" = "#E7298A")) +
+  scale_linetype_manual(name = "Undersaturation", values = c("Modal" = "dashed", "Mean" = "dotted")) +
+  labs(title = "",
+       color = "Year",
+       x = "Exceedance Probability (%)",
+       y = expression(Daily ~ DO["%Sat"])) +
+  theme_few() +
+  facet_wrap(~ Site)
+
+doDur %>% 
+  ggplot(aes(x = exceedance, y = avgDO.pctsat, color = Site)) +
+  geom_line() +
+  geom_hline(yintercept = 50, linetype = "dashed", alpha = 0.5)+
+  scale_color_brewer(palette = "Dark2") +
+  labs(title = "",
+       color = "Site",
+       x = "Exceedance Probability (%)",
+       y = expression(Daily ~ DO["%Sat"])) +
+  theme_few() +
+  facet_wrap(~ WaterYear)
+
+doDurAllTime <- dailyDO %>%
+  mutate(WaterYear = calcWaterYear(Date)) %>% 
+  select(Site, WaterYear, avgDO.pctsat) %>% 
+  group_by(Site) %>%
+  filter(!is.na(avgDO.pctsat)) %>%
+  mutate(exceedance = 100 * (rank(-avgDO.pctsat) / (length(avgDO.pctsat) + 1)))
+
+doDurAllTime %>% 
+  ggplot(aes(x = exceedance, y = avgDO.pctsat, color = Site)) +
+  geom_line() +
+  geom_hline(yintercept = 50, linetype = "dashed", alpha = 0.5)+
+  scale_color_brewer(palette = "Dark2") +
+  labs(title = "",
+       color = "Site",
+       x = "Exceedance Probability (%)",
+       y = expression(Daily ~ DO["%Sat"])) +
+  theme_few()
+```
+
+```{r}
+doMet <- doMet %>%
+  mutate(Year = factor(Year),
+         season = factor(season, levels = c("Spring", "Summer", "Fall", "Winter"), ordered = T))
+
+doMet %>%
+  #filter(season %in% c("Spring", "Summer")) %>% 
+  #filter(!Site == "SHN") %>% 
+  ggplot(aes(Year, DOpctsat.amp, color = Year)) +
+  geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.75)) +
+  geom_jitter(position = position_jitterdodge(), alpha = 0.6) +
+  theme_few() +
+  labs(y = expression(Daily ~ DO["%Sat"] ~ "Amplitude"))+
+  scale_color_brewer(palette = "Dark2")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.title.x = element_blank()) +
+  facet_wrap(~Site, ncol = 1, scales = "free")
+
+doMet %>%
+  filter(season %in% c("Spring", "Summer")) %>% 
+  ggplot(aes(season, DOpctsat.amp, color = season)) +
+  geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.75)) +
+  geom_jitter(position = position_jitterdodge(), alpha = 0.6) +
+  theme_few() +
+  labs(y = expression(Daily ~ DO["%Sat"] ~ "Amplitude"))+ 
+  scale_color_manual(values = c("Spring" = "#275E4D", "Summer" = "#FEB424"))+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.title.x = element_blank(),
+        legend.position = "none"
+    ) +
+  facet_grid(WaterYear~Site, scales = "fixed") 
+
+dailyDO %>%
+  filter(season %in% c("Spring", "Summer")) %>% 
+  ggplot(aes(x = probHypSat, fill = season, after_stat(scaled))) +
+  geom_density(alpha = 0.8) +
+  #xlim(-1.5, 1.5)+"
+  scale_fill_manual(values = c("Spring" = "#275E4D", "Summer" = "#FEB424"))+
+  labs(x = expression(DO["%Sat"] ~ "Probability of Hypoxia"), y = "Density") +
+  theme_few() +
+  scale_x_continuous(labels = scales::number_format(accuracy = 0.1)) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 3))+
+  theme(legend.position = "bottom", legend.title = element_blank()
+    )+
+  facet_grid(WaterYear~Site)
+
+allDat %>%
+  ggplot(aes(x = DO.pctsat, fill = isDaytime, after_stat(scaled))) +
+  geom_density(alpha = 0.7) +
+  scale_fill_manual(breaks = c("TRUE", "FALSE"),
+                    labels = c("Daytime", "Nighttime"),
+                    values = c("#FFA726", "#0D47A1")) +
+  geom_vline(xintercept = 50, linetype = "dashed") +
+  labs(x = expression(DO[sat]~"(%)" ), y = "Density") +
+  theme_few() +
+  theme(legend.title = element_blank(), legend.position = "bottom") +
+  facet_grid(WaterYear~Site)
+
+dailyDO %>%
+  ggplot(aes(x = avgDO.obs, fill = Site, after_stat(scaled))) +
+  geom_density(alpha = 0.5) +
+  scale_fill_brewer(palette = "Dark2") +
+  geom_vline(xintercept = 2, linetype = "dashed") +
+  labs(x = "DO (mg/L)", y = "Density") +
+  theme_few() +
+  theme(legend.title = element_blank(), legend.position = "bottom")+
+  facet_wrap(~WaterYear, ncol = 1, scale = "free_y") 
+
+dailyDO %>%
+  #filter(!Site == "SHN") %>% 
+  ggplot(aes(x = avgDO.pctsat, fill = Site, after_stat(scaled))) +
+  geom_density(alpha = 0.8) +
+  #scale_fill_manual(values = c("KMZ" = "#127088", "YMR" = "#DE3C37"))+
+  geom_vline(xintercept = 50, linetype = "dashed") +
+  labs(x = expression(DO["%sat"]), y = "Density") +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 3)) +
+  theme_few() +
+  theme(legend.position = "bottom", legend.title = element_blank())+
+  facet_wrap(~WaterYear, ncol = 1, scale = "free_y") 
+
+dailyDO %>%
+  #filter(!Site == "SHN") %>% 
+  ggplot(aes(x = avgDO.pctsat, fill = Site, after_stat(scaled))) +
+  geom_density(alpha = 0.8) +
+  #scale_fill_manual(values = c("KMZ" = "#127088", "YMR" = "#DE3C37"))+
+  geom_vline(xintercept = 50, linetype = "dashed") +
+  labs(x = expression(DO["%sat"]), y = "Density") +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 3)) +
+  theme_few() +
+  theme(legend.position = "bottom", legend.title = element_blank())
+
+dailyDO %>%
+  mutate(WaterYear = as.factor(WaterYear)) %>%
+  ggplot(aes(x = WaterYear, y = avgDO.pctsat, color = Site)) +  # Add color = Site
+  geom_boxplot(outlier.color = NA) +
+  geom_jitter(position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75), alpha = 0.5) +
+  scale_fill_brewer(palette = "Dark2") +
+  scale_color_brewer(palette = "Dark2") +  # Add this line
+  geom_hline(yintercept = 50, linetype = "dashed") +
+  labs(x = "Water Year", y = expression(Daily ~ DO["%Sat"])) +
+  theme_few() +
+  theme(legend.title = element_blank(), legend.position = "bottom")
+
+
+dailyDO %>%
+  #filter(!Site == "SHN") %>% 
+  ggplot(aes(x = DOpctsat.amp, fill = Site, after_stat(scaled))) +
+  geom_density(alpha = 0.5) +
+  scale_fill_brewer(palette = "Dark2") +
+  #geom_vline(xintercept = 50, linetype = "dashed") +
+  labs(x = expression(Daily ~ DO["%Sat"] ~ "Amplitude"),
+       y = "Density")+
+  theme_few() +
+  theme(legend.title = element_blank(), legend.position = "bottom")+
+  facet_wrap(~WaterYear, ncol = 1, scale = "free_y") 
+
+dailyDO %>%
+  #filter(!Site == "SHN") %>% 
+  ggplot(aes(x = probHypSat, fill = Site, after_stat(scaled))) +
+  geom_density(alpha = 0.5) +
+  #xlim(-1.5, 1.5)+
+  scale_fill_brewer(palette = "Dark2") +
+  labs(x = expression(DO["%Sat"] ~ "Probability of Hypoxia"), y = "Density") +
+  theme_few() +
+  theme(legend.position = "bottom", legend.title = element_blank())+
+  facet_wrap(~WaterYear, ncol = 1, scale = "free_y")
+
+doMet %>%
+  ggplot(aes(Date, probHypSat, color = Site)) +
+  geom_point(shape = 4, alpha = 0.8) +
+  theme_few() +
+  labs(y = expression(DO["%Sat"] ~ "Probability of Hypoxia"))+
+  scale_x_datetime(labels = date_format("%b"), breaks = "1 months") +
+  scale_color_brewer(palette = "Dark2")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.title.x = element_blank()) +
+  facet_wrap(~WaterYear, ncol = 1, scales = "free") 
+
+doMet %>%
+  ggplot(aes(Date, DOpctsat.amp, color = Site)) +
+  geom_point(shape = 4, alpha = 0.8) +
+  theme_few() +
+  labs(y = expression(Daily ~ DO["%Sat"] ~ "Amplitude"))+
+  scale_x_datetime(labels = date_format("%b"), breaks = "1 months") +
+  scale_color_brewer(palette = "Dark2")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.title.x = element_blank()) +
+  facet_wrap(~WaterYear, ncol = 1, scales = "free") 
+
+doMet %>%
+  ggplot(aes(Date, NHR_obs, color = Site)) +
+  geom_point(shape = 4, alpha = 0.8) +
+  theme_few() +
+  labs(y = expression(DO["mg/L"] ~ "Night Hypoxia Ratio"))+
+  scale_x_datetime(labels = date_format("%b"), breaks = "1 months") +
+  scale_color_brewer(palette = "Dark2")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.title.x = element_blank()) +
+  facet_wrap(~WaterYear, ncol = 1, scales = "free")
+
+doMet %>%
+  ggplot(aes(Date, NHR_sat, color = Site)) +
+  geom_point(shape = 4, alpha = 0.8) +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b"), breaks = "1 months") +
+  scale_color_brewer(palette = "Dark2")+
+  labs(y = expression(DO["%Sat"] ~ "Night Hypoxia Ratio"))+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.title.x = element_blank()) +
+  facet_wrap(~WaterYear, ncol = 1, scales = "free") 
+
+doMet %>%
+  ggplot(aes(x = cvDO.pctsat, fill = Site, after_stat(scaled))) +
+  geom_density(alpha = 0.5) +
+  xlim(-20, 100)+
+  scale_fill_brewer(palette = "Dark2") +
+  labs(x = expression(DO["%Sat"] ~ "Probability of Hypoxia"), y = "Density") +
+  theme_few() +
+  theme(legend.title = element_blank(), legend.position = "bottom")+
+  facet_wrap(~WaterYear, ncol = 1, scale = "free_y") 
+```
+
+# Hydro Metrics
+
+```{r}
+dailyQ <- allDat %>% 
+  mutate(Date = ymd(floor_date(solar.time, "1 day"))) %>%
+  group_by(Site, Date) %>%
+  summarize(Flow = mean(Q_Ls, na.rm = T)) %>% 
+  mutate(Flow = replace_na(Flow, 0),
+         Flow = ifelse(Flow < 0, 0, Flow)) %>% 
+  select(gage = Site, Date, Flow)
+
+for (i in unique(dailyQ$gage)) {
+  siteData <- filter(dailyQ, gage == i)
+  fileName <- paste0(i, ".csv") # Customize the file name as needed
+  write.csv(siteData, paste0(here("Data/AIMS_Q/"), fileName), row.names = FALSE)
+}
+
+allQ <- allDat %>% 
+  group_by(Site) %>%
+  filter(Site != "WHR") %>% 
+  mutate(Q_Ls = replace_na(Q_Ls, 0),
+         Q_Ls = ifelse(Q_Ls < 0, 0, Q_Ls))
+
+## Run sub_annual_metrics script
+```
+
+```{r}
+dryingMet <- read_csv(here("Data/AIMS_metrics_by_event_Q.csv")) %>% 
+  drop_na(event_id) %>% 
+  mutate(dryDateStart = ymd(paste0(calendar_year, "-01-01")) + days(dry_date_start-1),
+         Date = dryDateStart,
+         dryDateEnd = ymd(Date + days(dry_dur-1)),
+         peakDate = ymd(paste0(calendar_year, "-01-01")) + days(peak_date-1))
+
+#Merge hydro metrics with ts
+hydroTS <- dailyQ %>% 
+  full_join(dryingMet, by = c("gage", "Date"))
+```
+
+```{r}
+hydroTS %>%
+  #filter(gage == "KMZ") %>% 
+  ggplot(aes(Date, Flow)) +
+  geom_line(color = "#0084a8") +
+  ylab("Q (L/s)") +
+  theme_few() +
+  geom_rect(aes(xmin = dryDateStart, xmax = dryDateEnd, ymin = -Inf, ymax = +Inf),
+    fill = "#d3d3d3",
+    alpha = 0.5) +
+    geom_rect(aes(xmin = peakDate, xmax = peakDate+1, ymin = -Inf, ymax = +Inf),
+    fill = "#ff0000") +
+  scale_x_date() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap( ~ gage, scales = "free")
+```
+
+## Stage
+
+```{r}
+allDat %>%
+  ggplot(aes(dateTime, stage_cm)) +
+  geom_line(color = "#000000") +
+  ylab("SW Level (cm)") +
+  theme_few() +
+  scale_x_datetime() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap( ~ Site, scales = "free")
+
+dailyStage <- allDat %>% 
+  mutate(Date = ymd(floor_date(solar.time, "1 day"))) %>%
+  group_by(Site, Date) %>%
+  summarize(Flow = mean(stage_cm, na.rm = T)) %>% 
+  mutate(Flow = replace_na(Flow, 0),
+         Flow = ifelse(Flow < 0, 0, Flow)) %>% 
+  select(gage = Site, Date, Flow)
+
+for (i in unique(dailyQ$gage)) {
+  siteData <- filter(dailyQ, gage == i)
+  fileName <- paste0(i, ".csv") # Customize the file name as needed
+  write.csv(siteData, paste0(here("Data/AIMS_Stage/"), fileName), row.names = FALSE)
+}
+
+```
+
+```{r}
+dryingMetStage <- read_csv(here("Data/AIMS_metrics_by_event_Stage.csv")) %>% 
+  drop_na(event_id) %>% 
+  mutate(dryDateStart = ymd(paste0(calendar_year, "-01-01")) + days(dry_date_start - 1),
+         Date = dryDateStart,
+         dryDateEnd = ymd(Date + days(dry_dur - 1)),
+         peakDate = ymd(paste0(calendar_year, "-01-01")) + days(peak_date - 1))
+
+#Merge hydro metrics with ts
+dryingMetStage <- dailyStage %>% 
+  full_join(dryingMet, by = c("gage", "Date"))
+
+dryingMetStage %>%
+  ggplot(aes(Date, Flow)) +
+  geom_line(color = "#0084a8") +
+  ylab("Stage (cm)") +
+  theme_few() +
+  geom_rect(aes(xmin = dryDateStart, xmax = dryDateEnd, ymin = -Inf, ymax = +Inf),
+    fill = "#d3d3d3",
+    alpha = 0.5) +
+    geom_rect(aes(xmin = peakDate, xmax = peakDate + 1, ymin = -Inf, ymax = +Inf),
+    fill = "#ff0000",
+    alpha = 0.8) +
+  scale_x_date() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap( ~ gage, scales = "free")
+```
+
+# Merge Metrics
+
+```{r}
+dryingMetStage <- dryingMetStage %>% 
+  rename(Site = gage)
+allMet <- doMet %>% 
+  full_join(dryingMetStage)
+```
+
+# BFI
+
+```{r}
+# Filter parameters. More passes for more frequent data. Default is 3 for daily,
+# ~11 recommended for 15-min. Beta can be anywhere > 0.9, just tune to something
+# that looks good. More info in Ladson et al. (2013), DOI 10.7158/W12-028.2013.17.1
+beta <- 0.992
+#passes <- 11
+allQ <- allQ %>% 
+  group_by(Site) %>% 
+  mutate(bFlow = BaseflowSeparation(Q_Ls, beta, passes = 14),
+         bFlowIndex = bFlow/Q_Ls,
+         bFlowIndex = if_else(bFlowIndex < 0, NA, bFlowIndex)) #%>% 
+ # mutate(bFlowIndex = replace_na(bFlowIndex, 0))
+
+allQ %>%
+  filter(bFlow>= 0) %>%
+  ggplot(aes(dateTime, Q_Ls)) +
+  geom_line(color = "#0084a8") +
+  geom_line(aes(y = bFlow))+
+  ylab("Q (L/s)") +
+  theme_few() +
+  scale_x_datetime()+
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap( ~ Site, scales = "free")
+
+allQ %>%
+  filter(bFlow>= 0) %>%
+  ggplot(aes(dateTime, bFlowIndex)) +
+  geom_point(color = "#0084a8") +
+  ylab("BFI") +
+  theme_few() +
+  scale_x_datetime()+
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap( ~ Site, scales = "free")
+
+bfiThresh <- 0.5
+
+allQ %>%
+  filter(bFlow > 0) %>%
+  ggplot(aes(bFlowIndex)) +
+  geom_histogram(binwidth = 0.01)+
+  geom_vline(xintercept = bfiThresh, color = 'red') +
+  ylab("Q (L/s)") +
+  theme_few() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap( ~ Site, scales = "free")
+```
+
+```{r}
+# Create events data frame using threshold. Min_length argument filters out events
+# less than the specified length in days. 
+delineator <- function(x, bfi_threshold, min_length = NA){
+  dateTime <- x[['dateTime']]
+  bfi <- x[['bFlowIndex']]
+  
+  # Ensure the lag and lead return vectors of the same length as the original
+  lag_bfi <- lag(bfi, default = NA)
+  lead_bfi <- lead(bfi, default = NA)
+  
+  # Start the event when bfi is <= bfi_threshold and the previous bfi was > bfi_threshold
+  starts <- dateTime[bfi > bfi_threshold & lead_bfi < bfi_threshold & lag_bfi > bfi_threshold]
+  
+  # End the event when bfi becomes NaN
+  ends <- dateTime[is.na(lead_bfi)]
+  
+  # Match each start with an end
+  if(length(starts) > length(ends)) {
+    starts <- starts[1:length(ends)]  # Trim the excess starts to match ends
+  } else if(length(ends) > length(starts)) {
+    ends <- ends[1:length(starts)]  # Trim the excess ends to match starts
+  }
+  
+  # Create a dataframe of events
+  events <- data.frame(
+    start = starts,
+    end = ends
+  ) %>%
+    mutate(length = as.numeric(as.duration(interval(start, end)), 'days'))
+  
+  # Apply minimum length filter if specified
+  if(!is.na(min_length)){ events <- filter(events, length >= min_length) }
+  
+  # Assign event IDs
+  events[['event_id']] <- seq(1:nrow(events))
+  
+  return(events)
+}
+
+
+events <- list()
+for (i in unique(allQ$Site)) {
+  siteData <- allQ %>% 
+    filter(Site == i)
+    
+  events[[i]] <- delineator(siteData, bfiThresh, min_length = 10)
+  events[[i]]$Site <- i
+}
+
+events <- do.call(rbind, events)
+
+#max Q per site
+maxQ <- allQ %>%
+  group_by(Site) %>%
+  summarize(max_Q = max(Q_Ls, na.rm = TRUE))
+
+#join the max values with the events data
+events <- events %>%
+  left_join(maxQ, by = "Site")
+
+# plot it up --------------------------------------------------------------
+allQ %>% 
+  filter(bFlow >= 0) %>% 
+  ggplot() +
+  geom_line(aes(x = dateTime, y = Q_Ls)) +
+  geom_line(aes(x = dateTime, y = bFlow), color = 'red') +
+  geom_rect(data = events,
+            aes(xmin = start, xmax = end, ymin = 0, ymax = Inf),
+            inherit.aes = FALSE, # Ensure that data from events is used, not from allQ
+            fill = 'grey50', alpha = 0.3, linetype = 'dashed') +
+  geom_text(data = events,
+            aes(x = start, label = event_id, y = 0.95 * max_Q),
+            inherit.aes = FALSE) +
+  facet_wrap(~ Site, ncol = 3, scales = "free_y")
+```

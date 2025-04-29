@@ -1,0 +1,2947 @@
+---
+title: "GP DO Regimes"
+author: "CLB"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+library(data.table)
+library(tidyverse, warn.conflicts = F)
+options(readr.show_col_types = F)
+library(broom)
+library(googlesheets4)
+library(ggthemes)
+library(ggpmisc)
+library(NatParksPalettes)
+library(ggpubr)
+library(patchwork)
+library(gridExtra)
+library(plotly)
+library(here)
+library(styler)
+library(streamMetabolizer)
+library(rstan)
+options(mc.cores = parallel::detectCores())
+library(dataRetrieval)
+library(scales)
+library(knitr)
+library(lubridate)
+library(zoo)
+library(parallel)
+library(doParallel)
+library(foreach)
+library(nasapower)
+library(imputeTS)
+library(rgbif)
+library(moments)
+library(inflection)
+library(corrplot)
+library(factoextra)
+library(tidymodels)
+library(bestNormalize)
+#library(rstatix)
+library(emmeans)
+#library(infer)
+library(cluster)
+library(mgcv)  # For GAMs
+source(here("Code/priceDrying.R"))
+source(here("Code/Functions/exoPipeline.R"))
+```
+
+# Site Locations
+
+```{r}
+siteInfo <- tibble(Site = c("KMZ", "SHN", "YMR", "OKA", "GBJ", "DRC", "JDR", "TAL", "WHR", "PRF"),
+                   Lat = c(39.092353, 39.115220, 37.56452, 34.437642, 42.78483889, 43.7184, 43.1226, 33.7621789, 32.98463, 34.968669),
+                   Long = c(-96.587238, -96.558380, -96.49102, -96.652997, -112.44484722, -116.137, -116.776, -85.595521, -88.012269, -86.165439))
+	
+siteElev <-  elevation(latitude = siteInfo$Lat, longitude = siteInfo$Long, username = "conbro") %>% 
+  select(Elev = elevation_geonames)
+siteInfo$Elev_m <- siteElev$Elev
+```
+
+# Rating Curves
+
+```{r}
+# GP Rating Curve
+gpRC <- read_sheet(ss = "1DkF2Ugr6tEgnZHOGJ_UY2kW9JWH4ce8xbyzSyyA6-CI", col_types = "cDcddddddddcccc") %>%
+  filter(Quality %in% c("Maybe", "Good") &
+           SiteName %in% c("SFM01", "ENM01", "SHM01")) %>%
+  mutate(dateTime = ymd_hms(paste(Date, InjectionTime, sep = ":"))) %>% 
+    select(Site = SiteName, dateTime, NaCl_g, UpstreamWidth_m, DownstreamWidth_m, ReachLength_m, Q_Ls, SensorStage_ft,
+    ManualStage_ft, Offset, Quality) %>% 
+  mutate(Site = case_when(Site == "ENM01" ~ "YMR",
+                          Site == "SFM01" ~ "KMZ",
+                          Site == "SHM01" ~ "SHN"))
+
+# PT vs Stage
+ptStage <- read_sheet(ss = "1DkF2Ugr6tEgnZHOGJ_UY2kW9JWH4ce8xbyzSyyA6-CI",
+                   sheet = "PT vs Stage",
+                   col_types = "cDccdd") %>% 
+    mutate(dateTime = ymd_hms(paste(Date, Time, sep = ":"))) %>% 
+  select(-VisitType, -Date, -Time) %>% 
+  mutate(Site = case_when(Site == "ENM01" ~ "YMR",
+                          Site == "SFM01" ~ "KMZ",
+                          Site == "SHM01" ~ "SHN")) %>% 
+  bind_rows(gpRC %>% select(Site, dateTime, SensorStage_ft, ManualStage_ft))
+
+# YMR manual stage from sensor stage
+ymrStage <- ptStage %>%
+  filter(Site %in% c("YMR")) %>%
+  lm(ManualStage_ft ~ SensorStage_ft, data = .) %>% 
+  coef()
+
+# SHN sensor to manual stage
+shnStage <- ptStage %>%
+  filter(Site %in% c("SHN")) %>%
+  lm(SensorStage_ft ~ ManualStage_ft, data = .) %>% 
+  coef()
+
+# Apply the coefficients to calculate manual stage for YMR
+gpRC <- gpRC %>%
+  mutate(ManualStage_ft = case_when(
+    Site == "YMR" & is.na(ManualStage_ft) ~ ymrStage["(Intercept)"] + ymrStage["SensorStage_ft"] * SensorStage_ft,
+    TRUE ~ ManualStage_ft
+  ))
+
+```
+
+```{r}
+
+ptStage %>%
+  ggplot(aes(ManualStage_ft, SensorStage_ft)) +
+  geom_point() +
+  labs(x = "Manual Stage (ft)",
+       y = "Sensor Stage (ft)")+
+  geom_smooth(method='lm') +
+  stat_regline_equation(aes(label = ..rr.label..))+
+  theme_few() +
+  facet_wrap(~Site, ncol = 1, scales = "free")
+
+gpRC %>%
+  filter(Q_Ls > 0) %>% 
+  ggplot(aes(SensorStage_ft, Q_Ls)) +
+  geom_point() +
+  labs(x = "Sensor Stage (ft)",
+       y = "Discharge (L/s)")+
+  geom_smooth(method='lm') +
+  stat_regline_equation(aes(label = ..rr.label..))+
+  theme_few() +
+  facet_wrap(~Site, ncol = 1, scales = "free")
+
+gpRC %>%
+  drop_na(ManualStage_ft) %>% 
+  filter(Q_Ls > 0) %>% 
+  ggplot(aes(ManualStage_ft, Q_Ls)) +
+  geom_point() +
+  labs(x = "Manual Stage (ft)",
+       y = "Discharge (L/s)")+
+  geom_smooth(method='lm') +
+  stat_regline_equation(aes(label = ..rr.label..))+
+  theme_few() +
+  facet_wrap(~Site, ncol = 1, scales = "free")
+
+gpRC %>%
+  drop_na(ManualStage_ft) %>% 
+  filter(Q_Ls > 0) %>% 
+  ggplot(aes(exp(log(ManualStage_ft)), exp(log1p(Q_Ls)))) +
+  geom_point() +
+  labs(x = "log(Manual Stage (ft))",
+       y = "log(Discharge (L/s))")+
+  geom_smooth(method='lm') +
+  stat_regline_equation(aes(label = ..rr.label..))+
+  theme_few() +
+  facet_wrap(~Site, ncol = 1, scales = "free")
+
+gpRC %>%
+  drop_na(ManualStage_ft) %>% 
+  filter(Q_Ls > 0) %>% 
+  ggplot(aes(exp(log(ManualStage_ft)), Q_Ls)) +
+  geom_point() +
+  labs(x = "log(Manual Stage (ft))",
+       y = "Discharge (L/s)")+
+  geom_smooth(method='lm') +
+  stat_regline_equation(aes(label = ..rr.label..))+
+  theme_few() +
+  facet_wrap(~Site, ncol = 1, scales = "free")
+
+gpRC %>%
+  drop_na(ManualStage_ft) %>% 
+  filter(Q_Ls > 0) %>% 
+  ggplot(aes(ManualStage_ft, exp(log(Q_Ls)))) +
+  geom_point() +
+  labs(x = "Manual Stage (ft)",
+       y = "log(Discharge (L/s))")+
+  geom_smooth(method='lm') +
+  stat_regline_equation(aes(label = ..rr.label..))+
+  theme_few() +
+  facet_wrap(~Site, ncol = 1, scales = "free")
+
+```
+
+## Calc Discharge Rating Curve for Each Site
+
+```{r}
+#KMZ
+kmzRC <- gpRC %>%
+  filter(Site %in% c("KMZ")) %>%
+  drop_na(ManualStage_ft) %>%
+  lm(log1p(Q_Ls) ~ log(ManualStage_ft), data = .) %>% 
+  coef()
+
+#SHN
+shnRC <- gpRC %>% 
+  filter(Site %in% c("SHN")) %>% 
+  drop_na(SensorStage_ft) %>% 
+  lm(Q_Ls ~ SensorStage_ft, data = .) %>%
+  coef()
+
+#YMR
+ymrRC <- gpRC %>% 
+  filter(Site %in% c("YMR")) %>% 
+  drop_na(ManualStage_ft) %>% 
+  lm(Q_Ls ~ ManualStage_ft, data = .) %>%
+  coef()
+```
+
+# Get Sensor Data
+
+```{r}
+# Path to QAQC pipeline
+qaqcPath <- here("Data/EXO_QAQC/01_data/04_postQaqc/")
+# Site to load data
+#Sites <- c("SHN", "KMZ", "YMR", "OKA")
+Sites <- c("SHN", "KMZ", "YMR")
+
+
+# Read data for each site and combine
+rawGP <- rbindlist(lapply(Sites, read_QAQCdata), fill = TRUE) %>%
+  filter(alphaQf == 0 & betaQfSd == 0) %>%
+  select(Site, dateTime = timestamp, parameterName, value, wetQf) %>%
+  filter(parameterName %in% c("Temp_EXO_C", "SpCond_uS_cm", "Conductivity_uS_cm", "ODO_mg_L", "SW_Temp_PT_C", "SW_Level_ft",  "Temp_MiniDOT_C", "ODO_MiniDOT_mg_L", "Temp_s-can_C")) %>% 
+  pivot_wider(names_from = parameterName, values_from = value, values_fn = mean) %>%
+  mutate(
+    dateTime = parse_date_time(dateTime, orders = c("ymd HMS"), tz = "UTC"),
+    ODO_mg_L = ifelse(ODO_mg_L == 0, NA, ODO_mg_L)
+  ) %>% 
+  filter(!(Site == "YMR" & dateTime < "2021-07-18")) %>% 
+  filter(!(Site == "SHN" & dateTime < "2023-03-24")) %>% 
+  filter(!(Site == "KMZ" & dateTime < "2021-06-10"))
+  
+
+#Get all sites to 10 minute timestep
+rawGP <- rawGP %>% 
+  group_by(Site) %>%
+  complete(dateTime = seq(floor_date(min(dateTime), "10 min"), floor_date(max(dateTime), "10 min"), by = "10 min")) %>%
+  arrange(dateTime) %>%
+  mutate(across(c(Temp_EXO_C:ODO_MiniDOT_mg_L), ~ zoo::na.approx(.x, na.rm = F, maxgap = 10))) %>%
+  filter(minute(dateTime) %% 10 == 0) %>%
+  ungroup() %>% 
+  mutate(DO.obs = coalesce(ODO_mg_L, ODO_MiniDOT_mg_L),
+         temp.water = coalesce(Temp_EXO_C, `Temp_s-can_C`, SW_Temp_PT_C, Temp_MiniDOT_C),
+         SW_Level_cm = SW_Level_ft * 30.47999902) %>% 
+  select(-ODO_mg_L, -ODO_MiniDOT_mg_L, -Temp_EXO_C, -`Temp_s-can_C`, -Temp_MiniDOT_C)
+
+#Calc SpCond if missing
+condMissing <- rawGP %>%
+  filter((!is.na(SpCond_uS_cm) & is.na(Conductivity_uS_cm)) | (is.na(SpCond_uS_cm) & !is.na(Conductivity_uS_cm)))
+
+rawGP <- rawGP %>% 
+  mutate(SpCondCalc = Conductivity_uS_cm / (1 + 0.02 * (temp.water - 25)),
+         CondCalc = SpCond_uS_cm * (1 + 0.02 * (temp.water - 25)),
+         SpCond = coalesce(SpCond_uS_cm, SpCondCalc),
+         Cond = coalesce(Conductivity_uS_cm, CondCalc)) %>% 
+  select(-SpCond_uS_cm, -Conductivity_uS_cm, -SpCondCalc, -CondCalc)
+
+# Wet Dry Flagging
+rawGP <- rawGP %>% 
+      mutate(wetQf = case_when(
+      SW_Level_cm < 1 ~ 1,
+      SW_Level_cm < 2 & SpCond < 10 ~ 1,
+      Site == "KMZ" & SW_Level_cm > 3 ~ 0,
+      Site == "KMZ" & SpCond < 10 ~ 1,
+      Site == "KMZ" & (month(dateTime) == 12) | (month(dateTime) == 1) | (month(dateTime) == 2) ~ 1,
+      Site == "KMZ" & (year(dateTime) == "2022") & (month(dateTime) == 9) | (month(dateTime) == 10) | (month(dateTime) == 11) | (month(dateTime) == 12) ~ 1,
+      is.na(SW_Level_cm) & is.na(SpCond) & lag(wetQf, default = 0) == 1 ~ 1,
+      is.na(SW_Level_cm) & SpCond == 0 & lag(wetQf, default = 0) == 1 ~ 1,
+      Site == "YMR" & SW_Level_cm < 1.82 & SpCond < 300 ~ 1,
+      Site == "YMR" & (year(dateTime) == "2023") & (month(dateTime) == 8) | (month(dateTime) == 9) | (month(dateTime) == 10) | (month(dateTime) == 11) ~ 1,
+      Site == "SHN" & is.na(SpCond) | SpCond == 0 & SW_Level_cm < 3.1 & lag(wetQf, default = 1) == 1 ~ 1,
+      Site == "SHN" & SW_Level_cm < 1 & temp.water < 0 ~ 1,
+      Site == "SHN" & SW_Level_cm < 25 ~ 1,
+      Site == "KMZ" & SW_Level_cm < 10 ~ 1,
+      TRUE ~ 0
+    ))
+
+rawGP <- rawGP %>% 
+  filter(!wetQf == 1) %>% 
+  group_by(Site) %>%
+  complete(dateTime = seq(floor_date(min(dateTime), "10 min"), floor_date(max(dateTime), "10 min"), by = "10 min")) %>%
+  arrange(dateTime) %>%
+  mutate(across(c(SW_Temp_PT_C:Cond), ~ zoo::na.approx(.x, na.rm = F, maxgap = 10))) %>%
+  filter(minute(dateTime) %% 10 == 0) %>%
+  ungroup()
+```
+
+## Calc Q from Sensor Data
+
+```{r}
+gpDat <- rawGP %>%
+  mutate(
+    Q_Ls = case_when(
+      Site == "KMZ" ~ kmzRC["(Intercept)"] + kmzRC["log(ManualStage_ft)"] * SW_Level_ft,
+      Site == "SHN" ~ shnRC["(Intercept)"] + shnRC["SensorStage_ft"] * SW_Level_ft,
+      Site == "YMR" ~ ymrRC["(Intercept)"] + ymrRC["ManualStage_ft"] * SW_Level_ft, 
+      TRUE ~ NA_real_))
+```
+
+## Check Out Data
+
+```{r}
+gpDatLong <- gpDat %>%
+  select(-SW_Temp_PT_C, -SW_Level_ft) %>% 
+  pivot_longer(cols = c(Q_Ls, SW_Level_cm, DO.obs, Cond, SpCond), names_to = "parameter", values_to = "value")
+
+# Create plots for each site
+gpDatLong %>%
+  group_by(Site) %>%
+  do(plot = ggplot(data = ., aes(x = dateTime, y = value, color = parameter)) +
+       geom_line() +
+       labs(title = unique(.$Site), x = "DateTime", y = "Value") +
+       theme_few() +
+        scale_x_datetime(labels = date_format("%b '%y"), breaks = "2 months") +
+       scale_color_manual(values = c("Q_Ls" = "#0084a8", "SW_Level_cm" = "black", "DO.obs" = "#5d782e", "Cond" = "black", "SpCond" = "black"))+
+     facet_wrap(~parameter, ncol = 1, scales = "free_y")+
+       theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")) -> plt
+# Print plots to the console
+for(i in 1:length(plt$Site)) {
+  print(plt$plot[[i]])
+  datPlt <- plt$plot[[i]]
+#  ggsave(paste0(plt$Site[[i]], ".png"), datPlt, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+}
+```
+
+# Download NASA Data
+
+```{r}
+selSites <- siteInfo %>% 
+  filter(Site %in% unique(gpDat$Site))
+
+#Download barometric presssure from NASAPower for each site
+nasaDat <- list()
+for (i in 1:nrow(selSites)) {
+  cat(paste("Downloading data for", selSites$Site[i], "\n"))
+  tempDat <- gpDat %>% 
+    filter(Site == selSites$Site[i])
+  sDate <- as_date(min(tempDat$dateTime, na.rm = T))
+  eDate <- as_date(max(tempDat$dateTime, na.rm = T))
+  
+  nasaDat[[i]] <- get_power(
+    community = "sb",
+    pars = c("PSC", "ALLSKY_SFC_SW_DWN", "PRECTOTCORR"),
+    temporal_api = "hourly",
+    lonlat = c(selSites$Long[i], selSites$Lat[i]),
+    dates = c(sDate, eDate),
+    site_elevation = selSites$Elev_m[i],
+    time_standard = "UTC"
+  )
+  nasaDat[[i]]$Site <- selSites$Site[i]
+  cat(paste("Finished downloading data for", selSites$Site[i], "\n"))
+  #Break loop on last iteration
+  if (i == nrow(selSites)) {
+    break
+  }
+}
+
+nasaDat <- do.call(rbind, nasaDat)
+nasaDat <- nasaDat %>% 
+  select(Site, YYYYMMDD, HR, PSC, ALLSKY_SFC_SW_DWN, PPT_mm = PRECTOTCORR) %>% 
+  mutate(Hour = str_pad(HR, 2, side = "left", pad = 0)) %>% 
+  unite(dateTime, YYYYMMDD, Hour, sep = " ") %>% 
+  mutate(dateTime = ymd_hms(paste0(dateTime, ":00:00")),
+         PSC = PSC*10, #Convert kilopascals to millibar
+         PAR.obs = convert_SW_to_PAR(ALLSKY_SFC_SW_DWN)) %>% 
+  select(-HR, -ALLSKY_SFC_SW_DWN)
+
+gpDat <- gpDat %>% 
+  full_join(nasaDat, by = c("Site", "dateTime")) %>% 
+  left_join(selSites, by = "Site") %>% 
+  group_by(Site) %>% 
+  mutate(solar.time = convert_UTC_to_solartime(dateTime, longitude = Long, time.type = "mean solar"),
+         isDaytime = calc_is_daytime(solar.time, Lat),
+         PSC = na.approx(PSC, maxgap = 6, na.rm = F),
+         PAR.obs = na.approx(PAR.obs, maxgap = 6, na.rm = F),
+         PPT_mm = na.approx(PPT_mm, maxgap = 6, na.rm = F),
+         DO.sat = calc_DO_sat(temp.water = temp.water, PSC, model = "garcia-benson"),
+         DO.pctsat = 100 * (DO.obs/ DO.sat),
+         WaterYear = calcWaterYear(dateTime))
+```
+
+## Model Missing Light Data
+
+```{r}
+# Set the number of cores to use
+numCores <- detectCores() - 1  # Use one less than the number of available cores
+cl <- makeCluster(numCores)
+registerDoParallel(cl)
+
+# Parallel processing with foreach
+gpDat <- foreach(i = unique(gpDat$Site), .combine = rbind, .packages = c("dplyr", "data.table", "streamMetabolizer")) %dopar% {
+  tempDat <- gpDat %>% filter(Site == i)
+  # Get max observed light value
+  maxLight <- max(tempDat$PAR.obs, na.rm = TRUE)
+  tempDat$PAR.mod <- calc_light(tempDat$solar.time, latitude = tempDat$Lat, longitude =  tempDat$Long, max.PAR = maxLight)
+  # Merge calc and obs light
+  tempDat$light <- fcoalesce(tempDat$PAR.obs, tempDat$PAR.mod)
+  tempDat
+}
+
+# Stop the cluster
+stopCluster(cl)
+rm(cl)
+
+```
+
+### PPT Exceedence Probability
+
+```{r}
+#Download barometric presssure from NASAPower for each site
+pptDat <- list()
+for (i in 1:nrow(selSites)) {
+  cat(paste("Downloading data for", selSites$Site[i], "\n"))
+
+  
+  pptDat[[i]] <- get_power(
+    community = "sb",
+    pars = c("PRECTOTCORR"),
+    temporal_api = "daily",
+    lonlat = c(selSites$Long[i], selSites$Lat[i]),
+    dates = c("1981-01-01", "2024-07-01"),
+    site_elevation = selSites$Elev_m[i],
+    time_standard = "UTC"
+  )
+  pptDat[[i]]$Site <- selSites$Site[i]
+  cat(paste("Finished downloading data for", selSites$Site[i], "\n"))
+  #Break loop on last iteration
+  if (i == nrow(selSites)) {
+    break
+  }
+}
+
+pptDat <- do.call(rbind, pptDat)
+pptDat <- pptDat %>% 
+  select(Site, Date = YYYYMMDD,  PPT_mm = PRECTOTCORR) %>% 
+  mutate(Year = year(Date),
+         Period = case_when(
+           Year < 2021 ~ "1981-2020",
+           Year == 2021 ~ "2021",
+           Year == 2022 ~ "2022",
+           Year == 2023 ~ "2023",
+           Year == 2024 ~ "2024")) %>% 
+  group_by(Period, Site) %>%
+  arrange(desc(PPT_mm)) %>%
+  mutate(
+    Rank = row_number(),
+    PPT_ExceProb = (Rank / (n() + 1)) * 100)
+
+  
+
+pptDat %>% 
+  ggplot(aes(x = PPT_ExceProb, y = PPT_mm, color = Period)) +
+  geom_line() +
+  scale_y_log10() +
+  scale_color_manual(values = c("1981-2020" = "#000000", "2021" = "#1B9E77", "2022" = "#D95F02", "2023" = "#7570B3", "2024" = "#E7298A")) +
+  labs(x = "Exceedance Probability (%)",
+       y = "Precipitation (mm/d)") +
+  theme_few()+
+  facet_wrap(~Site)
+
+pptDat %>% 
+  filter(Year >= "2021") %>% 
+  ggplot(aes(Date, PPT_mm)) +
+  geom_col(color = "#0084a8") +
+  ylab("Precipitation (mm)") +
+  theme_few() +
+  scale_y_reverse()+
+  scale_x_date(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~Site, ncol = 1, scales = "free")
+
+pptMonthAvg <- pptDat %>%
+  mutate(Month = month(Date)) %>% 
+  group_by(Site, Period, Year, Month) %>%
+  summarise(PPT_mm = mean(PPT_mm, na.rm = T))
+pptMonthAvg %>% 
+  ggplot(aes(x = as.factor(Period), y = PPT_mm, fill = Site)) +
+  geom_boxplot() +
+  scale_fill_brewer(palette = "Dark2", type = "div") +
+  facet_wrap(~ Site, scales = "free") +
+  scale_y_continuous(labels = label_number())+
+  #scale_y_log10(labels = label_number()) +
+  labs(title = "Monthly Average Precipitation",
+       x = "",
+       y = "PPT (mm)") +
+  theme_few() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") -> pptPlt
+pptPlt
+ggsave("pptPlt.png", pptPlt, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+```
+
+### PPT Stats
+
+```{r}
+#get average for each year
+pptYrAvg <- pptDat %>% 
+  group_by(Site, Year) %>%
+  summarise(PPT_mm = mean(PPT_mm, na.rm = T))
+
+# Get long term average ppt
+pptLongAvg <- pptDat %>% 
+  group_by(Site, Period) %>%
+  filter(Period == "1981-2020") %>% 
+  summarise(longTermPPT = mean(PPT_mm, na.rm = T)) %>% 
+  dplyr::select(-Period)
+
+# Group by Site and perform the paired t-test
+pptYrAvg <- pptYrAvg %>% 
+  left_join(pptLongAvg)
+
+#t-test for each site's annual average against its long-term average
+pptTtest <- pptYrAvg %>%
+  group_by(Site) %>%
+  filter(Year > 2020) %>% 
+  summarize(t_test = list(t.test(PPT_mm, longTermPPT, paired = TRUE)))
+
+#t-test results
+pptTtest <- pptTtest %>%
+  mutate(
+    p_value = sapply(t_test, function(x) x$p.value),
+    statistic = sapply(t_test, function(x) x$statistic),
+    conf_low = sapply(t_test, function(x) x$conf.int[1]),
+    conf_high = sapply(t_test, function(x) x$conf.int[2])
+  )
+
+# Convert Year to a factor for ANOVA
+pptYrAvg <- pptYrAvg %>% 
+  filter(Year > "2020" & Year < "2024") %>% 
+  mutate(Year = as.factor(Year))
+
+# Perform two-way ANOVA
+pptAnova <- aov(PPT_mm ~ Site + Year, data = pptYrAvg)
+summary(pptAnova)
+# Summary of the ANOVA
+TukeyHSD(pptAnova, "Site")
+TukeyHSD(pptAnova, "Year")
+
+######
+#get average for each year
+pptYrAvg <- pptDat %>% 
+  group_by(Site, Period) %>%
+  summarise(PPT_mm = mean(PPT_mm, na.rm = T)) %>% 
+  mutate(Period = factor(Period))
+
+pptAnova <- aov(PPT_mm ~ Site + Period, data = pptYrAvg)
+summary(pptAnova)
+TukeyHSD(pptAnova, "Site")
+TukeyHSD(pptAnova, "Period")
+
+```
+
+```{r}
+gpDat %>%
+  ggplot(aes(dateTime, DO.pctsat)) +
+  geom_line(color = "#5d782e") + 
+  ylab("DO % Sat") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y"), breaks = "6 months") +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~Site, ncol = 2, scales = "free")
+
+gpDat %>%
+  ggplot(aes(dateTime, light)) +
+  geom_line(color = "darkgoldenrod1") +
+  ylab(expression(PAR~(mu*"mol m"^-2*"s"^-1))) +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y"), breaks = "6 months") +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~Site, ncol = 2, scales = "free")
+
+gpDat %>%
+  ggplot(aes(dateTime, Q_Ls)) +
+  geom_line(color = "#0084a8") +
+  ylab("Discharge (L/s)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y"), breaks = "6 months") +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~Site, ncol = 2, scales = "free")
+```
+
+## Check \# Days
+
+```{r}
+gpDatDays <- gpDat %>% 
+  mutate(Date = as.Date(dateTime),
+         Year = year(dateTime)) %>% 
+  group_by(Site, Year, Date) %>%
+  summarise(completeDay = all(!is.na(wetQf)) & 
+                            all(!is.na(temp.water)) & 
+                            all(!is.na(SpCond)) & 
+                            all(!is.na(Cond)) & 
+                            all(!is.na(DO.obs)) & 
+                            all(!is.na(SW_Temp_PT_C)) & 
+                            all(!is.na(SW_Level_ft)),
+            .groups = 'drop') %>% 
+  group_by(Site, Year) %>%
+  summarise(complete_days_count = sum(completeDay),
+            .groups = 'drop')
+
+
+gpDatDays <- gpDat %>% 
+  mutate(Date = as.Date(dateTime),
+         Year = year(dateTime)) %>% 
+  group_by(Site, Year, Date) %>%
+  summarise(total_obs = n(),
+            across(wetQf:Cond, ~ sum(!is.na(.))),
+            .groups = 'drop') %>% 
+  mutate(at_least_50_percent = (wetQf / total_obs >= 0.25) &
+                                (temp.water / total_obs >= 0.25) &
+                                (SpCond / total_obs >= 0.25) &
+                                (Cond / total_obs >= 0.25) &
+                                (DO.obs / total_obs >= 0.25) &
+                                (SW_Temp_PT_C / total_obs >= 0.25) &
+                                (SW_Level_ft / total_obs >= 0.25)) %>% 
+  group_by(Site, Year) %>%
+  summarise(days_with_50_percent_obs = sum(at_least_50_percent),
+            .groups = 'drop')
+
+```
+
+## Calc Dry vs. Wet Days
+
+```{r}
+aimsWetDry <- gpDat %>% 
+  select(Site, dateTime, wetQf, temp.water, SpCond, Cond, DO.obs, SW_Level_cm, SW_Level_ft) %>% 
+  mutate(Date = as.Date(dateTime)) %>%
+  group_by(Site, Date) %>%
+  summarize(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)), .groups = "drop") %>% 
+  mutate(wetQf = if_else(is.na(wetQf) | wetQf != 0 | SW_Level_ft < 0.09, 1, wetQf))
+
+
+# Read data for each site and combine
+aimsWetDry <- rawGP %>% 
+  select(Site, dateTime, wetQf, SW_Level_ft, SW_Temp_PT_C, temp.water, SpCond, Cond) %>% 
+  mutate(Date = as.Date(dateTime)) %>%
+  group_by(Site, Date) %>%
+  summarize(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)), .groups = "drop") %>% 
+  mutate(temp.water = na.approx(temp.water, na.rm = F, maxgap = 4),
+         SpCond = na.approx(SpCond, na.rm = F, maxgap = 4),
+         Cond = na.approx(Cond, na.rm = F, maxgap = 4),
+         SW_Temp_PT_C = na.approx(SW_Temp_PT_C, na.rm = F),
+         SW_Level_ft = na.approx(SW_Level_ft, na.rm = F),
+         wetQf = replace_na(wetQf, 1)
+         #wetQfInterp = na.approx(wetQf, na.rm = F),
+         ) %>%
+  mutate(wetQf2 = if_else(wetQf > 0 | SW_Level_ft < 0.05 | SW_Temp_PT_C < 5, 1, 0, wetQf)) %>% 
+  # Set wetQf to 1 if (SW_Level_ft < 0.02 and Conductivity_uS_cm < 5 or NA) or SW_Temp_PT_C < 0 or (SW_Level_ft < 0.02 & SW_Temp_PT_C < 0)
+  mutate(wetQf3 = if_else((SW_Level_ft < 0.02 & (is.na(Cond) | Cond < 5)) | SW_Temp_PT_C < 0 | (SW_Level_ft < 0.02 & SW_Temp_PT_C < 0), 1, wetQf2))
+
+aimsWetDryDays <- aimsWetDry %>% 
+  mutate(Year = year(Date)) %>%
+  filter(Year < "2024") %>% 
+  group_by(Site, Year) %>%
+  summarize(
+    DryDays = sum(wetQf2 == 1),
+    WetDays = sum(wetQf2 == 0),
+    TotalDays = n(),
+    PercWetPeriod = round((WetDays/TotalDays)*100),
+    PercDryPeriod = round((DryDays/TotalDays)*100),
+    .groups = 'drop'  # To ungroup after summarizing
+  )
+
+```
+
+## Get Season
+
+```{r}
+# Function to determine the season
+calcSeason <- function(date) {
+  m <- lubridate::month(date)
+  d <- lubridate::day(date)
+  if ((m == 12 && d >= 21) || (m %in% c(1, 2)) || (m == 3 && d < 21)) {
+    return("Winter")
+  } else if ((m == 3 && d >= 21) || (m %in% c(4, 5)) || (m == 6 && d < 21)) {
+    return("Spring")
+  } else if ((m == 6 && d >= 21) || (m %in% c(7, 8)) || (m == 9 && d < 21)) {
+    return("Summer")
+  } else if ((m == 9 && d >= 21) || (m %in% c(10, 11)) || (m == 12 && d < 21)) {
+    return("Fall")
+  }
+  return(NA)
+}
+
+# Add season column
+# gpDat <- gpDat %>%
+#   mutate(date = as.POSIXct(dateTime, format = "%Y-%m-%d %H:%M:%S"),
+#          season = sapply(date, calcSeason))
+
+```
+
+# Calculate DO Metrics
+
+```{r}
+# Daily metrics
+dailyDO <- gpDat %>% 
+  mutate(Date = floor_date(solar.time, "1 day")) %>%
+  group_by(Site, Date) %>%
+  summarize(
+    minDO.obs = min(DO.obs, na.rm = T),
+    maxDO.obs = max(DO.obs, na.rm = T),
+    minDO.pctsat = min(DO.pctsat, na.rm = T),
+    maxDO.pctsat = max(DO.pctsat, na.rm = T),
+    avgDO.obs = mean(DO.obs, na.rm = T),
+    avgDO.pctsat = mean(DO.pctsat, na.rm = T),
+    DOSat.hyp = sum(DO.pctsat <= 50, na.rm = T),
+    DO.hyp = sum(DO.obs <= 2, na.rm = T),
+    totalDO = n()
+    ) %>% 
+  mutate(across(where(is.numeric), ~ ifelse(is.finite(.), ., NA))) %>% 
+  mutate(across(where(is.numeric), ~ ifelse(if_any(everything(), is.na), NA, .))) %>% 
+  mutate(across(minDO.obs:avgDO.pctsat, ~ ifelse(. == 0, NA, .))) %>% 
+  mutate(DO.amp = maxDO.obs - minDO.obs,
+         DOpctsat.amp = maxDO.pctsat - minDO.pctsat,
+         probHyp = DO.hyp / totalDO,
+         probHypSat = DOSat.hyp / totalDO,
+         WaterYear = calcWaterYear(Date),
+         season = sapply(Date, calcSeason),
+         Year = year(Date))
+
+dailyDO <- gpDat %>% 
+  mutate(Date = floor_date(solar.time, "1 day")) %>%
+  group_by(Site, Date) %>%
+  summarize(
+    minDO.obs = min(DO.obs, na.rm = TRUE),
+    maxDO.obs = max(DO.obs, na.rm = TRUE),
+    minDO.pctsat = min(DO.pctsat, na.rm = TRUE),
+    maxDO.pctsat = max(DO.pctsat, na.rm = TRUE),
+    avgDO.obs = mean(DO.obs, na.rm = TRUE),
+    avgDO.pctsat = mean(DO.pctsat, na.rm = TRUE),
+    sdDO.obs = sd(DO.obs, na.rm = TRUE),
+    sdDO.pctsat = sd(DO.pctsat, na.rm = TRUE),
+    DOSat.hyp = sum(DO.pctsat <= 50, na.rm = TRUE),
+    DO.hyp = sum(DO.obs <= 2, na.rm = TRUE),
+    totalDO = n()
+  ) %>% 
+  mutate(across(where(is.numeric), ~ ifelse(is.finite(.), ., NA))) %>% 
+  mutate(across(where(is.numeric), ~ ifelse(if_any(everything(), is.na), NA, .))) %>% 
+  mutate(across(minDO.obs:avgDO.pctsat, ~ ifelse(. == 0, NA, .))) %>% 
+  mutate(DO.amp = maxDO.obs - minDO.obs,
+         DOpctsat.amp = maxDO.pctsat - minDO.pctsat,
+         probHyp = DO.hyp / totalDO,
+         probHypSat = DOSat.hyp / totalDO,
+         WaterYear = calcWaterYear(Date),
+         season = sapply(Date, calcSeason),
+         Year = year(Date),
+         cvDO.obs = (sdDO.obs / avgDO.obs) * 100,
+         cvDO.pctsat = (sdDO.pctsat / avgDO.pctsat) * 100) %>% 
+  select(-sdDO.obs, -sdDO.pctsat) 
+
+#nighttime hypoxia ratio
+nightHypRat <- gpDat %>% 
+  mutate(across(c("DO.obs", "DO.pctsat", "DO.sat"), ~ ifelse(. == 0, NA, .))) %>% 
+  select(Site, dateTime, solar.time, DO.obs, DO.pctsat, DO.sat, isDaytime) %>% 
+  mutate(Date = floor_date(solar.time, "1 day")) %>%
+  group_by(Date, Site, isDaytime) %>% 
+  summarise(DO.hyp.obs = sum(DO.obs <= 2, na.rm = TRUE),
+            DO.hyp.sat = sum(DO.pctsat <= 50, na.rm = TRUE), .groups = 'drop') %>% 
+  pivot_wider(names_from = isDaytime, 
+              values_from = c(DO.hyp.obs, DO.hyp.sat), 
+              names_prefix = "DO_hyp_", 
+              names_sep = "_") %>% 
+  rename(DayHyp_obs = DO.hyp.obs_DO_hyp_TRUE, 
+         NightHyp_obs = DO.hyp.obs_DO_hyp_FALSE,
+         DayHyp_sat = DO.hyp.sat_DO_hyp_TRUE, 
+         NightHyp_sat = DO.hyp.sat_DO_hyp_FALSE) %>% 
+  mutate(NHR_obs = NightHyp_obs / DayHyp_obs,
+         NHR_sat = NightHyp_sat / DayHyp_sat,
+         WaterYear = calcWaterYear(Date),
+         Year = year(Date)) %>% 
+  mutate(across(where(is.numeric), ~ ifelse(is.finite(.), ., NA))) %>% 
+  select(Date, Site, NHR_obs, NHR_sat)
+
+
+# Calculate probabilities for daytime
+dayHypProb <- gpDat %>% 
+  mutate(across(c("DO.obs", "DO.pctsat", "DO.sat"), ~ ifelse(. == 0, NA, .))) %>% 
+  select(Site, dateTime, solar.time, DO.obs, DO.pctsat, DO.sat, isDaytime) %>% 
+  mutate(Date = floor_date(solar.time, "1 day")) %>%
+  filter(isDaytime) %>%
+  group_by(Site, Date) %>%
+  summarise(
+    dayProbConc = mean(DO.obs < 2, na.rm = TRUE),
+    dayProbSat = mean(DO.pctsat < 50, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Calculate probabilities for nighttime
+nightHypProb <- gpDat %>%
+  mutate(across(c("DO.obs", "DO.pctsat", "DO.sat"), ~ ifelse(. == 0, NA, .))) %>% 
+  select(Site, dateTime, solar.time, DO.obs, DO.pctsat, DO.sat, isDaytime) %>% 
+  mutate(Date = floor_date(solar.time, "1 day")) %>%
+  filter(!isDaytime) %>%
+  group_by(Site, Date) %>%
+  summarise(
+    nightProbConc = mean(DO.obs < 2, na.rm = TRUE),
+    nightProbSat = mean(DO.pctsat < 50, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Join the daytime and nighttime probabilities
+nightHypRat <- dayHypProb %>%
+  inner_join(nightHypProb, by = c("Site", "Date")) %>% 
+  mutate(NHR_obs = nightProbConc/dayProbConc,
+         NHR_sat = nightProbSat/dayProbSat) %>% 
+  mutate(across(where(is.numeric), ~ ifelse(is.finite(.), ., NA))) %>% 
+  mutate(WaterYear = calcWaterYear(Date),
+         Year = year(Date))
+
+
+
+
+#Merge DO Metrics
+doMet <- dailyDO %>% 
+  full_join(nightHypRat) %>% 
+  arrange(Site, Date, WaterYear)
+```
+
+## DO Duration
+
+```{r}
+# Calculate the exceedance values
+doDur <- dailyDO %>%
+  filter(!Site == "SHN") %>% 
+  select(Site, WaterYear, avgDO.pctsat) %>% 
+  group_by(Site, WaterYear) %>%
+  filter(!is.na(avgDO.pctsat)) %>%
+  mutate(exceedance = 100 * (rank(-avgDO.pctsat) / (length(avgDO.pctsat) + 1)))
+
+# Calculate undersaturation
+underSat <- doDur %>%
+  group_by(Site, WaterYear) %>%
+  summarise(
+    modalUndersat = 100 - as.numeric(names(sort(table(avgDO.pctsat), decreasing = TRUE))[1]),
+    meanUndersat = mean(avgDO.pctsat)
+  )
+
+doDur <- doDur %>%
+  left_join(underSat)
+
+doDur %>% 
+  ggplot(aes(x = exceedance, y = avgDO.pctsat, color = factor(WaterYear))) +
+  geom_line(linewidth = 1.5) +
+  geom_hline(yintercept = 50, linetype = "dashed", alpha = 0.5)+
+  #scale_y_log10() +
+  scale_color_manual(values = c("2021" = "#1B9E77", "2022" = "#D95F02", "2023" = "#7570B3", "2024" = "#E7298A")) +
+  labs(title = "",
+       color = "Year",
+       x = "Exceedance Probability (%)",
+       y = expression(Daily ~ DO["%Sat"])) +
+  theme_few()+
+  theme(legend.position = "bottom", legend.title = element_blank(),
+        text = element_text(size = 25),       # Increase overall text size
+    axis.title = element_text(size = 25), # Increase axis titles size
+    axis.text = element_text(size = 25),  # Increase axis text size
+    strip.text = element_text(size = 25),  # Increase facet labels size
+    legend.text = element_text(size = 25)
+    )+
+  facet_wrap(~ Site) -> doExce
+doExce
+ggsave("doExce.png", doExce, here("Figs/"), device = "png", width = 11, height = 6, units = "in", dpi = "retina")
+
+doDur %>% 
+  ggplot(aes(x = exceedance, y = avgDO.pctsat, color = factor(WaterYear))) +
+  geom_line() +
+  geom_hline(data = doDur, aes(yintercept = modalUndersat, color = factor(WaterYear), linetype = "Modal")) +
+  geom_hline(data = doDur, aes(yintercept = meanUndersat, color = factor(WaterYear), linetype = "Mean")) +
+  scale_color_manual(values = c("2021" = "#1B9E77", "2022" = "#D95F02", "2023" = "#7570B3", "2024" = "#E7298A")) +
+  scale_linetype_manual(name = "Undersaturation", values = c("Modal" = "dashed", "Mean" = "dotted")) +
+  labs(title = "",
+       color = "Year",
+       x = "Exceedance Probability (%)",
+       y = expression(Daily ~ DO["%Sat"])) +
+  theme_few() +
+  facet_wrap(~ Site)
+
+doDur %>% 
+  filter(!Site == "SHN") %>% 
+  ggplot(aes(x = exceedance, y = avgDO.pctsat, color = Site)) +
+  geom_line() +
+  geom_hline(yintercept = 50, linetype = "dashed", alpha = 0.5)+
+  scale_color_manual(values = c("KMZ" = "#1B9E77", "YMR" = "#D95F02", "SHN" = "#7570B3")) +
+  labs(title = "",
+       color = "Site",
+       x = "Exceedance Probability (%)",
+       y = expression(Daily ~ DO["%Sat"])) +
+  theme_few() +
+  facet_wrap(~ WaterYear)-> doExceWY
+doExceWY
+ggsave("doExceWY.png", doExceWY, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+
+doDurAllTime <- dailyDO %>%
+  select(Site, WaterYear, avgDO.pctsat) %>% 
+  group_by(Site) %>%
+  filter(!is.na(avgDO.pctsat)) %>%
+  mutate(exceedance = 100 * (rank(-avgDO.pctsat) / (length(avgDO.pctsat) + 1)))
+
+doDurAllTime %>% 
+  ggplot(aes(x = exceedance, y = avgDO.pctsat, color = Site)) +
+  geom_line() +
+  geom_hline(yintercept = 50, linetype = "dashed", alpha = 0.5)+
+  scale_color_manual(values = c("KMZ" = "#1B9E77", "YMR" = "#D95F02", "SHN" = "#7570B3")) +
+  labs(title = "",
+       color = "Site",
+       x = "Exceedance Probability (%)",
+       y = expression(Daily ~ DO["%Sat"])) +
+  theme_few() -> doExceAll
+doExceAll
+ggsave("doExceAll.png", doExceAll, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+
+```
+
+## DO Metric Figures
+
+```{r}
+gpDat %>%
+  ggplot(aes(x = DO.pctsat, fill = isDaytime, after_stat(scaled))) +
+  geom_density(alpha = 0.7) +
+  scale_fill_manual(breaks = c("TRUE", "FALSE"),
+                    labels = c("Daytime", "Nighttime"),
+                    values = c("#FFA726", "#0D47A1")) +
+  geom_vline(xintercept = 50, linetype = "dashed") +
+  labs(x = expression(DO[sat]~"(%)" ), y = "Density") +
+  theme_few() +
+  theme(legend.title = element_blank(), legend.position = "bottom") +
+  facet_grid(WaterYear~Site)
+
+dailyDO %>%
+  ggplot(aes(x = avgDO.obs, fill = Site, after_stat(scaled))) +
+  geom_density(alpha = 0.5) +
+  scale_fill_brewer(palette = "Dark2") +
+  geom_vline(xintercept = 2, linetype = "dashed") +
+  labs(x = "DO (mg/L)", y = "Density") +
+  theme_few() +
+  theme(legend.title = element_blank(), legend.position = "bottom")+
+  facet_wrap(~WaterYear, ncol = 1, scale = "free_y") -> concDen
+concDen
+ggsave("concDen.png", concDen, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+
+dailyDO %>%
+  filter(!Site == "SHN") %>% 
+  ggplot(aes(x = avgDO.pctsat, fill = Site, after_stat(scaled))) +
+  geom_density(alpha = 0.8) +
+  scale_fill_manual(values = c("KMZ" = "#127088", "YMR" = "#DE3C37"))+
+  geom_vline(xintercept = 50, linetype = "dashed") +
+  labs(x = expression(DO["%sat"]), y = "Density") +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 3)) +
+  theme_few() +
+  theme(legend.position = "bottom", legend.title = element_blank(),
+        text = element_text(size = 25),       # Increase overall text size
+    axis.title = element_text(size = 25), # Increase axis titles size
+    axis.text = element_text(size = 25),  # Increase axis text size
+    strip.text = element_text(size = 25),  # Increase facet labels size
+    legend.text = element_text(size = 25)
+    )+
+  facet_wrap(~WaterYear, ncol = 1, scale = "free_y") -> satDen
+satDen
+ggsave("satDen.png", satDen, here("Figs/"), device = "png", width = 11, height = 6, units = "in", dpi = "retina")
+
+dailyDO %>%
+  mutate(WaterYear = as.factor(WaterYear)) %>%
+  ggplot(aes(x = WaterYear, y = avgDO.pctsat, color = Site)) +  # Add color = Site
+  geom_boxplot(outlier.color = NA) +
+  geom_jitter(position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75), alpha = 0.5) +
+  scale_fill_brewer(palette = "Dark2") +
+  scale_color_brewer(palette = "Dark2") +  # Add this line
+  geom_hline(yintercept = 50, linetype = "dashed") +
+  labs(x = "Water Year", y = expression(Daily ~ DO["%Sat"])) +
+  theme_few() +
+  theme(legend.title = element_blank(), legend.position = "bottom") -> satBox
+satBox
+ggsave("satBox.png", satBox, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+
+
+dailyDO %>%
+  filter(!Site == "SHN") %>% 
+  ggplot(aes(x = DOpctsat.amp, fill = Site, after_stat(scaled))) +
+  geom_density(alpha = 0.5) +
+  scale_fill_brewer(palette = "Dark2") +
+  #geom_vline(xintercept = 50, linetype = "dashed") +
+  labs(x = expression(Daily ~ DO["%Sat"] ~ "Amplitude"),
+       y = "Density")+
+  theme_few() +
+  theme(legend.title = element_blank(), legend.position = "bottom")+
+  facet_wrap(~WaterYear, ncol = 1, scale = "free_y") -> satAmpDen
+satAmpDen
+ggsave("satAmpDen.png", satAmpDen, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+
+dailyDO %>%
+  filter(!Site == "SHN") %>% 
+  ggplot(aes(x = probHypSat, fill = Site, after_stat(scaled))) +
+  geom_density(alpha = 0.5) +
+  #xlim(-1.5, 1.5)+
+  scale_fill_brewer(palette = "Dark2") +
+  labs(x = expression(DO["%Sat"] ~ "Probability of Hypoxia"), y = "Density") +
+  theme_few() +
+  theme(legend.position = "bottom", legend.title = element_blank(),
+        text = element_text(size = 25),       # Increase overall text size
+        axis.title = element_text(size = 25), # Increase axis titles size
+        axis.text = element_text(size = 25),  # Increase axis text size
+        strip.text = element_text(size = 25)  # Increase facet labels size
+    )+
+  facet_wrap(~WaterYear, ncol = 1, scale = "free_y") -> probDen
+probDen
+ggsave("probDen.png", probDen, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+
+doMet %>%
+  ggplot(aes(Date, probHypSat, color = Site)) +
+  geom_point(shape = 4, alpha = 0.8) +
+  theme_few() +
+  labs(y = expression(DO["%Sat"] ~ "Probability of Hypoxia"))+
+  scale_x_datetime(labels = date_format("%b"), breaks = "1 months") +
+  scale_color_brewer(palette = "Dark2")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.title.x = element_blank()) +
+  facet_wrap(~WaterYear, ncol = 1, scales = "free") -> probHyp
+probHyp
+ggsave("probHyp.png", probHyp, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+
+
+doMet %>%
+  ggplot(aes(Date, DOpctsat.amp, color = Site)) +
+  geom_point(shape = 4, alpha = 0.8) +
+  theme_few() +
+  labs(y = expression(Daily ~ DO["%Sat"] ~ "Amplitude"))+
+  scale_x_datetime(labels = date_format("%b"), breaks = "1 months") +
+  scale_color_brewer(palette = "Dark2")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.title.x = element_blank()) +
+  facet_wrap(~WaterYear, ncol = 1, scales = "free") -> satAmpSiteYr
+satAmpSiteYr
+ggsave("satAmpSiteYr.png", satAmpSiteYr, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+
+doMet %>%
+  ggplot(aes(Date, NHR_obs, color = Site)) +
+  geom_point(shape = 4, alpha = 0.8) +
+  theme_few() +
+  labs(y = expression(DO["mg/L"] ~ "Night Hypoxia Ratio"))+
+  scale_x_datetime(labels = date_format("%b"), breaks = "1 months") +
+  scale_color_brewer(palette = "Dark2")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.title.x = element_blank()) +
+  facet_wrap(~WaterYear, ncol = 1, scales = "free") -> nhrConc
+nhrConc
+ggsave("nhrConc.png", nhrConc, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+
+
+doMet %>%
+  ggplot(aes(Date, NHR_sat, color = Site)) +
+  geom_point(shape = 4, alpha = 0.8) +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b"), breaks = "1 months") +
+  scale_color_brewer(palette = "Dark2")+
+  labs(y = expression(DO["%Sat"] ~ "Night Hypoxia Ratio"))+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.title.x = element_blank()) +
+  facet_wrap(~WaterYear, ncol = 1, scales = "free") -> nhrSat
+nhrSat
+ggsave("nhrSat.png", nhrSat, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+
+doMet %>%
+  ggplot(aes(x = cvDO.pctsat, fill = Site, after_stat(scaled))) +
+  geom_density(alpha = 0.5) +
+  #xlim(-1.5, 1.5)+
+  scale_fill_brewer(palette = "Dark2") +
+  labs(x = expression(DO["%Sat"] ~ "Probability of Hypoxia"), y = "Density") +
+  theme_few() +
+  theme(legend.title = element_blank(), legend.position = "bottom")+
+  facet_wrap(~WaterYear, ncol = 1, scale = "free_y") -> cvSat
+cvSat
+```
+
+## Daily DO Sat Stats
+
+```{r}
+doPctSat <- dailyDO %>% 
+  filter(!Site == "SHN") %>% 
+  dplyr::select(Site, Date, WaterYear, avgDO.pctsat) %>% 
+  drop_na() %>% 
+  mutate(Site = as.factor(Site),
+         WaterYear = as.factor(WaterYear),
+         logDO.pctsat = log1p(avgDO.pctsat))
+
+# Perform two-way ANOVA
+doSatAnova <- aov(avgDO.pctsat ~ Site * WaterYear, data = doPctSat)
+summary(doSatAnova)
+
+doSatAnova_repeated <- nlme::lme(avgDO.pctsat ~ Site * WaterYear, random = ~1|Site/WaterYear, data = doPctSat)
+summary(doSatAnova_repeated)
+
+#Check assumptions
+# Normality of Residuals
+plot(doSatAnova, 2) # Q-Q plot
+shapiro.test(residuals(doSatAnova))
+
+# Homogeneity of Variances
+plot(doSatAnova, 1) # Residuals vs Fitted plot
+
+# Tukey's HSD post-hoc test
+tukey_results <- TukeyHSD(doSatAnova)
+
+# Extracting the Tukey HSD results for the main effect or interaction of interest
+tukey_sites <- tukey_results$`Site:WaterYear`
+
+# Generate compact letter displays (CLDs)
+cld <- multcompView::multcompLetters4(doSatAnova, tukey_results)
+
+# Extract the CLDs for plotting
+cld_df <- data.frame(SiteWaterYear = names(cld$`Site:WaterYear`$Letters), 
+                     Letters = cld$`Site:WaterYear`$Letters)
+
+# Merging the CLDs with the original data for plotting
+plot_data <- doPctSat %>%
+  unite("SiteWaterYear", Site, WaterYear, remove = FALSE, sep = ":")
+
+plot_data <- merge(plot_data, cld_df, by = "SiteWaterYear")
+
+# Creating the boxplot with CLDs
+plot_data %>%
+  ggplot(aes(x = Site, y = avgDO.pctsat, color = WaterYear)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75), alpha = 0.5) +  
+  scale_color_brewer(palette = "Dark2") +
+  geom_hline(yintercept = 50, linetype = "dashed") +
+  geom_text(aes(label = Letters, y = max(avgDO.pctsat) + 2.5), 
+            position = position_dodge(width = 0.75), 
+            vjust = 0.2, 
+            size = 5) +
+  labs(x = "Water Year", y = expression(Daily ~ DO["%Sat"])) +
+  theme_few() +
+  theme(legend.title = element_blank(), legend.position = "bottom") -> satBoxAnova
+satBoxAnova
+ggsave("satBoxAnova.png", satBoxAnova, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+
+
+# Perform mixed-effects model
+library(lme4)
+doSatMixedModel <- lmer(logDO.pctsat ~ Site * WaterYear + (1|Site),
+                              data = doPctSat,
+                              control = lmerControl(optimizer = "bobyqa",
+                                                    optCtrl = list(maxfun = 100000)))
+summary(doSatMixedModel)
+t <- performance::check_model(doSatMixedModel)
+plot(t)
+```
+
+```{r}
+gpQ <- gpDat %>% 
+  select(Site, dateTime, Q_Ls, SW_Level_ft, SW_Level_cm) %>% 
+  mutate(Date = as_date(dateTime)) %>% 
+  group_by(Site, Date) %>% 
+  summarise(
+    Q_Ls = mean(Q_Ls, na.rm = TRUE),
+    SW_Level_ft = mean(SW_Level_ft, na.rm = TRUE),
+    SW_Level_cm = mean(SW_Level_cm, na.rm = TRUE)
+  )
+
+doMet <- doMet %>% 
+  full_join(gpQ, by = c("Site", "Date")) %>% 
+  mutate(Date = as.Date(Date))
+```
+
+```{r}
+# Convert Date to Date format if not already
+doMet$Date <- as.Date(doMet$Date)
+
+# Split the data by Site and WaterYear
+split_data <- split(doMet, list(doMet$Site, doMet$WaterYear))
+
+# Restore the default plotting area
+par(mfrow = c(1, 1))
+# Loop over each subset of the data
+for (i in 1:length(split_data)) {
+    data <- split_data[[i]]
+    
+    # Check if data is not empty
+    if (nrow(data) > 0) {
+        # Create a filename for the plot
+        filename <- paste0(here("Figs/"), "DO_Amp_", names(split_data)[i], ".png")
+        
+        # Open a PNG device
+        png(filename, width = 960, height = 540)
+        
+        # Set up the plotting area
+        par(mfrow = c(1, 1), mar = c(6, 4, 2, 4), xpd = TRUE)
+        
+        # Plot the first y-axis (DOpctsat.amp)
+        plot(data$Date, data$DOpctsat.amp, type = "b", col = "#1B9E77", pch = 16,
+             ylab = "", xlab = "", main = paste(names(split_data)[i]),
+             ylim = range(data$DOpctsat.amp, na.rm = TRUE), xaxt = "n")
+        axis(side = 2)
+        mtext("Daily DO%Sat Amplitude", side = 2, line = 2, col = 1)
+        
+        # Add the x-axis with monthly breaks
+        axis.Date(1, at = seq(min(data$Date), max(data$Date), by = "month"), format = "%b")
+        
+        # Add the second y-axis (SW_Level_cm)
+        par(new = TRUE)
+        plot(data$Date, data$SW_Level_cm, type = "b", col = "black", axes = FALSE, xlab = "", ylab = "",
+             ylim = range(data$SW_Level_cm, na.rm = TRUE))
+        axis(side = 4)
+        mtext("SW Level (cm)", side = 4, line = 2, col = 1)
+        
+        # Add a legend
+        legend("bottom", legend = c("DO % Saturation", "SW Level (cm)"), col = c("#1B9E77", "black"), pch = c(16, NA), lty = c(NA, 1), inset = c(0, -0.15), horiz = TRUE, bty = "n")
+        
+        # Close the PNG device
+        dev.off()
+    }
+}
+
+#"#1B9E77" "#D95F02" "#7570B3" "#E7298A" "#66A61E" "#E6AB02" "#A6761D" "#666666"
+# Restore the default plotting area
+par(mfrow = c(1, 1))
+# Loop over each subset of the data
+for (i in 1:length(split_data)) {
+    data <- split_data[[i]]
+    
+    # Check if data is not empty
+    if (nrow(data) > 0) {
+        # Create a filename for the plot
+        filename <- paste0(here("Figs/"), "ProbHyp_", names(split_data)[i], ".png")
+        
+        # Open a PNG device
+        png(filename, width = 960, height = 540)
+        
+        # Set up the plotting area
+        par(mfrow = c(1, 1), mar = c(6, 4, 2, 4), xpd = TRUE)
+        
+        # Plot the first y-axis (DOpctsat.amp)
+        plot(data$Date, data$probHypSat, type = "b", col = "#D95F02", pch = 16,
+             ylab = "", xlab = "", main = paste(names(split_data)[i]),
+             ylim = range(data$probHypSat, na.rm = TRUE), xaxt = "n")
+        axis(side = 2)
+        mtext("Probability of Hypoxia", side = 2, line = 2, col = 1)
+        
+        # Add the x-axis with monthly breaks
+        axis.Date(1, at = seq(min(data$Date), max(data$Date), by = "month"), format = "%b")
+        
+        # Add the second y-axis (SW_Level_cm)
+        par(new = TRUE)
+        plot(data$Date, data$SW_Level_cm, type = "b", col = "black", axes = FALSE, xlab = "", ylab = "",
+             ylim = range(data$SW_Level_cm, na.rm = TRUE))
+        axis(side = 4)
+        mtext("SW Level (cm)", side = 4, line = 2, col = 1)
+        
+        # Add a legend
+        legend("bottom", legend = c("Probability of Hypoxia", "SW Level (cm)"), col = c("#D95F02", "black"), pch = c(16, NA), lty = c(NA, 1), inset = c(0, -0.15), horiz = TRUE, bty = "n")
+        
+        # Close the PNG device
+        dev.off()
+    }
+}
+
+# Restore the default plotting area
+par(mfrow = c(1, 1))
+# Loop over each subset of the data
+for (i in 1:length(split_data)) {
+    data <- split_data[[i]]
+     # Filter out rows with non-finite values in NHR_sat or SW_Level_cm
+    #data <- data[is.finite(data$avgDO.pctsat) , ]
+    # Check if data is not empty
+    if (nrow(data) > 0) {
+        # Create a filename for the plot
+        filename <- paste0(here("Figs/"), "DOSat_", names(split_data)[i], ".png")
+        
+        # Open a PNG device
+        png(filename, width = 960, height = 540)
+        
+        # Set up the plotting area
+        par(mfrow = c(1, 1), mar = c(6, 4, 2, 4), xpd = TRUE)
+        
+        # Plot the first y-axis (DOpctsat.amp)
+        plot(data$Date, data$avgDO.pctsat, type = "b", col = "#66A61E", pch = 16,
+             ylab = "", xlab = "", main = paste(names(split_data)[i]),
+             ylim = range(data$avgDO.pctsat, na.rm = TRUE), xaxt = "n")
+        axis(side = 2)
+        mtext("DO % Saturation", side = 2, line = 2, col = 1)
+        
+        # Add the x-axis with monthly breaks
+        axis.Date(1, at = seq(min(data$Date), max(data$Date), by = "month"), format = "%b")
+        
+        # Add the second y-axis (SW_Level_cm)
+        par(new = TRUE)
+        plot(data$Date, data$SW_Level_cm, type = "b", col = "black", axes = FALSE, xlab = "", ylab = "",
+             ylim = range(data$SW_Level_cm, na.rm = TRUE))
+        axis(side = 4)
+        mtext("SW Level (cm)", side = 4, line = 2, col = 1)
+        
+        # Add a legend
+        legend("bottom", legend = c("DO % Saturation", "SW Level (cm)"), col = c("#66A61E", "black"), pch = c(16, NA), lty = c(NA, 1), inset = c(0, -0.15), horiz = TRUE, bty = "n")
+        
+        # Close the PNG device
+        dev.off()
+    }
+}
+
+# Restore the default plotting area
+par(mfrow = c(1, 1))
+# Loop over each subset of the data
+for (i in 1:length(split_data)) {
+    data <- split_data[[i]]
+    
+    # Check if data is not empty
+    if (nrow(data) > 0) {
+        # Create a filename for the plot
+        filename <- paste0(here("Figs/"), "cvDO_", names(split_data)[i], ".png")
+        
+        # Open a PNG device
+        png(filename, width = 960, height = 540)
+        
+        # Set up the plotting area
+        par(mfrow = c(1, 1), mar = c(6, 4, 2, 4), xpd = TRUE)
+        
+        # Plot the first y-axis (DOpctsat.amp)
+        plot(data$Date, data$cvDO.pctsat, type = "b", col = "#7570B3", pch = 16,
+             ylab = "", xlab = "", main = paste(names(split_data)[i]),
+             ylim = range(data$cvDO.pctsat, na.rm = TRUE), xaxt = "n")
+        axis(side = 2)
+        mtext("DO % Saturation Variability", side = 2, line = 2, col = 1)
+        
+        # Add the x-axis with monthly breaks
+        axis.Date(1, at = seq(min(data$Date), max(data$Date), by = "month"), format = "%b")
+        
+        # Add the second y-axis (SW_Level_cm)
+        par(new = TRUE)
+        plot(data$Date, data$SW_Level_cm, type = "b", col = "black", axes = FALSE, xlab = "", ylab = "",
+             ylim = range(data$SW_Level_cm, na.rm = TRUE))
+        axis(side = 4)
+        mtext("SW Level (cm)", side = 4, line = 2, col = 1)
+        
+        # Add a legend
+        legend("bottom", legend = c("DO % Saturation Variability", "SW Level (cm)"), col = c("#7570B3", "black"), pch = c(16, NA), lty = c(NA, 1), inset = c(0, -0.15), horiz = TRUE, bty = "n")
+        
+        # Close the PNG device
+        dev.off()
+    }
+}
+
+
+```
+
+## DO and SW Level
+
+```{r}
+# Convert Date to Date format if not already
+doMet$Date <- as.Date(doMet$Date)
+
+# Split the data by Site and WaterYear
+split_data <- split(doMet, list(doMet$Site, doMet$WaterYear))
+
+# Restore the default plotting area
+par(mfrow = c(1, 1))
+# Loop over each subset of the data
+for (i in 1:length(split_data)) {
+    data <- split_data[[i]]
+    
+    # Check if data is not empty
+    if (nrow(data) > 0) {
+        # Create a filename for the plot
+        filename <- paste0(here("Figs/"), "DO_Amp_Q_", names(split_data)[i], ".png")
+        
+        # Open a PNG device
+        png(filename, width = 960, height = 540)
+        
+        # Set up the plotting area
+        par(mfrow = c(1, 1), mar = c(6, 4, 2, 4), xpd = TRUE)
+        
+        # Plot the first y-axis (DOpctsat.amp)
+        plot(data$Date, data$DOpctsat.amp, type = "b", col = "#1B9E77", pch = 16,
+             ylab = "", xlab = "", main = paste(names(split_data)[i]),
+             ylim = range(data$DOpctsat.amp, na.rm = TRUE), xaxt = "n")
+        axis(side = 2)
+        mtext("Daily DO%Sat Amplitude", side = 2, line = 2, col = 1)
+        
+        # Add the x-axis with monthly breaks
+        axis.Date(1, at = seq(min(data$Date), max(data$Date), by = "month"), format = "%b")
+        
+        # Add the second y-axis (SW_Level_cm)
+        par(new = TRUE)
+       plot(data$Date[data$Q_Ls>=0], data$Q_Ls[data$Q_Ls>=0], type = "l", col = "black", axes = FALSE, xlab = "", ylab = "",
+             ylim = c(0, max(data$Q_Ls[data$Q_Ls>=0], na.rm = TRUE)))
+        axis(side = 4)
+        mtext("Discharge (L/s)", side = 4, line = 2, col = 1)
+        
+        # Add a legend
+        legend("bottom", legend = c("DO % Saturation", "Discharge (L/s)"), col = c("#1B9E77", "black"), pch = c(16, NA), lty = c(NA, 1), inset = c(0, -0.15), horiz = TRUE, bty = "n")
+        
+        # Close the PNG device
+        dev.off()
+    }
+}
+
+# Restore the default plotting area
+par(mfrow = c(1, 1))
+# Loop over each subset of the data
+for (i in 1:length(split_data)) {
+    data <- split_data[[i]]
+    
+    # Check if data is not empty
+    if (nrow(data) > 0) {
+        # Create a filename for the plot
+        filename <- paste0(here("Figs/"), "ProbHyp_Q_", names(split_data)[i], ".png")
+        
+        # Open a PNG device
+        png(filename, width = 960, height = 540)
+        
+        # Set up the plotting area
+        par(mfrow = c(1, 1), mar = c(6, 4, 2, 4), xpd = TRUE)
+        
+        # Plot the first y-axis (DOpctsat.amp)
+        plot(data$Date, data$probHypSat, type = "b", col = "#D95F02", pch = 16,
+             ylab = "", xlab = "", main = paste(names(split_data)[i]),
+             ylim = range(data$probHypSat, na.rm = TRUE), xaxt = "n")
+        axis(side = 2)
+        mtext("Probability of Hypoxia", side = 2, line = 2, col = 1)
+        
+        # Add the x-axis with monthly breaks
+        axis.Date(1, at = seq(min(data$Date), max(data$Date), by = "month"), format = "%b")
+        
+        # Add the second y-axis (SW_Level_cm)
+        par(new = TRUE)
+        plot(data$Date[data$Q_Ls>=0], data$Q_Ls[data$Q_Ls>=0], type = "l", col = "black", axes = FALSE, xlab = "", ylab = "",
+             ylim = c(0, max(data$Q_Ls[data$Q_Ls>=0], na.rm = TRUE)))
+        axis(side = 4)
+        mtext("Discharge (L/s)", side = 4, line = 2, col = 1)
+        
+        # Add a legend
+        legend("bottom", legend = c("Probability of Hypoxia", "Discharge (L/s)"), col = c("#D95F02", "black"), pch = c(16, NA), lty = c(NA, 1), inset = c(0, -0.15), horiz = TRUE, bty = "n")
+        
+        # Close the PNG device
+        dev.off()
+    }
+}
+
+# Restore the default plotting area
+par(mfrow = c(1, 1))
+# Loop over each subset of the data
+for (i in 1:length(split_data)) {
+    data <- split_data[[i]]
+     # Filter out rows with non-finite values in NHR_sat or SW_Level_cm
+    #data <- data[is.finite(data$avgDO.pctsat) , ]
+    # Check if data is not empty
+    if (nrow(data) > 0) {
+        # Create a filename for the plot
+        filename <- paste0(here("Figs/"), "DOSat_Q_", names(split_data)[i], ".png")
+        
+        # Open a PNG device
+        png(filename, width = 960, height = 540)
+        
+        # Set up the plotting area
+        par(mfrow = c(1, 1), mar = c(6, 4, 2, 4), xpd = TRUE)
+        
+        # Plot the first y-axis (DOpctsat.amp)
+        plot(data$Date, data$avgDO.pctsat, type = "b", col = "#66A61E", pch = 16,
+             ylab = "", xlab = "", main = paste(names(split_data)[i]),
+             ylim = range(data$avgDO.pctsat, na.rm = TRUE), xaxt = "n")
+        axis(side = 2)
+        mtext("DO % Saturation", side = 2, line = 2, col = 1)
+        
+        # Add the x-axis with monthly breaks
+        axis.Date(1, at = seq(min(data$Date), max(data$Date), by = "month"), format = "%b")
+        
+        # Add the second y-axis (SW_Level_cm)
+        par(new = TRUE)
+         plot(data$Date[data$Q_Ls>=0], data$Q_Ls[data$Q_Ls>=0], type = "l", col = "black", axes = FALSE, xlab = "", ylab = "",
+             ylim = c(0, max(data$Q_Ls[data$Q_Ls>=0], na.rm = TRUE)))
+        axis(side = 4)
+        mtext("Discharge (L/s)", side = 4, line = 2, col = 1)
+        
+        # Add a legend
+        legend("bottom", legend = c("DO % Saturation", "Discharge (L/s)"), col = c("#66A61E", "black"), pch = c(16, NA), lty = c(NA, 1), inset = c(0, -0.15), horiz = TRUE, bty = "n")
+        
+        # Close the PNG device
+        dev.off()
+    }
+}
+
+# Restore the default plotting area
+par(mfrow = c(1, 1))
+# Loop over each subset of the data
+for (i in 1:length(split_data)) {
+    data <- split_data[[i]]
+    
+    # Check if data is not empty
+    if (nrow(data) > 0) {
+        # Create a filename for the plot
+        filename <- paste0(here("Figs/"), "cvDO_Q_", names(split_data)[i], ".png")
+        
+        # Open a PNG device
+        png(filename, width = 960, height = 540)
+        
+        # Set up the plotting area
+        par(mfrow = c(1, 1), mar = c(6, 4, 2, 4), xpd = TRUE)
+        
+        # Plot the first y-axis (DOpctsat.amp)
+        plot(data$Date, data$cvDO.pctsat, type = "b", col = "#7570B3", pch = 16,
+             ylab = "", xlab = "", main = paste(names(split_data)[i]),
+             ylim = range(data$cvDO.pctsat, na.rm = TRUE), xaxt = "n")
+        axis(side = 2)
+        mtext("DO % Saturation Variability", side = 2, line = 2, col = 1)
+        
+        # Add the x-axis with monthly breaks
+        axis.Date(1, at = seq(min(data$Date), max(data$Date), by = "month"), format = "%b")
+        
+        # Add the second y-axis (SW_Level_cm)
+        par(new = TRUE)
+        plot(data$Date[data$Q_Ls>=0], data$Q_Ls[data$Q_Ls>=0], type = "l", col = "black", axes = FALSE, xlab = "", ylab = "",
+             ylim = c(0, max(data$Q_Ls[data$Q_Ls>=0], na.rm = TRUE)))
+        axis(side = 4)
+        mtext("Discharge (L/s)", side = 4, line = 2, col = 1)
+        
+        # Add a legend
+        legend("bottom", legend = c("DO % Saturation Variability", "Discharge (L/s)"), col = c("#7570B3", "black"), pch = c(16, NA), lty = c(NA, 1), inset = c(0, -0.15), horiz = TRUE, bty = "n")
+        
+        # Close the PNG device
+        dev.off()
+    }
+}
+```
+
+```{r}
+doMet <- doMet %>%
+  mutate(Year = factor(Year),
+         season = factor(season, levels = c("Spring", "Summer", "Fall", "Winter"), ordered = T))
+
+doMet %>%
+  #filter(season %in% c("Spring", "Summer")) %>% 
+  #filter(!Site == "SHN") %>% 
+  ggplot(aes(Year, DOpctsat.amp, color = Year)) +
+  geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.75)) +
+  geom_jitter(position = position_jitterdodge(), alpha = 0.6) +
+  theme_few() +
+  labs(y = expression(Daily ~ DO["%Sat"] ~ "Amplitude"))+
+  scale_color_brewer(palette = "Dark2")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.title.x = element_blank()) +
+  facet_wrap(~Site, ncol = 1, scales = "free") -> doAmpBox
+doAmpBox
+ggsave("doAmpBox.png", doAmpBox, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+
+
+doMet %>%
+  #filter(season %in% c("Spring", "Summer")) %>% 
+  #filter(!Site == "SHN") %>% 
+  ggplot(aes(Year, probHypSat, color = Year)) +
+  geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.75)) +
+  geom_jitter(position = position_jitterdodge(), alpha = 0.6) +
+  theme_few() +
+  labs(y = expression(DO["%Sat"] ~ "Probability of Hypoxia"))+
+  scale_color_brewer(palette = "Dark2")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.title.x = element_blank()) +
+  facet_wrap(~Site, ncol = 1, scales = "free") -> probHypBox
+probHypBox
+ggsave("probHypBox.png", probHypBox, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+
+doMet %>%
+  filter(season %in% c("Spring", "Summer")) %>% 
+  ggplot(aes(season, avgDO.pctsat, color = season)) +
+  geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.75)) +
+  geom_jitter(position = position_jitterdodge(), alpha = 0.6) +
+  theme_few() +
+  scale_color_brewer(palette = "Dark2")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.title.x = element_blank()) +
+  facet_grid(WaterYear~Site, scales = "free")
+
+doMet %>%
+  filter(season %in% c("Spring", "Summer")) %>% 
+  ggplot(aes(season, DOpctsat.amp, color = season)) +
+  geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.75)) +
+  geom_jitter(position = position_jitterdodge(), alpha = 0.6) +
+  theme_few() +
+  labs(y = expression(Daily ~ DO["%Sat"] ~ "Amplitude"))+ 
+  scale_color_manual(values = c("Spring" = "#275E4D", "Summer" = "#FEB424"))+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.title.x = element_blank(),
+        legend.position = "none", 
+        text = element_text(size = 25),       # Increase overall text size
+        axis.title = element_text(size = 25), # Increase axis titles size
+        axis.text = element_text(size = 25),  # Increase axis text size
+        strip.text = element_text(size = 25),  # Increase facet labels size
+    ) +
+  facet_grid(WaterYear~Site, scales = "fixed") -> ampBox
+ampBox
+ggsave("ampBox.png", ampBox, here("Figs/"), device = "png", width = 11, height = 6, units = "in", dpi = "retina")
+
+
+doMet %>%
+  filter(season %in% c("Spring", "Summer")) %>% 
+  ggplot(aes(season, minDO.pctsat, color = season)) +
+  geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.75)) +
+  geom_jitter(position = position_jitterdodge(), alpha = 0.6) +
+  theme_few() +
+  labs(x = "",
+       y = expression(Daily ~ Minimum ~ DO["%Sat"]))+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title.x = element_blank(),
+        legend.position = "none",
+        text = element_text(size = 25),       # Increase overall text size
+        axis.title = element_text(size = 25), # Increase axis titles size
+        axis.text = element_text(size = 25),  # Increase axis text size
+        strip.text = element_text(size = 25),  # Increase facet labels size
+        )+
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 3))+
+  scale_color_manual(values = c("Spring" = "#275E4D", "Summer" = "#FEB424"))+
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 3))+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.title.x = element_blank()) +
+  facet_grid(WaterYear~Site, scales = "fixed") -> minBox
+minBox
+ggsave("minBox.png", minBox, here("Figs/"), device = "png", width = 11, height = 6, units = "in", dpi = "retina")
+
+doMet %>%
+  filter(season %in% c("Spring", "Summer")) %>% 
+  ggplot(aes(probHypSat, fill = season, after_stat(scaled))) +
+  geom_density(alpha = 0.5) +
+  theme_few() +
+  scale_fill_brewer(palette = "Dark2")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.title.x = element_blank()) +
+  facet_grid(WaterYear~Site, scales = "free")
+
+dailyDO %>%
+  filter(season %in% c("Spring", "Summer")) %>% 
+  ggplot(aes(x = probHypSat, fill = season, after_stat(scaled))) +
+  geom_density(alpha = 0.8) +
+  #xlim(-1.5, 1.5)+"
+  scale_fill_manual(values = c("Spring" = "#275E4D", "Summer" = "#FEB424"))+
+  labs(x = expression(DO["%Sat"] ~ "Probability of Hypoxia"), y = "Density") +
+  theme_few() +
+  scale_x_continuous(labels = scales::number_format(accuracy = 0.1)) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 3))+
+  theme(legend.position = "bottom", legend.title = element_blank(),
+        text = element_text(size = 25),       # Increase overall text size
+        axis.title = element_text(size = 25), # Increase axis titles size
+        axis.text = element_text(size = 25),  # Increase axis text size
+        strip.text = element_text(size = 25),  # Increase facet labels size
+        legend.text = element_text(size = 25)
+    )+
+  facet_grid(WaterYear~Site) -> probHypSeason
+probHypSeason
+ggsave("probHypSeason.png", probHypSeason, here("Figs/"), device = "png",  width = 16, height = 8.5, units = "in", dpi = "retina")
+```
+
+```{r}
+gpDOmet <- doMet %>% 
+  drop_na() %>% 
+  ungroup()
+#PCA
+doPca <- gpDOmet %>%
+  select(minDO.pctsat, maxDO.pctsat, avgDO.pctsat, DOpctsat.amp, probHypSat,  NHR_sat) %>% 
+  #m dayProbSat, nightProbSat,
+  select(where(is.numeric)) %>% # retain only numeric columns
+  prcomp(center = T, scale = T) # do PCA on scaled data
+
+#extract loadings
+doPcaLoad <- doPca %>%
+  tidy(matrix = "loadings")
+doPcaLoad
+#Variance explained
+doPcaEig <- doPca %>%
+  tidy(matrix = "eigenvalues")
+doPcaEig
+#Scree plot
+fviz_eig(doPca, addlabels = TRUE)
+
+#Qual of representation
+fviz_cos2(doPca, choice = "var", axes = 1)
+fviz_cos2(doPca, choice = "var", axes = 2)
+
+#Biplot
+fviz_pca_biplot(doPca, 
+                col.ind = gpDOmet$Site,
+                palette =  RColorBrewer::brewer.pal(3, "Dark2"), 
+                addEllipses = F,
+                label = "var",
+                col.var = "black",
+                repel = TRUE,
+                legend.title = "")+
+  theme_few()
+```
+
+# Kings Long Term Data
+
+```{r}
+#Get discharge data from NWIS
+rawKingsQ <- readNWISdv(siteNumbers = "06879650",
+                     parameterCd = "00060",
+                     startDate = "1979-04-11", 
+                     endDate = today()) 
+```
+
+## Exceedance Probability by Year
+
+```{r}
+kingsQ <- renameNWISColumns(rawKingsQ) %>% 
+  select(-agency_cd, -Flow_cd) %>% 
+  rename(FlowCFS = Flow) %>% #Label discharge units (cubic feet per second)
+  mutate(
+    FlowCMS = round(FlowCFS * 0.028316847, 2),#cfs to cms
+    Year = year(Date),
+    Period = case_when(Year <= 2020 ~ "1980-2020",
+                       Year == 2021 ~ "2021",
+                       Year == 2022 ~ "2022",
+                       Year == 2023 ~ "2023",
+                       Year == 2024 ~ "2024")) %>% 
+  group_by(Period) %>%
+  arrange(desc(FlowCMS),, .by_group = TRUE) %>%
+  mutate(
+    Rank = row_number(),
+    ExceedanceProbability = (Rank / (n() + 1)) * 100)
+
+kingsQ %>%
+  ggplot(aes(Date, FlowCMS)) +
+  geom_line(color = "#0084a8") +
+  geom_rect(data = kingsQ %>% filter(FlowCMS <= 0),
+            aes(xmin = Date, xmax = Date + 1),
+            ymin = -Inf, ymax = Inf,
+            fill = "#ff7f50",
+            alpha = 0.1,
+            inherit.aes = FALSE) +
+  labs(title = "Kings Creek",
+    x = "",
+       y = expression(Discharge~("m"^3*"s"^{-1}))) +
+  theme_few() +
+  scale_x_date(labels = date_format("%b '%y")) +
+  scale_y_continuous(trans = "log1p") +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) -> kingsDry
+kingsDry
+ggsave("kingsDry.png", kingsDry, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+
+kingsQ %>% 
+  ggplot(aes(x = ExceedanceProbability, y = FlowCMS, color = Period)) +
+  geom_line() +
+  scale_y_log10(labels = label_number()) +
+  scale_color_manual(values = c("1980-2020" = "black", "2021" = "#1B9E77", "2022" = "#D95F02", "2023" = "#7570B3", "2024" = "#E7298A")) +
+  labs(title = "Kings Creek",
+       x = "Exceedance Probability (%)",
+       y = expression(Discharge~("m"^3*"s"^{-1}))) +
+  theme_few()+
+  theme(legend.position = "bottom", legend.title = element_blank()) -> excProb
+excProb
+ggsave("excProb.png", excProb, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+```
+
+```{r}
+kingsQ <- renameNWISColumns(rawKingsQ) %>% 
+  select(-agency_cd, -Flow_cd) %>% 
+  rename(FlowCFS = Flow) %>% 
+  mutate(
+    FlowCMS = round(FlowCFS * 0.028316847, 2),
+    Year = year(Date),
+    DOY = yday(Date),
+    Month = month(Date, label = TRUE, abbr = TRUE),
+    DateForPlot = as.Date(paste("2020", DOY), format = "%Y %j")
+  ) %>% 
+  group_by(Year) %>%
+  mutate(
+    TotalYearlyQ = sum(FlowCMS, na.rm = TRUE),
+    CumulativeQ = cumsum(FlowCMS),
+    CumulativeProp = CumulativeQ / TotalYearlyQ
+  ) %>% 
+  ungroup() %>%
+  group_by(DOY) %>%
+  mutate(MeanQ = mean(FlowCMS, na.rm = TRUE),
+         MedianQ = median(FlowCMS, na.rm = T)) %>%
+  ungroup()
+
+# Calculate low flow statistics
+kingsLowFlow <- kingsQ %>%
+  mutate(WaterYear = calcWaterYear(Date)) %>% 
+  group_by(WaterYear) %>%
+  summarize(
+    WetDays = sum(FlowCMS > 0, na.rm = TRUE),
+    DryDays = sum(FlowCMS == 0, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# Calculate the cumulative discharge for each day of the year, the total discharge for each year, merge the total discharge with the original data, calculate the relative cumulative discharge, and find the date of the center of mass (50% cumulative discharge) all in one go.
+
+q50perc <- kingsQ %>%
+  mutate(
+    CumulativeQ = cumsum(FlowCMS),
+    TotalQ = sum(FlowCMS, na.rm = TRUE),
+    RelativeCumulativeQ = CumulativeQ / TotalQ
+  ) %>%
+  summarize(CentroidDOY = DOY[which.min(abs(RelativeCumulativeQ - 0.5))])
+
+q50percAIMS <- kingsQ %>%
+  group_by(Year) %>%
+  filter(Year >= 2021) %>% 
+  mutate(
+    CumulativeQ = cumsum(FlowCMS),
+    TotalQ = sum(FlowCMS, na.rm = TRUE),
+    RelativeCumulativeQ = CumulativeQ / TotalQ
+  ) %>%
+  ungroup() %>%
+  group_by(Year) %>%
+  summarize(CentroidDOY = DOY[which.min(abs(RelativeCumulativeQ - 0.5))]) %>%
+  ungroup() %>% 
+  mutate(CentroidDate = as.Date(paste("2020", CentroidDOY), format = "%Y %j"))
+```
+
+```{r}
+ggplot() +
+  geom_line(data = kingsQ %>% filter(Year != 2024), aes(x = DateForPlot, y = FlowCMS, group = Year), color = "grey", alpha = 0.5) +
+  geom_line(data = kingsQ %>% filter(Year == 2024), aes(x = DateForPlot, y = FlowCMS, group = Year), color = "black") +
+  geom_line(data = kingsQ, aes(x = DateForPlot, y = MeanQ), color = "red", alpha = 0.5) +
+  geom_line(data = kingsQ, aes(x = DateForPlot, y = MedianQ), color = "blue", alpha = 0.5) +
+  scale_x_date(date_labels = "%b", date_breaks = "1 month") +
+  labs(x = "",
+       y = expression(Discharge~("m"^3*"s"^{-1}))) +
+  theme_few() -> longTermQ
+longTermQ
+ggsave("longTermQ.png", longTermQ, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+
+yearColor <- c("2021" = "#1B9E77", "2022" = "#D95F02", "2023" = "#7570B3", "2024" = "#E7298A", "1980-2020" = "black")
+ggplot() +
+  geom_line(data = kingsQ %>% filter(Year == 2021), aes(x = DateForPlot, y = CumulativeProp, color = factor(Year)), linetype = "solid") +
+  geom_line(data = kingsQ %>% filter(Year == 2022), aes(x = DateForPlot, y = CumulativeProp, color = factor(Year)), linetype = "solid") +
+  geom_line(data = kingsQ %>% filter(Year == 2023), aes(x = DateForPlot, y = CumulativeProp, color = factor(Year)), linetype = "solid") +
+  #geom_line(data = kingsQ %>% filter(Year == 2024), aes(x = DateForPlot, y = CumulativeProp, color = factor(Year)), linetype = "solid") +
+  geom_line(data = kingsQ %>% group_by(DOY) %>%
+              filter(Year < 2021) %>% 
+              summarise(DateForPlot = first(DateForPlot), AverageCumulativeProp = mean(CumulativeProp, na.rm = TRUE)), 
+            aes(x = DateForPlot, y = AverageCumulativeProp, color = "1980-2020"), linetype = "dashed") +
+  labs(title = "Kings Creek", x = "", y = "Cumulative Proportion \n of Total Yearly Discharge") +
+  scale_x_date(date_labels = "%b", date_breaks = "1 month") +
+  scale_color_manual(values = yearColor, labels = c("2021", "2022", "2023", "1980-2020")) +
+  theme_few() +
+  theme(legend.position = "bottom", legend.title = element_blank()) -> q50
+q50
+ggsave("q50.png", q50, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+
+ggplot() +
+  geom_line(data = kingsQ %>% filter(Year != 2024), aes(x = DateForPlot, y = FlowCMS, group = Year), color = "grey", alpha = 0.5) +
+  geom_line(data = kingsQ %>% filter(Year == 2024), aes(x = DateForPlot, y = FlowCMS, group = Year), color = "black") +
+  geom_line(data = kingsQ, aes(x = DateForPlot, y = MeanQ), color = "red", alpha = 0.5) +
+  geom_vline(data = q50percAIMS, aes(xintercept = CentroidDate, color = as.factor(Year)), linetype = "dashed") +
+  scale_color_brewer(palette = "Dark2", type = "div") +
+  scale_x_date(date_labels = "%b", date_breaks = "1 month") +
+  labs(title = "Kings Creek",
+       x = "",
+       y = expression(Discharge~("m"^3*"s"^{-1})),
+       color = "50% Cumulative\n    Discharge") +
+  theme_few()+
+  theme(legend.position = "bottom") -> q50date
+ggsave("q50Date.png", q50date, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+
+kingsLowFlow %>% 
+  ggplot(aes(WaterYear, DryDays))+
+  geom_point()+
+  geom_smooth(method='lm') +
+  stat_regline_equation(aes(label = ..rr.label..))+
+  theme_few()
+```
+
+# LTER Weirs
+
+```{r}
+# weirDat <- read_csv(here("Data/knzWeirs_2023.csv")) %>% 
+#   filter(RecYear >= 1993 & Discharge < 1000) %>% 
+#   mutate(RecDay = case_when(RecDay == 0 ~ 1, TRUE ~ RecDay),
+#     Date = paste(RecYear, RecMonth, RecDay, sep = "-"),
+#          RecHour = parse_time(str_pad(RecHour, width = 4, side = "left", pad = 0), "%H%M"),
+#          dateTime = ymd_hms(paste(Date, RecHour, sep = " "))) %>% 
+#   select(Watershed, FlowCMS = Discharge, QualFlag, dateTime) %>% 
+#   mutate(SqKm = case_when(
+#     Watershed == "N04D" ~ 1357221.619483/1000000,
+#     Watershed == "N02B" ~ 1188677.233751/1000000,
+#     Watershed == "N01B" ~ 1208908.624873/1000000,
+#     Watershed == "N20B" ~ 839577.609151/1000000))
+# 
+# # Calculate daily average discharge
+# dailyWeir <- weirDat %>% 
+#   mutate(Date = as.Date(dateTime)) %>% 
+#   group_by(Date, Watershed, SqKm) %>% 
+#   summarise(FlowCMS = mean(FlowCMS, na.rm = TRUE), .groups = 'drop') %>% 
+#   mutate(Year = year(Date),
+#          DOY = yday(Date),
+#          Month = month(Date, label = TRUE, abbr = TRUE),
+#          DateForPlot = as.Date(paste("2020", DOY), format = "%Y %j"),
+#          Period = case_when(Year <= 2020 ~ "1993-2020",
+#                             Year == 2021 ~ "2021",
+#                             Year == 2022 ~ "2022",
+#                             Year == 2023 ~ "2023",
+#                             Year == 2024 ~ "2024")) %>% 
+#   group_by(Watershed, Period) %>%
+#   arrange(desc(FlowCMS), .by_group = TRUE) %>%
+#   mutate(ExceedanceProbability = (row_number() / (n() + 1)) * 100)
+# 
+# 
+# 
+# dailyWeir %>%
+#   ggplot(aes(Date, FlowCMS)) +
+#   geom_line(color = "#0084a8") +
+#   geom_rect(data = dailyWeir %>% filter(FlowCMS <= 0), aes(xmin = Date, xmax = Date + 1, ymin = -Inf, ymax = +Inf),
+#     fill = "#ff7f50",
+#     alpha = 0.1) +
+#   labs(x = "",
+#        y = expression(Discharge~("m"^3*"s"^{-1})))+
+#   theme_few() +
+#   scale_x_date(labels = date_format("%b '%y")) +
+#   theme(axis.title.x = element_blank(),
+#         axis.text.x = element_text(angle = 45, hjust = 1))+
+#   facet_wrap(~Watershed, ncol = 2, scales = "free")
+# 
+# dailyWeir %>% 
+#   ggplot(aes(x = ExceedanceProbability, y = FlowCMS, color = Period)) +
+#   geom_line() +
+#   scale_y_log10(labels = label_number()) +
+#   scale_color_manual(values = c("1993-2020" = "black", "2021" = "#1B9E77", "2022" = "#D95F02", "2023" = "#7570B3", "2024" = "#E7298A")) +
+#   labs(x = "Exceedance Probability (%)",
+#        y = expression(Discharge~("m"^3*"s"^{-1}))) +
+#   theme_few()+
+#   theme(legend.position = "bottom", legend.title = element_blank())+
+#   facet_wrap(~Watershed, ncol = 2, scales = "free")
+```
+
+# Elk River (YMR) Long Term Data
+
+```{r}
+#Get discharge data from NWIS
+rawElkQdaily <- readNWISdv(siteNumbers = "07169800",
+                     parameterCd = "00060",
+                     startDate = "1991-04-27", 
+                     endDate = today()) 
+```
+
+```{r}
+elkQdaily <- renameNWISColumns(rawElkQdaily) %>% 
+  select(-agency_cd, -Flow_cd) %>% 
+  rename(FlowCFS = Flow) %>% #Label discharge units (cubic feet per second)
+  mutate(
+    FlowCMS = FlowCFS * 0.028316847,#cfs to cms
+    Year = year(Date),
+    Period = case_when(Year <= 2020 ~ "1991-2020",
+                       Year == 2021 ~ "2021",
+                       Year == 2022 ~ "2022",
+                       Year == 2023 ~ "2023",
+                       Year == 2024 ~ "2024")) %>% 
+  group_by(Period) %>%
+  arrange(desc(FlowCMS)) %>%
+  mutate(ExceedanceProbability = (row_number() / (n() + 1)) * 100)
+
+elkQdaily %>%
+  ggplot(aes(Date, FlowCMS)) +
+  geom_line(color = "#0084a8") +
+  geom_rect(data = elkQdaily %>% filter(FlowCMS <= 0), aes(xmin = Date, xmax = Date + 1, ymin = -Inf, ymax = +Inf),
+    fill = "#ff7f50", alpha = 0.1) +
+  labs(title = "Elk River",
+    x = "",
+       y = expression(Discharge~("m"^3*"s"^{-1})))+
+  theme_few() +
+  scale_x_date(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) -> elkDry
+elkDry
+ggsave("elkDry.png", elkDry, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+
+
+elkQdaily %>% 
+  ggplot(aes(x = ExceedanceProbability, y = FlowCMS, color = Period)) +
+  geom_line() +
+  scale_y_log10(labels = label_number()) +
+  scale_color_manual(values = c("1991-2020" = "black", "2021" = "#1B9E77", "2022" = "#D95F02", "2023" = "#7570B3", "2024" = "#E7298A")) +
+  labs(title = "Elk River",
+       x = "Exceedance Probability (%)",
+       y = expression(Discharge~("m"^3*"s"^{-1}))) +
+  theme_few()+
+  theme(legend.position = "bottom", legend.title = element_blank())-> elkExcProb
+elkExcProb
+ggsave("ElkExcProb.png", elkExcProb, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+```
+
+```{r}
+elkQdaily <- renameNWISColumns(rawElkQdaily) %>% 
+  select(-agency_cd, -Flow_cd) %>% 
+  rename(FlowCFS = Flow) %>% 
+  mutate(
+    FlowCMS = round(FlowCFS * 0.028316847, 2),
+    Year = year(Date),
+    DOY = yday(Date),
+    Month = month(Date, label = TRUE, abbr = TRUE),
+    DateForPlot = as.Date(paste("2020", DOY), format = "%Y %j")
+  ) %>% 
+  group_by(Year) %>%
+  mutate(
+    TotalYearlyQ = sum(FlowCMS, na.rm = TRUE),
+    CumulativeQ = cumsum(FlowCMS),
+    CumulativeProp = CumulativeQ / TotalYearlyQ
+  ) %>% 
+  ungroup() %>%
+  group_by(DOY) %>%
+  mutate(MeanQ = mean(FlowCMS, na.rm = TRUE),
+         MedianQ = median(FlowCMS, na.rm = T)) %>%
+  ungroup()
+
+# Calculate low flow statistics
+elkLowFlow <- elkQdaily %>%
+  mutate(WaterYear = calcWaterYear(Date)) %>% 
+  group_by(WaterYear) %>%
+  summarize(
+    WetDays = sum(FlowCMS > 0, na.rm = TRUE),
+    DryDays = sum(FlowCMS == 0, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# Calculate the cumulative discharge for each day of the year, the total discharge for each year, merge the total discharge with the original data, calculate the relative cumulative discharge, and find the date of the center of mass (50% cumulative discharge) all in one go.
+
+elkQdaily50perc <- elkQdaily %>%
+  mutate(
+    CumulativeQ = cumsum(FlowCMS),
+    TotalQ = sum(FlowCMS, na.rm = TRUE),
+    RelativeCumulativeQ = CumulativeQ / TotalQ
+  ) %>%
+  summarize(CentroidDOY = DOY[which.min(abs(RelativeCumulativeQ - 0.5))])
+
+elkQdaily50percAIMS <- elkQdaily %>%
+  group_by(Year) %>%
+  filter(Year >= 2021) %>% 
+  mutate(
+    CumulativeQ = cumsum(FlowCMS),
+    TotalQ = sum(FlowCMS, na.rm = TRUE),
+    RelativeCumulativeQ = CumulativeQ / TotalQ
+  ) %>%
+  ungroup() %>%
+  group_by(Year) %>%
+  summarize(CentroidDOY = DOY[which.min(abs(RelativeCumulativeQ - 0.5))]) %>%
+  ungroup() %>% 
+  mutate(CentroidDate = as.Date(paste("2020", CentroidDOY), format = "%Y %j"))
+
+ggplot() +
+  geom_line(data = elkQdaily %>% filter(Year != 2024), aes(x = DateForPlot, y = FlowCMS, group = Year), color = "grey", alpha = 0.5) +
+  geom_line(data = elkQdaily %>% filter(Year == 2024), aes(x = DateForPlot, y = FlowCMS, group = Year), color = "black") +
+  geom_line(data = elkQdaily, aes(x = DateForPlot, y = MeanQ), color = "red", alpha = 0.5) +
+  geom_line(data = elkQdaily, aes(x = DateForPlot, y = MedianQ), color = "blue", alpha = 0.5) +
+  scale_x_date(date_labels = "%b", date_breaks = "1 month") +
+  labs(x = "",
+       y = expression(Discharge~("m"^3*"s"^{-1}))) +
+  theme_few()
+
+yearColor <- c("2021" = "#1B9E77", "2022" = "#D95F02", "2023" = "#7570B3", "2024" = "#E7298A", "1991-2020" = "black")
+ggplot() +
+  geom_line(data = elkQdaily %>% filter(Year == 2021), aes(x = DateForPlot, y = CumulativeProp, color = factor(Year)), linetype = "solid") +
+  geom_line(data = elkQdaily %>% filter(Year == 2022), aes(x = DateForPlot, y = CumulativeProp, color = factor(Year)), linetype = "solid") +
+  geom_line(data = elkQdaily %>% filter(Year == 2023), aes(x = DateForPlot, y = CumulativeProp, color = factor(Year)), linetype = "solid") +
+  #geom_line(data = elkQdaily %>% filter(Year == 2024), aes(x = DateForPlot, y = CumulativeProp, color = factor(Year)), linetype = "solid") +
+  geom_line(data = elkQdaily %>% group_by(DOY) %>%
+              filter(Year < 2021) %>% 
+              summarise(DateForPlot = first(DateForPlot), AverageCumulativeProp = mean(CumulativeProp, na.rm = TRUE)), 
+            aes(x = DateForPlot, y = AverageCumulativeProp, color = "1991-2020"), linetype = "dashed") +
+  labs(title = "Elk River", x = "", y = "Cumulative Proportion \n of Total Yearly Discharge") +
+  scale_x_date(date_labels = "%b", date_breaks = "1 month") +
+  scale_color_manual(values = yearColor, labels = c("2021", "2022", "2023", "1991-2020")) +
+  theme_few() +
+  theme(legend.position = "bottom", legend.title = element_blank()) -> eklCumuQ
+eklCumuQ
+ggsave("ElkCumuQ.png", eklCumuQ, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+
+ggplot() +
+  geom_line(data = elkQdaily %>% filter(Year != 2024), aes(x = DateForPlot, y = FlowCMS, group = Year), color = "grey", alpha = 0.5) +
+  geom_line(data = elkQdaily %>% filter(Year == 2024), aes(x = DateForPlot, y = FlowCMS, group = Year), color = "black") +
+  geom_line(data = elkQdaily, aes(x = DateForPlot, y = MeanQ), color = "red", alpha = 0.5) +
+  geom_vline(data = elkQdaily50percAIMS, aes(xintercept = CentroidDate, color = as.factor(Year)), linetype = "dashed") +
+  scale_color_brewer(palette = "Dark2", type = "div") +
+  scale_x_date(date_labels = "%b", date_breaks = "1 month") +
+  labs(x = "",
+       y = expression(Discharge~("m"^3*"s"^{-1})),
+       color = "50% Cumulative\n    Discharge") +
+  theme_few()+
+  theme(legend.position = "bottom")
+
+elkLowFlow %>% 
+  ggplot(aes(WaterYear, DryDays))+
+  geom_point()+
+  geom_smooth(method='lm') +
+  stat_regline_equation(aes(label = ..rr.label..))+
+  theme_few()
+```
+
+## Elk River vs. YMR
+
+```{r}
+ymrKm2 <- 1.45
+elkKm2 <- 569.797384
+
+ymrDat <- gpDat %>% 
+  select(Site, dateTime, Q_Ls) %>% 
+  filter(Site == "YMR") %>%
+  mutate(FlowCMS = Q_Ls * 0.001, .keep = "unused",
+         areaKM2 = ymrKm2,
+         areaM2 = ymrKm2 * 1e6)
+
+#Get discharge data from NWIS
+rawElkQ <- readNWISuv(siteNumbers = "07169800",
+                     parameterCd = "00060",
+                     startDate = min(as_date(ymrDat$dateTime), na.rm = T), 
+                     endDate = max(as_date(ymrDat$dateTime), na.rm = T)) %>% 
+  renameNWISColumns() %>% 
+  select(-site_no, -agency_cd, -Flow_Inst_cd, -tz_cd) %>% 
+  rename(FlowCFS = Flow_Inst) %>% 
+  mutate(FlowCMS = FlowCFS * 0.028316847,
+         areaM2 = elkKm2 * 1e6,
+         areaKM2 = elkKm2,
+         FlowScaled = FlowCMS * (ymrKm2/elkKm2),
+         Site = "ELK", .keep = "unused")
+```
+
+\
+
+```{r}
+#Merge YMR and Elk Data
+ymrElk <- ymrDat %>% 
+  full_join(rawElkQ) %>% 
+  group_by(Site) %>% 
+  mutate(FlowCMS = na.approx(FlowCMS, maxgap = 10, na.rm = F),
+         WaterYear = calcWaterYear(dateTime),
+         FlowScaled = coalesce(FlowScaled, FlowCMS)) %>% 
+  ungroup() %>% 
+  drop_na(FlowCMS)
+
+ymrElk %>% 
+  ggplot(aes(x = dateTime, y = FlowScaled, color = Site)) +
+  geom_line() +
+  facet_wrap(~ WaterYear, scales = "free_x") +
+  #scale_y_log10(labels = label_number())+
+  scale_x_datetime()+
+  scale_color_brewer(palette = "Dark2")+
+  labs(x = "",
+       y = expression(Discharge~("m"^3*"s"^{-1}/"km"^2))) +
+  theme_few()+
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.title.x = element_blank(), legend.position = "bottom",
+          legend.title = element_blank()) -> ymrElkQScaled
+ymrElkQScaled
+ggsave("ymrElkQ_Scaled.png", ymrElkQScaled, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+
+ymrElk %>% 
+  ggplot(aes(x = dateTime, y = FlowCMS, color = Site)) +
+  geom_line() +
+  facet_wrap(~ WaterYear, scales = "free_x") +
+  scale_y_log10(labels = label_number())+
+  scale_x_datetime()+
+  scale_color_brewer(palette = "Dark2")+
+  labs(x = "",
+       y = expression(Discharge~("m"^3*"s"^{-1}))) +
+  theme_few()+
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.title.x = element_blank(), legend.position = "bottom",
+          legend.title = element_blank()) -> ymrElkQ
+ymrElkQ
+ggsave("ymrElkQ.png", ymrElkQ, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+
+ymrElkWide <- ymrDat %>% 
+  rename(ymrQ = FlowCMS, ymrM2 = areaM2, ymrKM2 = areaKM2) %>% 
+  ungroup() %>% 
+  dplyr::select(-Site) %>% 
+  full_join(rawElkQ %>% rename(elkQ = FlowCMS, elkM2 = areaM2, elkKM2 = areaKM2) %>% select(-Site)) %>% 
+  mutate(ymrQ = na.approx(ymrQ, maxgap = 10, na.rm = F),
+         elkQ = na.approx(elkQ, maxgap = 10, na.rm = F),
+         WaterYear = calcWaterYear(dateTime),
+         elkM2 = na_locf(elkM2),
+         elkKM2 = na_locf(elkKM2),
+         elkQ_Scaled = na.approx(FlowScaled, maxgap = 10, na.rm = F)) %>% 
+  filter(!is.na(ymrQ) & !is.na(elkQ) & WaterYear < "2024")
+
+ymrElkWide %>%
+  ggplot(aes(x = elkQ, y = ymrQ)) +
+  geom_point() +
+  labs(x = "Elk River",
+       y = "Youngmeyer") +
+  geom_smooth(method='lm') +
+  stat_regline_equation(aes(label = ..rr.label..))+
+  theme_few()+
+  facet_wrap(~WaterYear, scales = "free_x") -> ymrElkQBiPlt
+ymrElkQBiPlt
+ggsave("ymrElkQBiPlt.png", ymrElkQBiPlt, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+
+# Cross-Correlation Analysis
+ccfRes <- ccf(ymrElkWide$elkQ_Scaled, ymrElkWide$ymrQ)
+ccfDf <- data.frame(lag = ccfRes$lag, correlation = ccfRes$acf)
+# Find the lag with the highest correlation
+maxCorrLag <- ccfDf %>%
+  filter(correlation == max(correlation)) %>%
+  pull(lag)
+cat("Lag with the highest correlation:", maxCorrLag, "\n")
+
+# Interpretation
+if (maxCorrLag > 0) {
+  cat("elkQ lags behind ymrQ by", maxCorrLag, "time steps.\n")
+} else if (maxCorrLag < 0) {
+  cat("ymrQ lags behind elkQ by", abs(maxCorrLag), "time steps.\n")
+} else {
+  cat("ymrQ and elkQ are not correlated at zero lag.\n")
+}
+
+
+# Create a new data frame with lagged YMR discharge
+ymrElkWide <- ymrElkWide %>%
+    mutate(elkQadj = lag(elkQ_Scaled, maxCorrLag),
+           qDiff = elkQadj - ymrQ)
+
+# Scatter Plot with Lagged Data
+ymrElkWide %>%
+  ggplot(aes(x = elkQadj, y = ymrQ)) +
+  geom_point() +
+  labs(x = "Elk River",
+       y = "Youngmeyer") +
+  geom_smooth(method='lm') +
+  stat_regline_equation(aes(label = ..rr.label..))+
+  theme_few()
+
+rm(ccfDf, ccfRes)
+```
+
+# Hydro Metrics
+
+```{r}
+gpDat <- gpDat %>% 
+  mutate(
+    WaterYear = calcWaterYear(dateTime),
+    Period = case_when(WaterYear == 2021 ~ "2021",
+                       WaterYear == 2022 ~ "2022",
+                       WaterYear == 2023 ~ "2023",
+                       WaterYear == 2024 ~ "2024")) %>% 
+  group_by(Site, Period) %>%
+  arrange(desc(SW_Level_cm)) %>%
+  mutate(ExceedanceProbability = (row_number() / (n() + 1)) * 100)
+
+gpDat %>% 
+  ggplot(aes(x = ExceedanceProbability, y = SW_Level_cm, color = Period)) +
+  geom_line() +
+  scale_y_log10(labels = label_number()) +
+  scale_color_manual(values = c("1991-2020" = "black", "2021" = "#1B9E77", "2022" = "#D95F02", "2023" = "#7570B3", "2024" = "#E7298A")) +
+  labs(x = "Exceedance Probability (%)",
+       y = "SW Level (cm)") +
+  theme_few()+
+  theme(legend.position = "bottom", legend.title = element_blank())+
+  facet_wrap(~Site)
+```
+
+```{r}
+dailyQ <- gpDat %>% 
+  mutate(Date = ymd(floor_date(solar.time, "1 day"))) %>%
+  group_by(Site, Date) %>%
+  summarize(Flow = mean(Q_Ls, na.rm = T)) %>% 
+  mutate(Flow = replace_na(Flow, 0),
+         Flow = ifelse(Flow < 0, 0, Flow)) %>% 
+  select(gage = Site, Date, Flow)
+
+for (i in unique(dailyQ$gage)) {
+  siteData <- filter(dailyQ, gage == i)
+  fileName <- paste0(i, ".csv") # Customize the file name as needed
+write.csv(siteData, paste0(here("Data/GP_Q/"), fileName), row.names = FALSE)
+}
+
+## Run sub_annual_metrics script
+```
+
+```{r}
+dryingMet <- read_csv(here("Data/GP_metrics_by_event_Q.csv")) %>% 
+  drop_na(event_id) %>% 
+  mutate(dryDateStart = ymd(paste0(calendar_year, "-01-01")) + days(dry_date_start - 1),
+         Date = dryDateStart,
+         dryDateEnd = ymd(Date + days(dry_dur - 1)),
+         peakDate = ymd(paste0(calendar_year, "-01-01")) + days(peak_date - 1))
+
+#Merge hydro metrics with ts
+hydroTS <- dailyQ %>% 
+  full_join(dryingMet, by = c("gage", "Date"))
+```
+
+```{r}
+hydroTS %>%
+  ggplot(aes(Date, Flow)) +
+  geom_line(color = "#0084a8") +
+  ylab("Q (L/s)") +
+  theme_few() +
+  geom_rect(aes(xmin = dryDateStart, xmax = dryDateEnd, ymin = -Inf, ymax = +Inf),
+    fill = "#d3d3d3",
+    alpha = 0.5) +
+    geom_rect(aes(xmin = peakDate, xmax = peakDate + 1, ymin = -Inf, ymax = +Inf),
+    fill = "#ff0000",
+    alpha = 0.8) +
+  scale_x_date() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap( ~ gage, scales = "free") -> hydroMetQ
+ggsave("hydroMetQ.png", hydroMetQ, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+
+```
+
+## Merge with DO Metrics
+
+```{r}
+# Expand dryingMet to include all dates between peak_date and dry_date_start
+# dryingMet <- dryingMet %>%
+#   rowwise() %>%
+#   mutate(date_seq = list(seq(peakDate, dryDateStart, by = "day"))) %>%
+#   unnest(date_seq) %>%
+#   rename(Date = date_seq)
+```
+
+## Stage
+
+```{r}
+gpDat %>%
+  ggplot(aes(dateTime, SW_Level_cm)) +
+  geom_line(color = "#000000") +
+  ylab("SW Level (cm)") +
+  theme_few() +
+  scale_x_datetime() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap( ~ Site, scales = "free")
+
+dailyStage <- gpDat %>% 
+  mutate(Date = ymd(floor_date(solar.time, "1 day"))) %>%
+  group_by(Site, Date) %>%
+  summarize(Flow = mean(SW_Level_cm, na.rm = T)) %>% 
+  mutate(Flow = replace_na(Flow, 0),
+         Flow = ifelse(Flow < 0, 0, Flow)) %>% 
+  select(gage = Site, Date, Flow)
+
+for (i in unique(dailyStage$gage)) {
+  siteData <- filter(dailyStage, gage == i)
+  fileName <- paste0(i, ".csv") # Customize the file name as needed
+  write.csv(siteData, paste0(here("Data/GP_Stage/"), fileName), row.names = FALSE)
+}
+```
+
+```{r}
+dryingMetStage <- read_csv(here("Data/GP_metrics_by_event_Stage.csv")) %>% 
+  drop_na(event_id) %>%
+  mutate(dryDateStart = ymd(paste0(calendar_year, "-01-01")) + days(dry_date_start - 1),
+         dryDateEnd = ymd(dryDateStart + days(dry_dur - 1)),
+         peakDate = ymd(paste0(calendar_year, "-01-01")) + days(peak_date - 1)) %>% 
+    select(-season, -meteorologic_year, -calendar_year, -peak_date, -dry_date_start, -dry_date_mean) 
+
+#Merge hydro metrics with ts
+dailyStageDrying <- dailyStage %>% 
+  full_join(dryingMetStage %>% mutate(Date = peakDate), by = c("gage", "Date"))
+
+dailyStageDrying %>%
+  ggplot(aes(Date, Flow)) +
+  geom_line(color = "#0084a8") +
+  ylab("Stage (cm)") +
+  theme_few() +
+  geom_rect(aes(xmin = dryDateStart, xmax = dryDateEnd, ymin = -Inf, ymax = +Inf),
+    fill = "#d3d3d3",
+    alpha = 0.5) +
+    geom_rect(aes(xmin = peakDate, xmax = peakDate + 1, ymin = -Inf, ymax = +Inf),
+    fill = "#ff0000",
+    alpha = 0.8) +
+  scale_x_date() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap( ~ gage, scales = "free") -> hydroMetStage
+hydroMetStage
+#ggsave("hydroMetStage.png", hydroMetStage, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+
+```
+
+```{r}
+gpDryMetStage <- dryingMetStage %>% 
+  rename(Site = gage) %>% 
+  ungroup() %>% 
+  drop_na()
+#PCA
+dryPca <- gpDryMetStage %>% 
+  ungroup() %>% 
+  select(peak2zero, drying_rate, dry_dur, peak_value, peak_quantile) %>% 
+  select(where(is.numeric)) %>% # retain only numeric columns
+  prcomp(center = T, scale = T) # do PCA on scaled data
+
+#extract loadings
+dryPcaLoad <- dryPca %>%
+  tidy(matrix = "loadings")
+dryPcaLoad
+#Variance explained
+dryPcaEig <- dryPca %>%
+  tidy(matrix = "eigenvalues")
+dryPcaEig
+#Scree plot
+fviz_eig(dryPca, addlabels = TRUE)
+
+#Qual of representation
+fviz_cos2(dryPca, choice = "var", axes = 1)
+fviz_cos2(dryPca, choice = "var", axes = 2)
+
+#Biplot
+fviz_pca_biplot(dryPca, 
+                col.ind = gpDryMetStage$Site,
+                palette =  RColorBrewer::brewer.pal(3, "Dark2"), 
+                addEllipses = F,
+                label = "var",
+                col.var = "black",
+                repel = TRUE,
+                legend.title = "")+
+  theme_few()
+```
+
+## Merge Metrics W/Stage
+
+```{r}
+dryingMetStageExp <- dryingMetStage %>%
+  group_by(gage, event_id) %>% 
+  rowwise() %>%
+  do(data.frame(Date = seq(.$peakDate, .$dryDateStart, by = "day"), .)) %>%
+  ungroup() %>%
+  rename(Site = gage)
+
+gpMetrics <- doMet %>% 
+  full_join(dryingMetStageExp) %>% 
+  drop_na() %>% 
+  select(-WaterYear, -Year, -season, -minDO.obs, -maxDO.obs, -avgDO.obs, -totalDO, -DO.amp, -probHyp, -cvDO.obs, -dayProbConc, -nightProbConc, -NHR_obs, -SW_Level_ft, -DO.hyp, -DOSat.hyp, -dryDateStart, -dryDateEnd, -peakDate) %>% 
+  mutate(WaterYear = calcWaterYear(Date))
+
+## I use this till tidyverse implements a scale function
+scale_numeric <- function(x) mutate_if(x, is.numeric, function(y) as.vector(scale(y)))
+
+gpMetrics %>%
+  ungroup() %>% 
+  select(where(is.numeric)) %>% # retain only numeric columns
+  scale_numeric() %>%  # center and scale
+  cor(method = "pearson") %>%
+  car::scatterplotMatrix()
+
+gpMetrics %>%
+  ungroup() %>% 
+  select(where(is.numeric)) %>% # retain only numeric columns
+  scale_numeric() %>%  # center and scale
+  cor(method = "pearson") %>%
+  corrplot(type = "upper")
+```
+
+```{r}
+gpMetrics %>%
+  filter(drying_rate < 0) %>% 
+  ggplot(aes(peak2zero, avgDO.pctsat)) +
+  geom_point() +
+  labs(x = "Peak Stage to Zero",
+       y = expression(Daily ~ Avg. ~ DO["%Sat"]))+
+  geom_smooth(method='lm') +
+  stat_regline_equation(aes(label = ..rr.label..))+
+  theme_few() -> doDrying
+doDrying
+ggsave("doDryingLM.png", doDrying, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+summary(lm(avgDO.pctsat ~ drying_rate, data = gpMetrics %>% filter(drying_rate<0)))
+```
+
+```{r}
+# Subset data to only include relevant columns
+metrics <- gpMetrics %>%
+  select(minDO.pctsat, maxDO.pctsat, avgDO.pctsat, DOpctsat.amp, probHypSat, NHR_sat,
+         peak_value, peak_quantile, peak2zero, drying_rate, dry_dur) %>% 
+  filter(drying_rate < 0)
+# Function to create scatter plot with regression line
+create_plot <- function(x_var, y_var, data, x_label, y_label) {
+  ggplot(data, aes_string(x = x_var, y = y_var)) +
+    geom_point() +
+    geom_smooth(method = "lm") +
+    stat_regline_equation(aes(label = ..rr.label..))+
+    labs(x = x_label, y = y_label)
+}
+
+# List of DO metrics and drying metrics
+do_metrics <- c("minDO.pctsat", "maxDO.pctsat", "avgDO.pctsat", "DOpctsat.amp", "probHypSat", "NHR_sat")
+drying_metrics <- c("peak_value", "peak_quantile", "peak2zero", "drying_rate", "dry_dur")
+
+# Initialize an empty dataframe to store significant results
+significant_results <- data.frame()
+
+# Loop through each DO metric and drying metric pair
+for (do_metric in do_metrics) {
+  for (drying_metric in drying_metrics) {
+    # Create the formula for the linear model
+    formula <- as.formula(paste(do_metric, "~", drying_metric))
+    
+    # Fit the linear model
+    model <- lm(formula, data = metrics)
+    
+    # Tidy the model results
+    tidied_model <- tidy(model)
+    
+    # Filter for significant results (p-value < 0.05)
+    significant <- tidied_model %>%
+      filter(term != "(Intercept)" & p.value < 0.05)
+    
+    # If there are significant results, add them to the dataframe
+    if (nrow(significant) > 0) {
+      significant <- significant %>%
+        mutate(DO_metric = do_metric, Drying_metric = drying_metric)
+      significant_results <- rbind(significant_results, significant)
+    }
+  }
+}
+
+# Generate plots for each pair of DO metric and drying metric
+plot_list <- list()
+for (do_metric in do_metrics) {
+  for (drying_metric in drying_metrics) {
+    plot_list[[length(plot_list) + 1]] <- create_plot(drying_metric, do_metric, metrics, drying_metric, do_metric)
+  }
+}
+
+# Arrange plots in a grid
+cursedLMs <- grid.arrange(grobs = plot_list, ncol = length(drying_metrics))
+```
+
+```{r}
+# Subset data to only include relevant columns for clustering
+metrics <- gpMetrics %>%
+  ungroup() %>% 
+  select(minDO.pctsat, maxDO.pctsat, avgDO.pctsat, DOpctsat.amp, probHypSat, NHR_sat,
+         peak_value, peak_quantile, peak2zero, drying_rate, dry_dur)
+
+# Determine optimal number of clusters using the elbow method
+set.seed(123)
+fviz_nbclust(metrics, kmeans, method = "wss")
+
+# Perform K-means clustering with optimal number of clusters (e.g., k = 3)
+set.seed(123)
+kmeans_result <- kmeans(metrics, centers = 3, nstart = 25)
+
+# Add the cluster assignment to the original data
+metrics$cluster <- kmeans_result$cluster
+cluster_summary <- metrics %>%
+  group_by(cluster) %>%
+  summarise(across(everything(), list(mean = mean, sd = sd), na.rm = TRUE))
+
+print(cluster_summary)
+
+# Visualize the clustering results
+fviz_cluster(kmeans_result, data = metrics, geom = "point",
+             stand = FALSE, ellipse = TRUE, show.clust.cent = TRUE) +
+  labs(title = "K-means Clustering of DO and Drying Metrics")
+
+# Reshape data for easier plotting
+metrics <- metrics %>%
+  mutate(cluster = as.factor(cluster))
+
+metrics_long <- metrics %>%
+  pivot_longer(cols = -cluster, names_to = "variable", values_to = "value")
+
+# Create boxplots for each variable by cluster
+ggplot(metrics_long, aes(x = cluster, y = value, fill = cluster)) +
+  geom_boxplot() +
+  facet_wrap(~variable, scales = "free", ncol = 3) +
+  theme_minimal() +
+  labs(title = "Boxplots of Variables by Cluster", x = "Cluster", y = "Value")
+```
+
+```{r}
+# Subset data to only include relevant columns for clustering
+metrics <- gpMetrics %>%
+  ungroup() %>% 
+  select(minDO.pctsat, maxDO.pctsat, avgDO.pctsat, DOpctsat.amp, probHypSat, NHR_sat,
+         peak_value, peak_quantile, peak2zero, drying_rate, dry_dur)
+
+# Remove rows with missing or infinite values
+metrics <- metrics %>%
+  filter_all(all_vars(!is.na(.))) %>%
+  filter_all(all_vars(!is.infinite(.)))
+# Scale the data
+metrics_scaled <- scale(metrics)
+
+# Compute the dissimilarity matrix
+dist_matrix <- dist(metrics_scaled)
+
+# Perform hierarchical clustering
+hc_result <- hclust(dist_matrix, method = "ward.D2")
+
+# Plot the dendrogram
+plot(hc_result, labels = FALSE, hang = -1, main = "Hierarchical Clustering Dendrogram")
+
+# Cut the dendrogram to form clusters (e.g., cut into 3 clusters)
+k <- 3 # Adjust based on the dendrogram
+clusters <- cutree(hc_result, k = k)
+
+# Add the cluster assignment to the original data
+metrics <- metrics %>%
+  mutate(cluster = as.factor(clusters))
+
+cluster_centroids <- metrics %>%
+  group_by(cluster) %>%
+  summarise(across(everything(), mean, na.rm = TRUE))
+
+cluster_summary <- metrics %>%
+  group_by(cluster) %>%
+  summarise(across(everything(), list(mean = mean, sd = sd), na.rm = TRUE))
+
+# Visualize the clustering results using a scatter plot matrix
+fviz_cluster(data = metrics, cluster = clusters, geom = "point",
+             stand = FALSE, ellipse = TRUE, show.clust.cent = TRUE) +
+  labs(title = "Hierarchical Clustering of DO and Drying Metrics")
+
+# Reshape data for easier plotting with ggplot2
+metrics_long <- metrics %>%
+  pivot_longer(cols = -cluster, names_to = "variable", values_to = "value")
+
+# Create boxplots for each variable by cluster
+ggplot(metrics_long, aes(x = cluster, y = value, fill = cluster)) +
+  geom_boxplot() +
+  facet_wrap(~variable, scales = "free", ncol = 3) +
+  theme_minimal() +
+  labs(title = "Boxplots of Variables by Cluster", x = "Cluster", y = "Value")
+
+```
+
+# PCA
+
+## DO PCA
+
+```{r}
+#PCA
+doPca <- gpMetrics %>%
+  ungroup() %>% 
+  select(minDO.pctsat, maxDO.pctsat, avgDO.pctsat, DOpctsat.amp, probHypSat,  NHR_sat) %>% 
+  #m dayProbSat, nightProbSat,
+  select(where(is.numeric)) %>% # retain only numeric columns
+  prcomp(center = T, scale = T) # do PCA on scaled data
+
+#extract loadings
+doPcaLoad <- doPca %>%
+  tidy(matrix = "loadings")
+doPcaLoad
+#Variance explained
+doPcaEig <- doPca %>%
+  tidy(matrix = "eigenvalues")
+doPcaEig
+#Scree plot
+fviz_eig(doPca, addlabels = TRUE)
+
+#Qual of representation
+fviz_cos2(doPca, choice = "var", axes = 1)
+fviz_cos2(doPca, choice = "var", axes = 2)
+
+#Biplot
+fviz_pca_biplot(doPca, 
+                col.ind = gpMetrics$Site,
+                palette =  RColorBrewer::brewer.pal(3, "Dark2"), 
+                addEllipses = T,
+                label = "var",
+                col.var = "black",
+                repel = TRUE,
+                legend.title = "")+
+  theme_few()
+```
+
+## Drying PCA
+
+```{r}
+#PCA
+dryPca <- gpMetrics %>% 
+  ungroup() %>% 
+  select(peak2zero, drying_rate, dry_dur, peak_value, peak_quantile) %>% 
+  select(where(is.numeric)) %>% # retain only numeric columns
+  prcomp(center = T, scale = T) # do PCA on scaled data
+
+#extract loadings
+dryPcaLoad <- dryPca %>%
+  tidy(matrix = "loadings")
+dryPcaLoad
+#Variance explained
+dryPcaEig <- dryPca %>%
+  tidy(matrix = "eigenvalues")
+dryPcaEig
+#Scree plot
+fviz_eig(dryPca, addlabels = TRUE)
+
+#Qual of representation
+fviz_cos2(dryPca, choice = "var", axes = 1)
+fviz_cos2(dryPca, choice = "var", axes = 2)
+
+#Biplot
+fviz_pca_biplot(dryPca, 
+                col.ind = gpMetrics$Site,
+                palette =  RColorBrewer::brewer.pal(3, "Dark2"), 
+                addEllipses = F,
+                label = "var",
+                col.var = "black",
+                repel = TRUE,
+                legend.title = "")+
+  theme_few()
+```
+
+## USGS Dat
+
+```{r}
+usgsMet <- read_csv(here("Data/USGS_AllMetrics.csv")) %>% 
+  rename(Site = siteName)
+
+allMetrics <- gpMetrics %>% 
+  full_join(usgsMet) %>% 
+  select(-Q_Ls, -SW_Level_cm, -cvDO.pctsat, -event_id, -WaterYear)
+```
+
+### DO PCA
+
+```{r}
+#PCA
+allDoPca <- allMetrics %>%
+  ungroup() %>% 
+  select(minDO.pctsat, maxDO.pctsat, avgDO.pctsat, DOpctsat.amp, probHypSat,  NHR_sat) %>% 
+  #m dayProbSat, nightProbSat,
+  select(where(is.numeric)) %>% # retain only numeric columns
+  prcomp(center = T, scale = T) # do PCA on scaled data
+
+#extract loadings
+allDoPcaLoad <- doPca %>%
+  tidy(matrix = "loadings")
+allDoPcaLoad
+#Variance explained
+allDoPcaEig <- doPca %>%
+  tidy(matrix = "eigenvalues")
+allDoPcaEig
+#Scree plot
+fviz_eig(allDoPca, addlabels = TRUE)
+
+#Qual of representation
+fviz_cos2(allDoPca, choice = "var", axes = 1)
+fviz_cos2(allDoPca, choice = "var", axes = 2)
+
+#Biplot
+fviz_pca_biplot(allDoPca, 
+                col.ind = allMetrics$Site,
+                palette =  RColorBrewer::brewer.pal(7, "Dark2"), 
+                addEllipses = F,
+                label = "var",
+                col.var = "black",
+                repel = TRUE,
+                legend.title = "")+
+  scale_shape_manual(values = c(0, 1, 2, 3, 4, 5, 6))+
+  theme_few()
+```
+
+### Dry PCA
+
+```{r}
+#PCA
+allDryPca <- allMetrics %>% 
+  ungroup() %>% 
+  select(peak2zero, drying_rate, dry_dur, peak_value, peak_quantile) %>% 
+  select(where(is.numeric)) %>% # retain only numeric columns
+  prcomp(center = T, scale = T) # do PCA on scaled data
+
+#extract loadings
+allDryPcaLoad <- allDryPca %>%
+  tidy(matrix = "loadings")
+allDryPcaLoad
+#Variance explained
+allDryPcaEig<- allDryPca %>%
+  tidy(matrix = "eigenvalues")
+allDryPcaEig
+#Scree plot
+fviz_eig(allDryPca, addlabels = TRUE)
+
+#Qual of representation
+fviz_cos2(allDryPca, choice = "var", axes = 1)
+fviz_cos2(allDryPca, choice = "var", axes = 2)
+
+#Biplot
+fviz_pca_biplot(allDryPca, 
+                col.ind = allMetrics$Site,
+                palette =  RColorBrewer::brewer.pal(7, "Dark2"), 
+                addEllipses = F,
+                label = "var",
+                col.var = "black",
+                repel = TRUE,
+                legend.title = "")+
+  scale_shape_manual(values = c(0, 1, 2, 3, 4, 5, 6))+
+  theme_few()
+```
+
+# Clustering
+
+```{r}
+allMetricsScaled <- allMetrics %>%
+  select(minDO.pctsat, maxDO.pctsat, avgDO.pctsat, DOpctsat.amp, probHypSat, cvDO.pctsat, dayProbSat, nightProbSat, NHR_sat) %>% 
+  ungroup() %>% 
+  select(where(is.numeric)) %>% # retain only numeric columns
+  scale_numeric()
+```
+
+```{r}
+fviz_nbclust(allMetricsScaled, kmeans, method = "wss")
+gapStat <- clusGap(allMetricsScaled, FUN = kmeans, K.max = 10, B = 100)
+fviz_gap_stat(gapStat)
+
+gpKmeans <- kmeans(allMetricsScaled, centers = 6, nstart = 25)
+fviz_cluster(gpKmeans, allMetricsScaled)
+```
+
+```{r}
+# Determine the optimal number of clusters using the Elbow method
+fviz_nbclust(allMetricsScaled, kmeans, method = "wss") +
+  labs(subtitle = "Elbow method")
+
+# Set the number of clusters (k)
+set.seed(123) # For reproducibility
+k <- 6  # You can choose the optimal k based on the Elbow method
+
+# Perform k-means clustering
+kmeans_result <- kmeans(allMetricsScaled, centers = k, nstart = 25)
+
+# Ungroup the tibble if it is grouped
+allMetrics <- allMetrics %>% ungroup()
+
+# Add the cluster assignment to the original data
+allMetrics <- allMetrics %>%
+  mutate(cluster = kmeans_result$cluster)
+
+# Visualize the clusters using the first two principal components
+fviz_cluster(kmeans_result, data = allMetricsScaled,
+             geom = "point", ellipse.type = "norm") +
+  labs(title = "K-means Clustering",
+       x = "Principal Component 1",
+       y = "Principal Component 2")
+
+# If you want to visualize clusters based on the original features,
+# you can use pairs plot or ggplot for specific feature pairs
+ggplot(allMetrics, aes(x = minDO.pctsat, y = maxDO.pctsat, color = as.factor(cluster))) +
+  geom_point() +
+  labs(title = "Clusters based on minDO.pctsat and maxDO.pctsat",
+       x = "Minimum DO % Saturation",
+       y = "Maximum DO % Saturation",
+       color = "Cluster")
+```
+
+```{r}
+# Compute the distance matrix
+distMatrix <- dist(allMetricsScaled)
+
+# Perform hierarchical clustering using the complete linkage method
+hiClust <- hclust(distMatrix, method = "ward.D2")
+
+# Plot the dendrogram
+fviz_dend(hiClust, rect = TRUE, show_labels = FALSE) +
+  labs(title = "Hierarchical Clustering Dendrogram",
+       x = "Observations",
+       y = "Height")
+
+# Cut the dendrogram to obtain the desired number of clusters
+k <- 5  # You can choose the number of clusters based on the dendrogram
+clusterAssignments <- cutree(hiClust, k = k)
+
+# Add the cluster assignment to the original data
+allMetrics <- allMetrics %>%
+  ungroup() %>%
+  mutate(cluster = clusterAssignments)
+
+# Visualize the clusters using the first two principal components
+fviz_cluster(list(data = allMetricsScaled, cluster = clusterAssignments),
+             geom = "point", ellipse.type = "norm") +
+  labs(title = "Hierarchical Clustering",
+       x = "Principal Component 1",
+       y = "Principal Component 2")
+
+# Visualize clusters based on the original features and add site names
+ggplot(allMetrics, aes(x = minDO.pctsat, y = maxDO.pctsat, color = as.factor(cluster))) +
+  geom_point() +
+  geom_text(aes(label = Site), hjust = 1.5, vjust = 1.5) +
+  labs(title = "Clusters based on minDO.pctsat and maxDO.pctsat",
+       x = "Minimum DO % Saturation",
+       y = "Maximum DO % Saturation",
+       color = "Cluster")
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+fviz_nbclust(allMetricsScaled, kmeans, method = "wss")
+gapStat <- clusGap(allMetricsScaled, FUN = kmeans, K.max = 10, B = 100)
+fviz_gap_stat(gapStat)
+
+gpKmeans <- kmeans(allMetricsScaled, centers = 6, nstart = 25)
+
+# Compute the distance matrix
+distMatrix <- dist(allSiteScaled)
+
+# Perform hierarchical clustering using the complete linkage method
+hiClust <- hclust(distMatrix, method = "ward.D2")
+
+# Plot the dendrogram
+fviz_dend(hiClust, rect = TRUE, show_labels = FALSE) +
+  labs(title = "Hierarchical Clustering Dendrogram",
+       x = "Observations",
+       y = "Height")
+
+# Cut the dendrogram to obtain the desired number of clusters
+k <- 6  # You can choose the number of clusters based on the dendrogram
+clusterAssignments <- cutree(hiClust, k = k)
+
+# Add the cluster assignment to the original data
+allSiteMet <- allSiteMet %>%
+  ungroup() %>%
+  mutate(cluster = clusterAssignments)
+
+# Visualize the clusters using the first two principal components
+fviz_cluster(list(data = allSiteScaled, cluster = clusterAssignments),
+             geom = "point", ellipse.type = "norm") +
+  labs(title = "Hierarchical Clustering",
+       x = "Principal Component 1",
+       y = "Principal Component 2")
+
+# Visualize clusters based on the original features and add site names
+ggplot(allSiteMet, aes(x = minDO.pctsat, y = maxDO.pctsat, color = as.factor(cluster))) +
+  geom_point() +
+  geom_text(aes(label = Site), hjust = 1.5, vjust = 1.5) +
+  labs(title = "Clusters based on minDO.pctsat and maxDO.pctsat",
+       x = "Minimum DO % Saturation",
+       y = "Maximum DO % Saturation",
+       color = "Cluster")
+```
+
+```{r}
+# Aggregate data by site
+data_agg <- allSiteMet %>%
+  #select(Site, minDO.pctsat, maxDO.pctsat, avgDO.pctsat, DOpctsat.amp, probHypSat,  NHR_sat) %>% 
+  #select(Site, peak2zero, drying_rate, dry_dur, peak_value, peak_quantile) %>% 
+  select(-Date, -cluster) %>% 
+  filter(Site %in% c ("KMZ", "SHN", "YMR")) %>% 
+  group_by(Site) %>%
+  summarise(across(everything(), mean))
+
+# Transform data for heatmap
+heatmap_data <- data_agg %>%
+  column_to_rownames("Site")
+
+# Create heatmap
+pheatmap::pheatmap(heatmap_data, scale = "row", clustering_distance_rows = "euclidean",
+         clustering_distance_cols = "euclidean", clustering_method = "ward.D2",
+         color = colorRampPalette(c("blue", "white", "red"))(50))
+
+# Distance matrix
+dist_matrix <- dist(heatmap_data)
+
+# Hierarchical clustering
+hc <- hclust(dist_matrix, method = "ward.D2")
+
+# Plot dendrogram
+plot(hc, labels = rownames(heatmap_data), main = "Dendrogram of Sites")
+```

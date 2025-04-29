@@ -1,0 +1,412 @@
+---
+title: "GP Precip"
+author: "CLB"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+library(data.table)
+library(tidyverse, warn.conflicts = F)
+options(readr.show_col_types = F)
+library(broom)
+library(googlesheets4)
+library(ggthemes)
+library(ggpmisc)
+library(ggrepel)
+library(NatParksPalettes)
+library(ggpubr)
+library(patchwork)
+library(gridExtra)
+library(plotly)
+library(here)
+library(styler)
+library(streamMetabolizer)
+library(rstan)
+options(mc.cores = parallel::detectCores())
+library(dataRetrieval)
+library(neonUtilities)
+library(scales)
+library(knitr)
+library(lubridate)
+library(zoo)
+library(parallel)
+library(doParallel)
+library(foreach)
+library(nasapower)
+library(imputeTS)
+library(rgbif)
+library(moments)
+library(inflection)
+library(corrplot)
+library(factoextra)
+library(tidymodels)
+library(bestNormalize)
+#library(rstatix)
+library(emmeans)
+#library(infer)
+library(cluster)
+library(metScanR)
+library(stationaRy)
+library(worldmet)
+library(countyweather)
+library(rnoaa)
+options("noaakey" = Sys.getenv("noaakey"))
+library(mgcv)  # For GAMs
+source(here("Code/priceDrying.R"))
+source(here("Code/Functions/exoPipeline.R"))
+```
+
+```{r}
+siteInfo <- tibble(Site = c("KMZ", "SHN", "YMR", "OKA", "GBJ", "DRC", "JDR", "TAL", "WHR", "PRF"),
+                   Lat = c(39.092353, 39.115220, 37.56452, 34.437642, 42.78483889, 43.7184, 43.1226, 33.7621789, 32.98463, 34.968669),
+                   Long = c(-96.587238, -96.558380, -96.49102, -96.652997, -112.44484722, -116.137, -116.776, -85.595521, -88.012269, -86.165439))
+	
+siteElev <-  elevation(latitude = siteInfo$Lat, longitude = siteInfo$Long, username = "conbro") %>% 
+  select(Elev = elevation_geonames)
+siteInfo <- siteInfo %>% 
+  mutate(Elev_m = siteElev$Elev) # %>% 
+  #filter(Site != "OKA")
+```
+
+# NEON
+
+```{r}
+#| include: false
+#download data
+neonTbl <- loadByProduct(
+  dpID = "DP4.00001.001",
+  site = c("KONA", "KONZ"),
+  timeIndex = 30,
+  token = Sys.getenv("NEON_Token"),
+  include.provisional = T,
+  check.size = F
+)
+```
+
+```{r}
+neonPPT <- neonTbl$wss_daily_precip %>% 
+  select(Date = date, PPT_mm = wssPrecipTotal) %>% 
+  mutate(Date = as_date(Date)) %>% 
+  ungroup() %>% 
+  mutate(Site = "KMZ",
+        Source = "NEON")
+```
+
+```{r}
+# neonPPT <- neonPPT %>% 
+#  mutate(Year = year(Date),
+#          Period = case_when(
+#            Year < 2021 ~ "Long Term",
+#            Year == 2021 ~ "2021",
+#            Year == 2022 ~ "2022",
+#            Year == 2023 ~ "2023",
+#            Year == 2024 ~ "2024")) %>% 
+#   group_by(Period, Site) %>%
+#   arrange(desc(PPT_mm)) %>%
+#   mutate(
+#     Rank = row_number(),
+#     PPT_ExceProb = (Rank / (n() + 1)) * 100)
+# 
+# neonPPT %>% 
+#   ggplot(aes(x = PPT_ExceProb, y = PPT_mm, color = Period)) +
+#   geom_line() +
+#   scale_y_log10() +
+#   scale_color_manual(values = c("Long Term" = "#000000", "2021" = "#1B9E77", "2022" = "#D95F02", "2023" = "#7570B3", "2024" = "#E7298A")) +
+#   labs(x = "Exceedance Probability (%)",
+#        y = "Precipitation (mm)") +
+#   theme_few()+
+#   facet_wrap(~Site)
+# 
+# neonPPT %>% 
+#   filter(Date >= "2021-01-01") %>% 
+#   ggplot(aes(Date, PPT_mm)) +
+#   geom_col(color = "#0084a8") +
+#   ylab("Precipitation (mm)") +
+#   theme_few() +
+#   scale_y_reverse()+
+#   scale_x_date(labels = date_format("%b '%y")) +
+#   theme(axis.title.x = element_blank(),
+#         axis.text.x = element_text(angle = 45, hjust = 1))+
+#   facet_wrap(~Site)
+# 
+# neonPPTmonth <- neonPPT %>%
+#   mutate(Month = month(Date)) %>% 
+#   group_by(Month, Year) %>%
+#   summarise(PPT_total = sum(PPT_mm, na.rm = T)) %>% 
+#   mutate(Period = case_when(
+#            Year < 2021 ~ "Long Term",
+#            Year == 2021 ~ "2021",
+#            Year == 2022 ~ "2022",
+#            Year == 2023 ~ "2023",
+#            Year == 2024 ~ "2024")) %>% 
+#   group_by(Period, Month) %>% 
+#   summarise(PPT_avg = mean(PPT_total)) %>% 
+#   mutate(Site = "Kings/Shane (KONZ @ NEON)",
+#          Month = month.abb[Month] )
+# 
+# 
+# neonPPTmonth %>% 
+#   ggplot(aes(x = as.factor(Period), y = PPT_avg, fill = Site)) +
+#   geom_boxplot(outlier.shape = NA) +
+#   #geom_jitter()+
+#   geom_text_repel(aes(label = Month), point.size = NA, max.overlaps = 15)+
+#   scale_fill_brewer(palette = "Dark2", type = "div") +
+#   scale_y_continuous(labels = label_number())+
+#   #scale_y_log10(labels = label_number()) +
+#   labs(title = "Monthly Total Precipitation",
+#        x = "",
+#        y = "PPT (mm)") +
+#   theme_few() +
+#   theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")+
+#   facet_wrap(~Site)
+```
+
+## Calc Dist from NEON
+
+```{r}
+konz <- c(-96.563075, 39.100774)
+kona <- c(-96.612935, 39.110446)
+king <- c(-96.603829, 39.105061)
+blue <-	c(-96.624201, 34.444218)
+
+shnKonz <- as.numeric(geosphere::distm(x = konz, 
+                                  y = c(siteInfo$Long[siteInfo$Site == "SHN"],
+                                        siteInfo$Lat[siteInfo$Site == "SHN"]))) * 0.001
+
+shnKona <- as.numeric(geosphere::distm(x = kona, 
+                                  y = c(siteInfo$Long[siteInfo$Site == "SHN"],
+                                        siteInfo$Lat[siteInfo$Site == "SHN"]))) * 0.001
+
+shnKing <- as.numeric(geosphere::distm(x = king, 
+                                  y = c(siteInfo$Long[siteInfo$Site == "SHN"],
+                                        siteInfo$Lat[siteInfo$Site == "SHN"]))) * 0.001
+
+kmzKona <- as.numeric(geosphere::distm(x = konz, 
+                                  y = c(siteInfo$Long[siteInfo$Site == "KMZ"],
+                                        siteInfo$Lat[siteInfo$Site == "KMZ"]))) * 0.001
+kmzKonz <- as.numeric(geosphere::distm(x = kona, 
+                                  y = c(siteInfo$Long[siteInfo$Site == "KMZ"],
+                                        siteInfo$Lat[siteInfo$Site == "KMZ"]))) * 0.001
+
+kmzKing <- as.numeric(geosphere::distm(x = king, 
+                                  y = c(siteInfo$Long[siteInfo$Site == "KMZ"],
+                                        siteInfo$Lat[siteInfo$Site == "KMZ"]))) * 0.001
+
+okaBlue <- as.numeric(geosphere::distm(x = blue, 
+                                  y = c(siteInfo$Long[siteInfo$Site == "OKA"],
+                                        siteInfo$Lat[siteInfo$Site == "OKA"]))) * 0.001
+
+```
+
+# LTER
+
+```{r}
+knzLTER <- read_csv(here("Data/knzLTER_PPT.csv")) %>%
+  filter(Watershed %in% c("N01B", "N02B", "N4DF", "N4DU", "n01b", "n4df", "HQ")) %>%
+  mutate(Watershed = case_when(Watershed == "n01b" ~ "N01B",
+                               Watershed == "n4df" ~ "N04D - Low",
+                               Watershed == "N4DF" ~ "N04D - Low",
+                               Watershed == "N4DU" ~ "N04D - Up", T ~ Watershed))
+knzHQ <- read_csv(here("Data/knzHQ_PPT.csv"))
+
+knzLTER %>% 
+  ggplot(aes(Date, PPT_mm)) +
+  geom_col(color = "#0084a8") +
+  ylab("Precipitation (mm)") +
+  theme_few() +
+  scale_y_reverse()+
+  scale_x_date(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~Watershed, ncol = 3, scales = "free")
+
+knzHQ %>% 
+  ggplot(aes(Date, PPT_mm)) +
+  geom_col(color = "#0084a8") +
+  ylab("Precipitation (mm)") +
+  theme_few() +
+  scale_y_reverse()+
+  scale_x_date(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~Watershed, ncol = 3, scales = "free")
+```
+
+# NOAA
+
+```{r}
+#| include: false
+
+noaaStations <- ghcnd_stations() |> 
+  group_by(id, latitude, longitude, elevation, state, name, gsn_flag, wmo_id, first_year, last_year) |> 
+  summarise(
+    elements = paste(unique(element), collapse = ", "),
+    .groups = "drop"
+  )
+# Function to calculate closest station
+find_closest_station <- function(site, stations) {
+  # Get site coordinates
+  site_coords <- c(site$Long, site$Lat)
+  
+  # Calculate distances to all NOAA stations
+  distances <- geosphere::distHaversine(
+    matrix(c(stations$longitude, stations$latitude), ncol = 2),
+    site_coords
+  )
+  
+  # Find the index of the closest station
+  closest_index <- which.min(distances)
+  
+  # Return the closest station info
+  stations[closest_index, ]
+}
+
+# Apply to all sites
+closest_stations <- siteInfo %>%
+  rowwise() %>%
+  mutate(closest_station = list(find_closest_station(pick(everything()), noaaStations))) %>%
+  unnest_wider(closest_station)
+
+closest_stations <- closest_stations |> 
+  sf::st_as_sf(coords = c("longitude", "latitude"), crs = sf::st_crs(4326))
+
+library(mapview)
+noaaMap <- mapview(closest_stations, alpha.regions=0.3, color = "red", col.regions = "red") 
+noaaMap
+```
+
+```{r}
+#| include: false
+
+noaaPPT <- meteo_pull_monitors(monitors = allMetStations$id) %>%
+  left_join(allMetStations %>% select(id, Site), by = "id") %>% 
+  select(Site, Date = date, PPT_mm = prcp) %>% 
+  mutate(PPT_mm = PPT_mm/10,
+         #Temp_C = ((tmin+tmax)/2.0)/10,
+         Source = "NOAA")
+# 
+#   group_by(Period, Site) %>%
+#   arrange(desc(PPT_mm)) %>%
+#   mutate(
+#     Rank = row_number(),
+#     PPT_ExceProb = (Rank / (n() + 1)) * 100)
+```
+
+# NASA
+
+```{r}
+#| include: false
+
+nasaDat <- list()
+for (i in 1:nrow(siteInfo)) {
+  cat(paste("Downloading data for", siteInfo$Site[i], "\n"))
+
+  
+  nasaDat[[i]] <- get_power(
+    community = "ag",
+    pars = c("PRECTOTCORR"),
+    temporal_api = "daily",
+    lonlat = c(siteInfo$Long[i], siteInfo$Lat[i]),
+    dates = c("1981-01-01", "2024-09-16"),
+    site_elevation = siteInfo$Elev_m[i],
+    time_standard = "UTC"
+  )
+  nasaDat[[i]]$Site <- siteInfo$Site[i]
+  cat(paste("Finished downloading data for", siteInfo$Site[i], "\n"))
+  #Break loop on last iteration
+  if (i == nrow(siteInfo)) {
+    break
+  }
+}
+```
+
+```{r}
+nasaPPT <- do.call(rbind, nasaDat) %>% 
+  mutate(Date = as_date(YYYYMMDD)) %>% 
+  select(Site, Date, PRECTOTCORR) %>% 
+  group_by(Site, Date) %>%
+  summarize(PPT_mm = sum(PRECTOTCORR, na.rm = T)) %>% 
+  ungroup() %>% 
+  mutate(Source = "NASA")
+```
+
+# Merge All PPT Data
+
+```{r}
+allPPT <- rbind(neonPPT, nasaPPT, noaaPPT) %>% 
+  mutate(Year = year(Date),
+         Site = factor(Site, levels = siteInfo %>% arrange(desc(Lat)) %>% pull(Site)))
+
+monthlyPPT <- allPPT %>%
+  mutate(Month = month.abb[month(Date)]) %>% 
+  group_by(Month, Year, Site, Source) %>%
+  summarise(PPT_total = sum(PPT_mm, na.rm = T)) %>% 
+  mutate(Period = case_when(
+           Year < 2021 ~ "Long Term",
+           Year == 2021 ~ "2021",
+           Year == 2022 ~ "2022",
+           Year == 2023 ~ "2023",
+           Year == 2024 ~ "2024")) %>% 
+  group_by(Period, Month, Site, Source) %>% 
+  summarise(PPT_avg = mean(PPT_total)) %>% 
+  mutate(Period = factor(Period, levels = c("Long Term", "2021", "2022", "2023", "2024")))
+ 
+monthlyPPT %>% 
+  filter(Source == "NOAA") %>% 
+  ggplot(aes(x = as.factor(Period), y = PPT_avg, fill = Site)) +
+  geom_boxplot(outlier.shape = NA) +
+  #geom_jitter()+
+  geom_text_repel(aes(label = Month), point.size = NA, max.overlaps = 15)+
+  scale_y_continuous(labels = label_number())+
+  #scale_y_log10(labels = label_number()) +
+  labs(title = "Monthly Total Precipitation - NOAA",
+       x = "",
+       y = "PPT (mm)") +
+  theme_few() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")+
+  facet_wrap(~Site, ncol = 3)
+
+monthlyPPT %>% 
+  filter(Source == "NASA") %>% 
+  ggplot(aes(x = as.factor(Period), y = PPT_avg, fill = Site)) +
+  geom_boxplot(outlier.shape = NA) +
+  #geom_jitter()+
+  geom_text_repel(aes(label = Month), point.size = NA, max.overlaps = 15)+
+  scale_y_continuous(labels = label_number())+
+  #scale_y_log10(labels = label_number()) +
+  labs(title = "Monthly Total Precipitation - NASA",
+       x = "",
+       y = "PPT (mm)") +
+  theme_few() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")+
+  facet_wrap(~Site, ncol = 3)
+
+monthlyPPT %>% 
+  filter(Source == "NEON") %>% 
+  ggplot(aes(x = as.factor(Period), y = PPT_avg, fill = Site)) +
+  geom_boxplot(outlier.shape = NA) +
+  #geom_jitter()+
+  geom_text_repel(aes(label = Month), point.size = NA, max.overlaps = 15)+
+  scale_y_continuous(labels = label_number())+
+  #scale_y_log10(labels = label_number()) +
+  labs(title = "Monthly Total Precipitation - NEON",
+       x = "",
+       y = "PPT (mm)") +
+  theme_few() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")+
+  facet_wrap(~Site, ncol = 3)
+
+allPPT %>% 
+  filter(Year >= "2021" & Source == "NOAA") %>% 
+  ggplot(aes(Date, PPT_mm)) +
+  geom_col(color = "#0084a8") +
+  ylab("Precipitation (mm)") +
+  theme_few() +
+  scale_y_reverse()+
+  scale_x_date(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~Site, ncol = 3, scales = "free")
+```

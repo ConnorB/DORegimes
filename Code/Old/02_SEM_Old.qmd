@@ -1,0 +1,783 @@
+---
+title: "02_SEM"
+author: "CLB"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+library(here)
+source(here("Code/paths+packages.R"))
+library(sf)
+library(preMetabolizer)
+library(furrr)
+library(PerformanceAnalytics)
+library(corrr)
+library(cluster)
+library(factoextra)
+library(lavaan)
+library(beepr)
+library(glue)
+library(cowplot)
+library(ggExtra)
+library(piecewiseSEM)
+library(lme4)
+library(caret)
+library(randomForest)
+library(easystats)
+set.seed(4) # For reproducibility
+gpSites <- c("#1b9e77", "#d95f02", "#7570b3")
+```
+
+# Load data
+
+```{r}
+sheet_id <- "1uQquFaVpRFs5y4UDBrqKtq1Oo3dW7zXLwFoIv-gle6g"
+sheet_names <- c("Talladega", "Paint Rock", "Weyerhaeuser")
+
+all_sheets <- map(sheet_names, \(name) {
+  read_sheet(sheet_id, sheet = name, col_types = "c") |>
+    mutate(Site = name)
+})
+
+seMaint <- bind_rows(all_sheets) |> 
+    janitor::clean_names() |> 
+  mutate(
+    temp_c = coalesce(temp_c, temperature_c),
+    stage_m = coalesce(staff_gauge_height_m, staff_gauge_height),
+    # Safely combine date + time
+    Date = mdy(date)
+  ) |> 
+  select(Site = site, Date, connected = connected_and_flowing, upstream = upstream_tribs_flowing, site_notes, do_mg_l, stage_m, temp_c) |> 
+  mutate(
+    connected = str_to_lower(connected),
+    upstream = str_to_lower(upstream),
+    flow_state = case_when(
+      connected == "yes" ~ "Flowing",
+      connected == "no" & upstream == "yes" ~ "Pooled",
+      connected == "no" & upstream == "no" ~ "Dry",
+      TRUE ~ NA_character_
+    )
+  ) |> 
+  mutate(
+    flow_state = case_when(
+      (flow_state %in% c("Dry", NA)) &
+        str_detect(str_to_lower(site_notes), "\\b(flow|flowing|pool|pooled|isolated|low)\\b") ~ "Pooled",
+      TRUE ~ flow_state
+    )
+  ) |> 
+  select(Site, Date, wetQf = flow_state) |> 
+  mutate(
+    Site = case_when(
+      str_starts(Site, "T") ~ "TAL",
+      str_starts(Site, "W") ~ "WHR",
+      str_starts(Site, "P") ~ "PRF",
+      TRUE ~ NA_character_
+    ))
+```
+
+```{r}
+sites <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Sites")
+streams <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Streams")
+
+flowObs <- read_csv(here("Metadata/FlowObs.csv"))
+
+streamLight <- read_csv(here("Data/streamLight/predLight/all_sites_results.csv")) |> 
+  rename(Site = Site_ID) |> 
+  mutate(
+    Date = as_date(local_time),
+    Site = case_when(
+    Site == "SFM01" ~ "KNZ",
+    Site == "SHM01" ~ "SHN",
+    Site == "ENM01" ~ "YMR",
+    TRUE ~ Site  # keep other values unchanged
+  )) |> 
+    group_by(Site, Date) |>
+  summarise(maxPar = max(PAR_surface, na.rm = TRUE),
+            avgPar = mean(PAR_surface, na.rm = TRUE),
+            .groups = "drop")
+
+gpDat <- fread(here("Data/GP_dailyData.csv")) |> 
+  select(-minDO.obs, -maxDO.obs, -avgDO.obs, -DO.hyp, -DO.amp, -probHyp, -dayProbConc, -nightProbConc, -NHR_obs, -dPercCon, -wetdry_SW) |> 
+  mutate(Date = as_date(Date)) |> 
+  left_join(streamLight, by = c("Site", "Date")) 
+seDat <- fread(here("Data/SE_dailyData.csv")) |> 
+  select(-minDO.obs, -maxDO.obs, -avgDO.obs, -DO.hyp, -DO.amp, -probHyp, -dayProbConc, -nightProbConc, -NHR_obs) |> 
+  mutate(Date = as_date(Date)) |> 
+  full_join(seMaint)
+
+allDat <- gpDat |> 
+  full_join(seDat) |> 
+  select(-excProb, -DOSat.exc) |> 
+  mutate(waterYear = as.factor(calcWaterYear(Date)),
+         Season = as.factor(get_season(Date)),
+         Date = as.Date(Date),
+         DOY = as.numeric(format(Date, "%j")),
+         DOY_sin = sin(2 * pi * DOY / (365 + leap_year(Date))),
+         DOY_cos = cos(2 * pi * DOY / (365 + leap_year(Date)))
+         ) |> 
+  select(-totalDO) |> 
+    group_by(Site) |> 
+    mutate(excProb = calc_exceedance_prob(Q_1d, rm.Zero = T),
+           DOSat.exc = calc_exceedance_prob(avgDO.pctsat, rm.Zero = T)) |> 
+    ungroup()
+
+dailyHydro <- allDat|>
+  select(Site, Date, wetQf, PercWet_1d, PercWet_7d, PercWet_14d, PercWet_30d, PercWet_60d,
+         dPercWet_1d, dPercWet_7d, dPercWet_14d, dPercWet_30d, dPercWet_60d,
+         minDepth, maxDepth, Depth_1d, Depth_7d, Depth_14d, Depth_30d, Depth_60d,
+         minQ, maxQ, Q_1d, Q_7d, Q_14d, Q_30d, Q_60d, excProb,
+         PPT_1d, PPT_7d, PPT_14d, PPT_30d, PPT_60d,
+         AlphaCentrality, upstream_length, percentConnected, DOY_sin, DOY_cos)
+
+dailyDat <- allDat |> 
+  drop_na(avgDO.pctsat)
+
+#rm(list = setdiff(ls(), c("dailyDat", "allDat")))
+#gc()
+```
+
+# P-SEM
+
+## BRMS
+
+```{r}
+library(brms)
+semDat <- dailyDat |>
+  filter(Site %in% c("KNZ", "SHN", "YMR", "TAL")) |> 
+  group_by(Site) |>
+  complete(Date = seq(min(Date), max(Date), by = "day")) |> 
+  arrange(Date) |>
+  mutate(
+    cont_time = numFactor(as.numeric(Date - min(Date)))# Numeric time
+  ) |> 
+  ungroup() |> 
+  #mutate(Site = factor(Site)) |>
+  # Add global scaling across all sites for numeric predictors
+  ungroup() |> 
+  mutate(across(
+    where(is.numeric) & !starts_with(c("DOY","DOY_cos", "DOY_sin", "cont_time")), 
+    ~ (. - mean(., na.rm = TRUE)) / sd(., na.rm = TRUE), 
+    .names = "{.col}"
+  ))
+
+
+# Base linear model
+mod_PPT_1d <- lm(PPT_1d ~ DOY_sin + DOY_cos, data = semDat)
+
+mod_avgPar <- brm(
+  avgPar ~ PPT_1d + DOY_sin + DOY_cos + (1 | Site) + gp(cont_time, by = Site),
+  data = semDat,
+  family = gaussian(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  cores = 4,
+  iter = 2000
+)
+
+mod_water.temp <- brm(
+  water.temp ~ avgPar + PPT_1d + DOY_sin + DOY_cos + gp(cont_time, by = Site),
+  data = semDat,
+  family = gaussian(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  cores = 4,
+  iter = 2000
+)
+
+mod_Depth_1d <- brm(
+  Depth_1d ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos +
+    excProb + headGradient_1d + percentConnected + AlphaCentrality +
+    upstream_length + PercWet_1d + (1 | Site) + gp(cont_time, by = Site),
+  data = semDat,
+  family = gaussian(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  cores = 4,
+  iter = 2000
+)
+
+mod_excProb <- brm(
+  excProb ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos +
+    percentConnected + AlphaCentrality + upstream_length + PercWet_1d + 
+    (1 | Site) + gp(cont_time, by = Site),
+  data = semDat,
+  family = gaussian(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  cores = 4,
+  iter = 2000
+)
+
+mod_headGradient_1d <- brm(
+  headGradient_1d ~ avgPar + water.temp + PPT_1d + DOY_sin + DOY_cos +
+    percentConnected + AlphaCentrality + upstream_length + PercWet_1d +
+    (1 | Site) + gp(cont_time, by = Site),
+  data = semDat,
+  family = gaussian(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  cores = 4,
+  iter = 2000
+)
+
+mod_percentConnected <- brm(
+  percentConnected ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos + gp(cont_time, by = Site),
+  data = semDat,
+  family = gaussian(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  cores = 4,
+  iter = 2000
+)
+
+mod_AlphaCentrality <- brm(
+  AlphaCentrality ~ water.temp + avgPar + percentConnected + PPT_1d +
+    DOY_sin + DOY_cos + gp(cont_time, by = Site),
+  data = semDat,
+  family = gaussian(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  cores = 4,
+  iter = 2000
+)
+
+mod_upstream_length <- brm(
+  upstream_length ~ water.temp + avgPar + AlphaCentrality + percentConnected +
+    PPT_1d + DOY_sin + DOY_cos + (1 | Site) + gp(cont_time, by = Site),
+  data = semDat,
+  family = gaussian(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  cores = 4,
+  iter = 2000
+)
+
+mod_PercWet_1d <- brm(
+  PercWet_1d ~ water.temp + avgPar + percentConnected + upstream_length +
+    AlphaCentrality + PPT_1d + DOY_sin + DOY_cos + gp(cont_time, by = Site),
+  data = semDat,
+  family = gaussian(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  cores = 4,
+  iter = 2000
+)
+
+mod_DOSat.exc <- brm(
+  DOSat.exc ~ water.temp + PPT_1d + Depth_1d + excProb + percentConnected +
+    AlphaCentrality + upstream_length + PercWet_1d + headGradient_1d +
+    avgPar + DOY_sin + DOY_cos + gp(cont_time, by = Site),
+  data = semDat,
+  family = gaussian(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  cores = 4,
+  iter = 2000
+)
+
+mod_DOpctsat.amp <- brm(
+  DOpctsat.amp ~ DOSat.exc + water.temp + PPT_1d + Depth_1d +
+    excProb + percentConnected + AlphaCentrality + upstream_length +
+    PercWet_1d + headGradient_1d + avgPar + DOY_sin + DOY_cos +
+    (1 | Site) + gp(cont_time, by = Site),
+  data = semDat,
+  family = gaussian(),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  cores = 4,
+  iter = 2000
+)
+```
+
+## glmmTMB
+
+```{r}
+source(here("Code/Functions/prune_sem.R"))
+library(glmmTMB)
+
+# Then modify your data preparation code
+semDat <- dailyDat |>
+  filter(Site %in% c("KNZ", "SHN", "YMR", "TAL")) |> 
+  group_by(Site) |>
+  complete(Date = seq(min(Date), max(Date), by = "day")) |> 
+  arrange(Date) |>
+  mutate(
+    cont_time = numFactor(as.numeric(Date - min(Date)))# Numeric time
+  ) |> 
+  ungroup() |> 
+  #mutate(Site = factor(Site)) |>
+  # Add global scaling across all sites for numeric predictors
+  ungroup() |> 
+  mutate(across(
+    where(is.numeric) & !starts_with(c("DOY","DOY_cos", "DOY_sin", "cont_time")), 
+    ~ (. - mean(., na.rm = TRUE)) / sd(., na.rm = TRUE), 
+    .names = "{.col}"
+  ))
+
+# Base linear model
+mod_PPT_1d <- lm(PPT_1d ~ DOY_sin + DOY_cos, data = semDat)
+
+mod_avgPar <- glmmTMB(
+  avgPar ~ PPT_1d + DOY_sin + DOY_cos + (1 | Site) + ou(cont_time + 0 | Site),
+  data = semDat,
+  sparseX = c(cond = TRUE),
+  control = glmmTMBControl(
+    optimizer = optim,
+    optArgs = list(method = "BFGS", maxit = 1000)
+    )
+)
+
+mod_water.temp <- glmmTMB(
+  water.temp ~ avgPar + PPT_1d + DOY_sin + DOY_cos + ou(cont_time + 0 | Site),
+  data = semDat,
+  sparseX = c(cond = TRUE),
+  control = glmmTMBControl(
+    optimizer = optim,
+    optArgs = list(method = "BFGS", maxit = 1000)
+    )
+  )
+
+mod_Depth_1d <- glmmTMB(
+  Depth_1d ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos +
+    excProb + headGradient_1d + percentConnected + AlphaCentrality +
+    upstream_length + PercWet_1d + (1 | Site) + ou(cont_time + 0 | Site),
+  data = semDat,
+  sparseX = c(cond = TRUE),
+  control = glmmTMBControl(
+    optimizer = optim,
+    optArgs = list(method = "BFGS", maxit = 1000)
+    )
+  )
+
+mod_excProb <- glmmTMB(
+  excProb ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos +
+    percentConnected + AlphaCentrality + upstream_length + PercWet_1d + 
+    (1 | Site) + ou(cont_time + 0 | Site),
+  data = semDat,
+  sparseX = c(cond = TRUE),
+  control = glmmTMBControl(
+    optimizer = optim,
+    optArgs = list(method = "BFGS", maxit = 1000)
+    )
+  )
+
+mod_headGradient_1d <- glmmTMB(
+  headGradient_1d ~ avgPar + water.temp + PPT_1d + DOY_sin + DOY_cos +
+    percentConnected + AlphaCentrality + upstream_length + PercWet_1d +
+    (1 | Site) + ou(cont_time + 0 | Site),
+  data = semDat,
+  sparseX = c(cond = TRUE),
+  control = glmmTMBControl(
+    optimizer = optim,
+    optArgs = list(method = "BFGS", maxit = 1000)
+    )
+  )
+
+mod_percentConnected <- glmmTMB(
+  percentConnected ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos + ou(cont_time + 0 | Site),
+  data = semDat,
+  sparseX = c(cond = TRUE),
+  control = glmmTMBControl(
+    optimizer = optim,
+    optArgs = list(method = "BFGS", maxit = 1000)
+    )
+  )
+
+mod_AlphaCentrality <- glmmTMB(
+  AlphaCentrality ~ water.temp + avgPar + percentConnected + PPT_1d +
+    DOY_sin + DOY_cos + ou(cont_time + 0 | Site),
+  data = semDat,
+  sparseX = c(cond = TRUE),
+  control = glmmTMBControl(
+    optimizer = optim,
+    optArgs = list(method = "BFGS", maxit = 1000)
+    )
+  )
+
+mod_upstream_length <- glmmTMB(
+  upstream_length ~ water.temp + avgPar + AlphaCentrality + percentConnected +
+    PPT_1d + DOY_sin + DOY_cos + (1 | Site) + ou(cont_time + 0 | Site),
+  data = semDat,
+  sparseX = c(cond = TRUE),
+  control = glmmTMBControl(
+    optimizer = optim,
+    optArgs = list(method = "BFGS", maxit = 1000)
+    )
+  )
+
+mod_PercWet_1d <- glmmTMB(
+  PercWet_1d ~ water.temp + avgPar + percentConnected + upstream_length +
+    AlphaCentrality + PPT_1d + DOY_sin + DOY_cos + ou(cont_time + 0 | Site),
+  data = semDat,
+  sparseX = c(cond = TRUE),
+  control = glmmTMBControl(
+    optimizer = optim,
+    optArgs = list(method = "BFGS", maxit = 1000)
+    )
+  )
+
+mod_DOSat.exc <- glmmTMB(
+  DOSat.exc ~ water.temp + PPT_1d + Depth_1d + excProb + percentConnected +
+    AlphaCentrality + upstream_length + PercWet_1d + headGradient_1d +
+    avgPar + DOY_sin + DOY_cos + ou(cont_time + 0 | Site),
+  data = semDat,
+  sparseX = c(cond = TRUE),
+  control = glmmTMBControl(
+    optimizer = optim,
+    optArgs = list(method = "BFGS", maxit = 1000)
+    )
+  )
+
+mod_DOpctsat.amp <- glmmTMB(
+  DOpctsat.amp ~ DOSat.exc + water.temp + PPT_1d + Depth_1d +
+    excProb + percentConnected + AlphaCentrality + upstream_length +
+    PercWet_1d + headGradient_1d + avgPar + DOY_sin + DOY_cos +
+    (1 | Site) + ou(cont_time + 0 | Site),
+  data = semDat,
+  sparseX = c(cond = TRUE),
+  control = glmmTMBControl(
+    optimizer = optim,
+    optArgs = list(method = "BFGS", maxit = 1000)
+    )
+  )
+
+```
+
+## Check Models
+
+```{r}
+# check_convergence(mod_PPT_1d)
+# check_convergence(mod_avgPar)
+# check_convergence(mod_water.temp)
+# check_convergence(mod_Depth_1d)
+# check_convergence(mod_excProb)
+# check_convergence(mod_headGradient_1d)
+# check_convergence(mod_percentConnected)
+# check_convergence(mod_AlphaCentrality)
+# check_convergence(mod_upstream_length)
+# check_convergence(mod_PercWet_1d)
+# check_convergence(mod_DOSat.exc)
+# check_convergence(mod_DOpctsat.amp)
+# 
+# 
+# check_model(mod_PPT_1d)
+# check_model(mod_avgPar)
+# check_model(mod_water.temp)
+# check_model(mod_Depth_1d)
+# check_model(mod_excProb)
+# check_model(mod_headGradient_1d)
+# check_model(mod_percentConnected)
+# check_model(mod_AlphaCentrality)
+# check_model(mod_upstream_length)
+# check_model(mod_PercWet_1d)
+# check_model(mod_DOSat.exc)
+# check_model(mod_DOpctsat.amp)
+# 
+# 
+# check_autocorrelation(mod_PPT_1d)
+# check_autocorrelation(mod_avgPar)
+# check_autocorrelation(mod_water.temp)
+# check_autocorrelation(mod_Depth_1d)
+# check_autocorrelation(mod_excProb)
+# check_autocorrelation(mod_headGradient_1d)
+# check_autocorrelation(mod_percentConnected)
+# check_autocorrelation(mod_AlphaCentrality)
+# check_autocorrelation(mod_upstream_length)
+# check_autocorrelation(mod_PercWet_1d)
+# check_autocorrelation(mod_DOSat.exc)
+# check_autocorrelation(mod_DOpctsat.amp)
+# 
+# check_heteroscedasticity(mod_DOpctsat.amp)
+```
+
+```{r}
+# Remove ordered factor from cont time
+# semDat_clean <- semDat |>
+#   dplyr::mutate(
+#     cont_time = as.character(cont_time),
+#     across(where(~ length(class(.)) > 1), ~ as.character(.))
+#   ) |>
+#   droplevels()
+
+
+sem_mod_glmm <- psem(
+  PPT_1d = mod_PPT_1d,                    # lm object
+  avgPar = mod_avgPar,                    # glmmTMB fitted model
+  water.temp = mod_water.temp,
+  Depth_1d = mod_Depth_1d,
+  excProb = mod_excProb,
+  headGradient_1d = mod_headGradient_1d,
+  percentConnected = mod_percentConnected,
+  AlphaCentrality = mod_AlphaCentrality,
+  upstream_length = mod_upstream_length,
+  PercWet_1d = mod_PercWet_1d,
+  DOSat.exc = mod_DOSat.exc,
+  DOpctsat.amp = mod_DOpctsat.amp,
+  data = semDat
+)
+sem_summary_glmm <- summary(sem_mod_glmm)
+plot_sem_graph(sem_summary, file = "~/Desktop/origSem_glmm.png")
+```
+
+## LME
+
+```{r}
+library(nlme)
+
+PPT_1d <- lm(PPT_1d ~ DOY_sin + DOY_cos, 
+              data = semDat)
+# Metabolism/Light
+avgPar <- lme(
+  avgPar ~ PPT_1d + DOY_sin + DOY_cos,
+  random = ~1 | Site,
+  correlation = corCAR1(form = ~Date | Site),
+  data = semDat,
+  na.action = na.omit
+)
+
+# Water temperature
+water.temp <- lme(
+  water.temp ~ avgPar + PPT_1d + DOY_sin + DOY_cos,
+  random = ~1 | Site,
+  correlation = corCAR1(form = ~Date | Site),
+  data = semDat,
+  na.action = na.omit
+)
+
+# Depth
+Depth_1d <- lme(
+  Depth_1d ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos +
+    excProb + headGradient_1d + percentConnected + AlphaCentrality +
+    upstream_length + PercWet_1d,
+  random = ~1 | Site,
+  correlation = corCAR1(form = ~Date | Site),
+  data = semDat,
+  na.action = na.omit
+)
+
+# Discharge
+excProb <- lme(
+  excProb ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos +
+    percentConnected + AlphaCentrality + upstream_length + PercWet_1d,
+  random = ~1 | Site,
+  correlation = corCAR1(form = ~Date | Site),
+  data = semDat,
+  na.action = na.omit
+)
+
+# Groundwater inputs
+headGradient_1d <- lme(
+  headGradient_1d ~ avgPar + water.temp + PPT_1d + DOY_sin + DOY_cos +
+    percentConnected + AlphaCentrality + upstream_length + PercWet_1d,
+  random = ~1 | Site,
+  correlation = corCAR1(form = ~Date | Site),
+  data = semDat,
+  na.action = na.omit
+)
+
+# Network connectivity
+percentConnected <- lme(
+  percentConnected ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos,
+  random = ~1 | Site,
+  correlation = corCAR1(form = ~Date | Site),
+  data = semDat,
+  na.action = na.omit
+)
+
+AlphaCentrality <- lme(
+  AlphaCentrality ~ water.temp + avgPar + percentConnected +
+    PPT_1d + DOY_sin + DOY_cos,
+  random = ~1 | Site,
+  correlation = corCAR1(form = ~Date | Site),
+  data = semDat,
+  na.action = na.omit
+)
+
+upstream_length <- lme(
+  upstream_length ~ water.temp + avgPar + AlphaCentrality + percentConnected +
+    PPT_1d + DOY_sin + DOY_cos,
+  random = ~1 | Site,
+  correlation = corCAR1(form = ~Date | Site),
+  data = semDat,
+  na.action = na.omit
+)
+
+PercWet_1d <- lme(
+  PercWet_1d ~ water.temp + avgPar + percentConnected + upstream_length +
+    AlphaCentrality + PPT_1d + DOY_sin + DOY_cos,
+  random = ~1 | Site,
+  correlation = corCAR1(form = ~Date | Site),
+  data = semDat,
+  na.action = na.omit
+)
+
+# DO responses
+DOSat.exc <- lme(
+  DOSat.exc ~ water.temp + PPT_1d + Depth_1d + excProb + percentConnected +
+    AlphaCentrality + upstream_length + PercWet_1d + headGradient_1d +
+    avgPar + DOY_sin + DOY_cos,
+  random = ~1 | Site,
+  correlation = corCAR1(form = ~Date | Site),
+  data = semDat,
+  na.action = na.omit
+)
+
+DOpctsat.amp <- lme(
+  DOpctsat.amp ~ DOSat.exc + water.temp + PPT_1d + Depth_1d + excProb + percentConnected + AlphaCentrality + 
+    upstream_length + PercWet_1d + headGradient_1d + avgPar + DOY_sin + DOY_cos,
+                 random = ~1|Site,
+                 correlation = corCAR1(form = ~Date|Site),
+                 data = semDat,
+  na.action = na.omit)
+
+```
+
+```{r}
+check_model(PPT_1d)
+check_model(water.temp)
+check_model(Depth_1d)
+check_model(excProb)
+check_model(headGradient_1d)
+check_model(percentConnected)
+check_model(AlphaCentrality)
+check_model(upstream_length)
+check_model(PercWet_1d)
+check_model(DOSat.exc)
+check_model(DOpctsat.amp)
+
+
+
+check_autocorrelation(PPT_1d)
+check_autocorrelation(water.temp)
+check_autocorrelation(Depth_1d)
+check_autocorrelation(excProb)
+check_autocorrelation(headGradient_1d)
+check_autocorrelation(percentConnected)
+check_autocorrelation(AlphaCentrality)
+check_autocorrelation(upstream_length)
+check_autocorrelation(PercWet_1d)
+check_autocorrelation(DOSat.exc)
+check_autocorrelation(DOpctsat.amp)
+```
+
+## Build SEM
+
+```{r}
+sem_model <- psem(
+  PPT_1d = lm(PPT_1d ~ DOY_sin + DOY_cos, 
+              data = semDat),
+  # Metabolism/Light
+  avgPar = lme(
+    avgPar ~ PPT_1d + DOY_sin + DOY_cos,
+    random = ~1 | Site,
+    correlation = corCAR1(form = ~Date | Site),
+    data = semDat,
+    na.action = na.omit
+  ),
+  
+  # Water temperature
+  water.temp = lme(
+    water.temp ~ avgPar + PPT_1d + DOY_sin + DOY_cos,
+    random = ~1 | Site,
+    correlation = corCAR1(form = ~Date | Site),
+    data = semDat,
+    na.action = na.omit
+  ),
+  
+  # Depth
+  Depth_1d = lme(
+    Depth_1d ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos +
+      excProb + headGradient_1d + percentConnected + AlphaCentrality +
+      upstream_length + PercWet_1d,
+    random = ~1 | Site,
+    correlation = corCAR1(form = ~Date | Site),
+    data = semDat,
+    na.action = na.omit
+  ),
+  
+  # Discharge
+  excProb = lme(
+    excProb ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos +
+      percentConnected + AlphaCentrality + upstream_length + PercWet_1d,
+    random = ~1 | Site,
+    correlation = corCAR1(form = ~Date | Site),
+    data = semDat,
+    na.action = na.omit
+  ),
+  
+  # Groundwater inputs
+  headGradient_1d = lme(
+    headGradient_1d ~ avgPar + water.temp + PPT_1d + DOY_sin + DOY_cos +
+      percentConnected + AlphaCentrality + upstream_length + PercWet_1d,
+    random = ~1 | Site,
+    correlation = corCAR1(form = ~Date | Site),
+    data = semDat,
+    na.action = na.omit
+  ),
+  
+  # Network connectivity
+  percentConnected = lme(
+    percentConnected ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos,
+    random = ~1 | Site,
+    correlation = corCAR1(form = ~Date | Site),
+    data = semDat,
+    na.action = na.omit
+  ),
+  
+  AlphaCentrality = lme(
+    AlphaCentrality ~ water.temp + avgPar + percentConnected +
+      PPT_1d + DOY_sin + DOY_cos,
+    random = ~1 | Site,
+    correlation = corCAR1(form = ~Date | Site),
+    data = semDat,
+    na.action = na.omit
+  ),
+  
+  upstream_length = lme(
+    upstream_length ~ water.temp + avgPar + AlphaCentrality + percentConnected +
+      PPT_1d + DOY_sin + DOY_cos,
+    random = ~1 | Site,
+    correlation = corCAR1(form = ~Date | Site),
+    data = semDat,
+    na.action = na.omit
+  ),
+  
+  PercWet_1d = lme(
+    PercWet_1d ~ water.temp + avgPar + percentConnected + upstream_length +
+      AlphaCentrality + PPT_1d + DOY_sin + DOY_cos,
+    random = ~1 | Site,
+    correlation = corCAR1(form = ~Date | Site),
+    data = semDat,
+    na.action = na.omit
+  ),
+  
+  # DO responses
+  DOSat.exc = lme(
+    DOSat.exc ~ water.temp + PPT_1d + Depth_1d + excProb + percentConnected +
+      AlphaCentrality + upstream_length + PercWet_1d + headGradient_1d +
+      avgPar + DOY_sin + DOY_cos,
+    random = ~1 | Site,
+    correlation = corCAR1(form = ~Date | Site),
+    data = semDat,
+    na.action = na.omit,
+    keep.data = F
+  ),
+  
+  DOpctsat.amp = lme(
+    DOpctsat.amp ~ DOSat.exc + water.temp + PPT_1d + Depth_1d + excProb + percentConnected + AlphaCentrality + 
+      upstream_length + PercWet_1d + headGradient_1d + avgPar + DOY_sin + DOY_cos,
+    random = ~1|Site,
+    correlation = corCAR1(form = ~Date|Site),
+    data = semDat,
+    na.action = na.omit),
+  data = semDat
+)
+
+sem_summary <- summary(sem_model)
+plot_sem_graph(sem_summary, file = "~/Desktop/origSem_autoCor.png")
+```
+
+# Prune
+
+```{r}
+pruned_sem <- prune_sem(
+  sem_model = sem_model,
+  data = semDat,
+  alpha = 0.05,
+  max_iter = 100
+  )
+
+pruned_summary <- summary(pruned_sem)
+plot_sem_graph(pruned_summary, file = "~/Desktop/prunedSem.png")
+```

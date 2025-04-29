@@ -1,0 +1,489 @@
+---
+title: "Kings Creek Discharge"
+author: "CLB"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+library(data.table)
+library(tidyverse, warn.conflicts = F)
+options(readr.show_col_types = F)
+library(broom)
+library(googlesheets4)
+library(ggthemes)
+library(ggpmisc)
+library(ggpubr)
+library(patchwork)
+library(plotly)
+library(here)
+library(styler)
+library(streamMetabolizer)
+library(rstan)
+options(mc.cores = parallel::detectCores())
+library(dataRetrieval)
+library(scales)
+library(knitr)
+library(lubridate)
+library(zoo)
+library(parallel)
+library(doParallel)
+library(foreach)
+library(nasapower)
+library(imputeTS)
+library(rgbif)
+library(moments)
+source(here("Code/priceDrying.R"))
+source(here("Code/Functions/exoPipeline.R"))
+```
+
+# Get Data
+
+```{r}
+#Get discharge data from NWIS
+rawKingsQ <- readNWISdv(siteNumbers = "06879650",
+                     parameterCd = "00060",
+                     startDate = "1979-04-11", 
+                     endDate = today()) 
+```
+
+# Exceedance Probability by Year
+
+```{r}
+kingsQExcProb <- renameNWISColumns(rawKingsQ) %>% 
+  select(-agency_cd, -Flow_cd) %>% 
+  rename(FlowCFS = Flow) %>% #Label discharge units (cubic feet per second)
+  mutate(
+    FlowCMS = FlowCFS * 0.028316847,#cfs to cms
+    FlowCMS = na.approx(FlowCMS, maxgap = 6, na.rm = F),
+    Year = year(Date),
+    Period = case_when(Year <= 2020 ~ "1980-2020",
+                       Year == 2021 ~ "2021",
+                       Year == 2022 ~ "2022",
+                       Year == 2023 ~ "2023",
+                       Year == 2024 ~ "2024")) %>% 
+  group_by(Period) %>%
+  arrange(desc(FlowCMS),, .by_group = TRUE) %>%
+  mutate(
+    Rank = row_number(),
+    ExceedanceProbability = (Rank / (n() + 1)) * 100,
+    Site = "Kings Creek")
+
+kingsQExcProb %>%
+  ggplot(aes(Date, FlowCMS)) +
+  geom_line(color = "#0084a8") +
+  geom_rect(data = kingsQExcProb %>% filter(FlowCMS <= 0), aes(xmin = Date, xmax = Date + 1, ymin = -Inf, ymax = +Inf),
+    fill = "#ff7f50",
+    alpha = 0.1) +
+  labs(x = "",
+       y = expression(Discharge~("m"^3*"s"^{-1})))+
+  theme_few() +
+  scale_x_date(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+kingsQExcProb %>%
+  ggplot(aes(Date, FlowCMS)) +
+  geom_line(color = "#0084a8") +
+  geom_rect(data = kingsQExcProb %>% filter(FlowCMS <= 0),
+            aes(xmin = Date, xmax = Date + 1),
+            ymin = -Inf, ymax = Inf,
+            fill = "#ff7f50",
+            alpha = 0.1,
+            inherit.aes = FALSE) +
+  labs(x = "",
+       y = expression(Discharge~("m"^3*"s"^{-1}))) +
+  theme_few() +
+  scale_x_date(labels = date_format("%b '%y")) +
+  scale_y_continuous(trans = "log1p") +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+kingsQExcProb %>% 
+  ggplot(aes(x = ExceedanceProbability, y = FlowCMS, color = Period)) +
+  geom_line() +
+  scale_y_log10(labels = label_number()) +
+  scale_color_manual(values = c("1980-2020" = "black", "2021" = "#1B9E77", "2022" = "#D95F02", "2023" = "#7570B3", "2024" = "#E7298A")) +
+  labs(title = "Kings Creek",
+       x = "Exceedance Probability (%)",
+       y = expression(Discharge~("m"^3*"s"^{-1}))) +
+  theme_few()
+```
+
+```{r}
+kingsQ <- renameNWISColumns(rawKingsQ) %>% 
+  select(-agency_cd, -Flow_cd) %>% 
+  rename(FlowCFS = Flow) %>% 
+  mutate(
+    FlowCMS = FlowCFS * 0.028316847,
+    FlowCMS = na.approx(FlowCMS, maxgap = 6, na.rm = F),
+    Year = year(Date),
+    DOY = yday(Date),
+    Month = month(Date, label = TRUE, abbr = TRUE),
+    DateForPlot = as.Date(paste("2020", DOY), format = "%Y %j"),
+    Period = case_when(Year <= 2020 ~ "1980-2020",
+                       Year == 2021 ~ "2021",
+                       Year == 2022 ~ "2022",
+                       Year == 2023 ~ "2023",
+                       Year == 2024 ~ "2024")
+  ) %>% 
+  group_by(Period) %>%
+  mutate(
+    TotalYearlyQ = sum(FlowCMS, na.rm = TRUE),
+    CumulativeQ = cumsum(FlowCMS),
+    CumulativeProp = CumulativeQ / TotalYearlyQ
+  ) %>% 
+  ungroup() %>%
+  group_by(DOY) %>%
+  mutate(MeanQ = mean(FlowCMS, na.rm = TRUE),
+         MedianQ = median(FlowCMS, na.rm = T)) %>%
+  ungroup()
+
+# Calculate low flow statistics
+kingsLowFlow <- kingsQ %>%
+  mutate(WaterYear = calcWaterYear(Date)) %>% 
+  group_by(WaterYear) %>%
+  summarize(
+    WetDays = sum(FlowCMS > 0, na.rm = TRUE),
+    DryDays = sum(FlowCMS == 0, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# Calculate the cumulative discharge for each day of the year, the total discharge for each year, merge the total discharge with the original data, calculate the relative cumulative discharge, and find the date of the center of mass (50% cumulative discharge) all in one go.
+
+q50perc <- kingsQ %>%
+  mutate(
+    CumulativeQ = cumsum(FlowCMS),
+    TotalQ = sum(FlowCMS, na.rm = TRUE),
+    RelativeCumulativeQ = CumulativeQ / TotalQ
+  ) %>%
+  summarize(CentroidDOY = DOY[which.min(abs(RelativeCumulativeQ - 0.5))])
+
+q50percAIMS <- kingsQ %>%
+  group_by(Year) %>%
+  filter(Year >= 2021) %>% 
+  mutate(
+    CumulativeQ = cumsum(FlowCMS),
+    TotalQ = sum(FlowCMS, na.rm = TRUE),
+    RelativeCumulativeQ = CumulativeQ / TotalQ
+  ) %>%
+  ungroup() %>%
+  group_by(Year) %>%
+  summarize(CentroidDOY = DOY[which.min(abs(RelativeCumulativeQ - 0.5))]) %>%
+  ungroup() %>% 
+  mutate(CentroidDate = as.Date(paste("2020", CentroidDOY), format = "%Y %j"))
+```
+
+```{r}
+ggplot() +
+  geom_line(data = kingsQ %>% filter(Year != 2024), aes(x = DateForPlot, y = FlowCMS, group = Year), color = "grey", alpha = 0.5) +
+  geom_line(data = kingsQ %>% filter(Year == 2024), aes(x = DateForPlot, y = FlowCMS, group = Year), color = "black") +
+  geom_line(data = kingsQ, aes(x = DateForPlot, y = MeanQ), color = "red", alpha = 0.5) +
+  geom_line(data = kingsQ, aes(x = DateForPlot, y = MedianQ), color = "blue", alpha = 0.5) +
+  scale_x_date(date_labels = "%b", date_breaks = "1 month") +
+  scale_y_continuous(trans = "log1p") +
+  labs(x = "",
+       y = expression(Discharge~("m"^3*"s"^{-1}))) +
+  theme_few()
+
+ggplot() +
+  geom_line(data = kingsQ %>% filter(Year != 2024), aes(x = DateForPlot, y = FlowCMS, group = Year), color = "grey", alpha = 0.5) +
+  geom_line(data = kingsQ %>% filter(Year == 2024), aes(x = DateForPlot, y = FlowCMS, group = Year), color = "black") +
+  geom_line(data = kingsQ, aes(x = DateForPlot, y = MeanQ), color = "red", alpha = 0.5) +
+  geom_vline(data = q50percAIMS, aes(xintercept = CentroidDate, color = as.factor(Year)), linetype = "dashed") +
+  scale_color_brewer(palette = "Dark2", type = "div") +
+  scale_x_date(date_labels = "%b", date_breaks = "1 month") +
+  scale_y_continuous(trans = "log1p") +
+  labs(title = "Kings Creek",
+       x = "",
+       y = expression(Discharge~("m"^3*"s"^{-1})),
+       color = "50% Cumulative\n    Discharge") +
+  theme_few()+
+  theme(legend.position = "bottom")
+
+kingsLowFlow %>% 
+  ggplot(aes(WaterYear, DryDays))+
+  geom_point()+
+  geom_smooth(method='lm') +
+  stat_regline_equation(aes(label = ..rr.label..))+
+  theme_few()
+```
+
+```{r}
+kingsQcum <- renameNWISColumns(rawKingsQ) %>% 
+  select(-agency_cd, -Flow_cd) %>% 
+  rename(FlowCFS = Flow) %>% 
+  mutate(FlowCMS = FlowCFS * 0.028316847, # cfs to cms
+         FlowCMS = na.approx(FlowCMS, maxgap = 6, na.rm = F),
+         Year = year(Date),
+         DOY = yday(Date),
+         Month = month(Date, label = TRUE, abbr = TRUE),
+         DateForPlot = as.Date(paste(year(today()), DOY), format = "%Y %j"),
+         Period = case_when(Year <= 2020 ~ "1980-2020",
+                            Year == 2021 ~ "2021",
+                            Year == 2022 ~ "2022",
+                            Year == 2023 ~ "2023",
+                            Year == 2024 ~ "2024")
+  )
+
+# Calculate cumulative discharge
+kingsAimsQ <- kingsQcum %>%
+  filter(!Period == "1980-2020") %>% 
+  group_by(Period, DateForPlot) %>%
+  summarize(FlowCMS = sum(FlowCMS, na.rm = TRUE)) %>%
+  ungroup() %>%
+  group_by(Period) %>%
+  mutate(CumulativeQ = cumsum(FlowCMS))
+
+# Separate the data for plotting
+longTermAvg <- kingsQcum %>%
+  filter(Period == "1980-2020") %>%
+  group_by(DateForPlot) %>%
+  summarize(FlowCMS = mean(FlowCMS, na.rm = T)) %>% 
+  mutate(Period = "1980-2020",
+         CumulativeQ = cumsum(FlowCMS)
+         )
+
+plot_data <- kingsAimsQ %>%
+  bind_rows(longTermAvg)
+
+# Plot the data
+plot_data %>% 
+  filter(DateForPlot < today()) %>% 
+ggplot(aes(x = DateForPlot, y = CumulativeQ, color = Period)) +
+  geom_line() +
+  labs(
+    title = "Kings Creek: Accumulated Discharge",
+    x = "",
+    y = expression(Discharge~("m"^3*"s"^{-1})),
+    color = "Period"
+  ) +
+  theme_few() +
+  scale_color_manual(values = c("1980-2020" = "black", "2021" = "#1B9E77", "2022" = "#D95F02", "2023" = "#7570B3", "2024" = "#E7298A")) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  scale_x_date(date_labels = "%b-%d", date_breaks = "4 weeks") 
+```
+
+```{r}
+
+```
+
+# Elk River (YMR) Long Term Data
+
+```{r}
+#Get discharge data from NWIS
+rawElkQdaily <- readNWISdv(siteNumbers = "07169800",
+                     parameterCd = "00060",
+                     startDate = "1991-04-27", 
+                     endDate = today()) 
+```
+
+```{r}
+elkQExcProb <- renameNWISColumns(rawElkQdaily) %>% 
+  select(-agency_cd, -Flow_cd) %>% 
+  rename(FlowCFS = Flow) %>% #Label discharge units (cubic feet per second)
+  mutate(
+    FlowCMS = FlowCFS * 0.028316847,#cfs to cms
+    Year = year(Date),
+    Period = case_when(Year <= 2020 ~ "1991-2020",
+                       Year == 2021 ~ "2021",
+                       Year == 2022 ~ "2022",
+                       Year == 2023 ~ "2023",
+                       Year == 2024 ~ "2024")) %>% 
+  group_by(Period) %>%
+  arrange(desc(FlowCMS),, .by_group = TRUE) %>%
+  mutate(
+    Rank = row_number(),
+    ExceedanceProbability = (Rank / (n() + 1)) * 100,
+    Site = "Elk River")
+
+elkQExcProb %>%
+  ggplot(aes(Date, FlowCMS)) +
+  geom_line(color = "#0084a8") +
+  geom_rect(data = elkQExcProb %>% filter(FlowCMS <= 0), aes(xmin = Date, xmax = Date + 1, ymin = -Inf, ymax = +Inf),
+    fill = "#ff7f50",
+    alpha = 0.1) +
+  labs(x = "",
+       y = expression(Discharge~("m"^3*"s"^{-1})))+
+  theme_few() +
+  scale_x_date(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+elkQExcProb %>%
+  ggplot(aes(Date, FlowCMS)) +
+  geom_line(color = "#0084a8") +
+  geom_rect(data = elkQExcProb %>% filter(FlowCMS <= 0),
+            aes(xmin = Date, xmax = Date + 1),
+            ymin = -Inf, ymax = Inf,
+            fill = "#ff7f50",
+            alpha = 0.1,
+            inherit.aes = FALSE) +
+  labs(x = "",
+       y = expression(Discharge~("m"^3*"s"^{-1}))) +
+  theme_few() +
+  scale_x_date(labels = date_format("%b '%y")) +
+  scale_y_continuous(trans = "log1p") +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+elkQExcProb %>% 
+  ggplot(aes(x = ExceedanceProbability, y = FlowCMS, color = Period)) +
+  geom_line() +
+  scale_y_log10(labels = label_number()) +
+  scale_color_manual(values = c("1991-2020" = "black", "2021" = "#1B9E77", "2022" = "#D95F02", "2023" = "#7570B3", "2024" = "#E7298A")) +
+  labs(title = "Elk River",
+       x = "Exceedance Probability (%)",
+       y = expression(Discharge~("m"^3*"s"^{-1}))) +
+  theme_few()
+```
+
+```{r}
+elkQdaily <- renameNWISColumns(rawElkQdaily) %>% 
+  select(-agency_cd, -Flow_cd) %>% 
+  rename(FlowCFS = Flow) %>% 
+  mutate(
+    FlowCMS = FlowCFS * 0.028316847,
+    Year = year(Date),
+    DOY = yday(Date),
+    Month = month(Date, label = TRUE, abbr = TRUE),
+    DateForPlot = as.Date(paste("2020", DOY), format = "%Y %j")
+  ) %>% 
+  group_by(Year) %>%
+  mutate(
+    TotalYearlyQ = sum(FlowCMS, na.rm = TRUE),
+    CumulativeQ = cumsum(FlowCMS),
+    CumulativeProp = CumulativeQ / TotalYearlyQ
+  ) %>% 
+  ungroup() %>%
+  group_by(DOY) %>%
+  mutate(MeanQ = mean(FlowCMS, na.rm = TRUE),
+         MedianQ = median(FlowCMS, na.rm = T)) %>%
+  ungroup() 
+
+# Calculate low flow statistics
+elkLowFlow <- elkQdaily %>%
+  mutate(WaterYear = calcWaterYear(Date)) %>% 
+  group_by(WaterYear) %>%
+  summarize(
+    WetDays = sum(FlowCMS > 0, na.rm = TRUE),
+    DryDays = sum(FlowCMS == 0, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# Calculate the cumulative discharge for each day of the year, the total discharge for each year, merge the total discharge with the original data, calculate the relative cumulative discharge, and find the date of the center of mass (50% cumulative discharge) all in one go.
+
+elkQdaily50perc <- elkQdaily %>%
+  mutate(
+    CumulativeQ = cumsum(FlowCMS),
+    TotalQ = sum(FlowCMS, na.rm = TRUE),
+    RelativeCumulativeQ = CumulativeQ / TotalQ
+  ) %>%
+  summarize(CentroidDOY = DOY[which.min(abs(RelativeCumulativeQ - 0.5))])
+
+elkQdaily50percAIMS <- elkQdaily %>%
+  group_by(Year) %>%
+  filter(Year >= 2021) %>% 
+  mutate(
+    CumulativeQ = cumsum(FlowCMS),
+    TotalQ = sum(FlowCMS, na.rm = TRUE),
+    RelativeCumulativeQ = CumulativeQ / TotalQ
+  ) %>%
+  ungroup() %>%
+  group_by(Year) %>%
+  summarize(CentroidDOY = DOY[which.min(abs(RelativeCumulativeQ - 0.5))]) %>%
+  ungroup() %>% 
+  mutate(CentroidDate = as.Date(paste("2020", CentroidDOY), format = "%Y %j"))
+
+ggplot() +
+  geom_line(data = elkQdaily %>% filter(Year != 2024), aes(x = DateForPlot, y = FlowCMS, group = Year), color = "grey", alpha = 0.5) +
+  geom_line(data = elkQdaily %>% filter(Year == 2024), aes(x = DateForPlot, y = FlowCMS, group = Year), color = "black") +
+  geom_line(data = elkQdaily, aes(x = DateForPlot, y = MeanQ), color = "red", alpha = 0.5) +
+  geom_line(data = elkQdaily, aes(x = DateForPlot, y = MedianQ), color = "blue", alpha = 0.5) +
+  scale_x_date(date_labels = "%b", date_breaks = "1 month") +
+  labs(x = "",
+       y = expression(Discharge~("m"^3*"s"^{-1}))) +
+  theme_few()
+
+ggplot() +
+  geom_line(data = elkQdaily %>% filter(Year == 2021), aes(x = DateForPlot, y = CumulativeProp, color = factor(Year)), linetype = "solid") +
+  geom_line(data = elkQdaily %>% filter(Year == 2022), aes(x = DateForPlot, y = CumulativeProp, color = factor(Year)), linetype = "solid") +
+  geom_line(data = elkQdaily %>% filter(Year == 2023), aes(x = DateForPlot, y = CumulativeProp, color = factor(Year)), linetype = "solid") +
+  geom_line(data = elkQdaily %>% filter(Year == 2024), aes(x = DateForPlot, y = CumulativeProp, color = factor(Year)), linetype = "solid") +
+  geom_line(data = elkQdaily %>% group_by(DOY) %>%
+              summarise(DateForPlot = first(DateForPlot), AverageCumulativeProp = mean(CumulativeProp, na.rm = TRUE)), 
+            aes(x = DateForPlot, y = AverageCumulativeProp, color = "1991-2020"), linetype = "dashed") +
+  labs(title = "Elk River", x = "", y = "Cumulative Proportion \n of Total Yearly Discharge") +
+  scale_x_date(date_labels = "%b", date_breaks = "1 month") +
+  scale_color_manual(values = c("1991-2020" = "black", "2021" = "#1B9E77", "2022" = "#D95F02", "2023" = "#7570B3", "2024" = "#E7298A")) +
+  theme_few() +
+  theme(legend.position = "bottom", legend.title = element_blank())
+
+
+ggplot() +
+  geom_line(data = elkQdaily %>% filter(Year != 2024), aes(x = DateForPlot, y = FlowCMS, group = Year), color = "grey", alpha = 0.5) +
+  geom_line(data = elkQdaily %>% filter(Year == 2024), aes(x = DateForPlot, y = FlowCMS, group = Year), color = "black") +
+  geom_line(data = elkQdaily, aes(x = DateForPlot, y = MeanQ), color = "red", alpha = 0.5) +
+  geom_vline(data = elkQdaily50percAIMS, aes(xintercept = CentroidDate, color = as.factor(Year)), linetype = "dashed") +
+  scale_color_brewer(palette = "Dark2", type = "div") +
+  scale_x_date(date_labels = "%b", date_breaks = "1 month") +
+  labs(x = "",
+       y = expression(Discharge~("m"^3*"s"^{-1})),
+       color = "50% Cumulative\n    Discharge") +
+  theme_few()+
+  theme(legend.position = "bottom")
+
+elkLowFlow %>% 
+  ggplot(aes(WaterYear, DryDays))+
+  geom_point()+
+  geom_smooth(method='lm') +
+  stat_regline_equation(aes(label = ..rr.label..))+
+  theme_few()
+```
+
+```{r}
+excProb <- kingsQExcProb %>% 
+  full_join(elkQExcProb) %>% 
+  mutate(WaterYear = calcWaterYear(Date),
+         Period = case_when(WaterYear <= 2020 ~ "Long Term Mean",
+                       WaterYear == 2021 ~ "2021",
+                       WaterYear == 2022 ~ "2022",
+                       WaterYear == 2023 ~ "2023",
+                       WaterYear == 2024 ~ "2024")) %>%
+  filter(WaterYear < 2024) %>% 
+  group_by(Period, Site) %>%
+  arrange(desc(FlowCMS),, .by_group = TRUE) %>%
+  mutate(
+    Rank = row_number(),
+    ExceedanceProbability = (Rank / (n() + 1)) * 100)
+
+
+excProb$Site <- factor(excProb$Site, levels = c("Kings Creek", "Elk River"), ordered = T)
+
+excProb %>% 
+  ggplot(aes(x = ExceedanceProbability, y = FlowCMS, color = Period)) +
+  geom_line(linewidth = 1.5) +
+  scale_y_log10(labels = label_number()) +
+  scale_color_manual(values = c("Long Term Mean" = "black", "2021" = "#1B9E77", "2022" = "#D95F02", "2023" = "#7570B3", "2024" = "#E7298A")) +
+  labs(title = "",
+       x = "Exceedance Probability (%)",
+       y = expression(Discharge~("m"^3*"s"^{-1}))) +
+  theme_few() +
+  theme(legend.position = "bottom", legend.title = element_blank(),
+        text = element_text(size = 25),       # Increase overall text size
+    axis.title = element_text(size = 25), # Increase axis titles size
+    axis.text = element_text(size = 25),  # Increase axis text size
+    strip.text = element_text(size = 25),  # Increase facet labels size
+    legend.text = element_text(size = 25)) +
+  facet_wrap(~Site) -> excProbPlt
+excProbPlt
+ggsave("excProb.png", excProbPlt, here("Figs/"), device = "png", width = 16, height = 8.5, units = "in", dpi = "retina")
+
+```

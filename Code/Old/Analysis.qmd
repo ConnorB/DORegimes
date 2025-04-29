@@ -1,0 +1,229 @@
+---
+title: "Analysis"
+author: "CLB"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+library(tidyverse)
+options(readr.show_col_types = F)
+library(tidymodels)
+library(here)
+library(corrr)
+library(corrplot)
+library(PerformanceAnalytics)
+library(progress)
+library(ggthemes)
+```
+
+```{r}
+dailyDat <- read_csv(here("Data/dailyData.csv"))
+
+doVars <- c("minDO.pctsat", "maxDO.pctsat", "avgDO.pctsat", "DOpctsat.amp", "probHypSat")
+predVars <- c(
+  "PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d",
+  "dPercWet_1d", "dPercWet_7d", "dPercWet_14d", "dPercWet_30d", "dPercWet_60d",
+  "PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d", 
+  "Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d", "exeProb",
+  "Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d"
+)
+
+```
+
+# Correlations
+
+```{r}
+dailyDat %>%
+  select(all_of(predVars)) %>%
+  scale(center = T, scale = T) %>% 
+  as_tibble() %>% 
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Value") %>% 
+  ggplot(aes(x = Value)) +
+  geom_histogram( fill = "#3cb44b") +
+  facet_wrap(~Variable, scales = "free") +
+  theme_few() +
+  labs(title = "Histograms of Predictors", x = "Value", y = "Frequency")
+
+predCorTest <- dailyDat %>%
+  select(all_of(predVars)) %>%
+  scale(center = T, scale = T) %>% 
+  cor.mtest(conf.level = 0.95)
+
+  
+dailyDat %>%
+  select(all_of(predVars)) %>%
+  scale(center = T, scale = T) %>% 
+  cor(method = "pearson", use = "complete.obs") %>% 
+  corrplot(method = 'circle', diag = FALSE, type = 'upper')
+
+dailyDat %>%
+  select(all_of(predVars)) %>%
+  correlate() %>% 
+  rearrange(absolute = FALSE) %>% 
+  rplot(print_cor = T)
+```
+
+```{r}
+dailyDat %>%
+  select(all_of(doVars)) %>%
+  scale(center = T, scale = T) %>% 
+  as_tibble() %>% 
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Value") %>% 
+  ggplot(aes(x = Value)) +
+  geom_histogram( fill = "#3cb44b") +
+  facet_wrap(~Variable, scales = "free") +
+  theme_few() +
+  labs(title = "Histograms of DO Metrics", x = "Value", y = "Frequency")
+
+dailyDat %>%
+  select(all_of(doVars)) %>%
+  scale(center = T, scale = T) %>% 
+  cor(method = "pearson", use = "complete.obs") %>% 
+  corrplot()
+
+dailyDat %>%
+  select(all_of(doVars)) %>%
+  correlate() %>% 
+  rearrange(absolute = FALSE) %>% 
+  shave(upper = T) %>%
+  rplot(print_cor = T)
+```
+
+```{r}
+#Prep data
+lmDat <- dailyDat %>% 
+  ungroup() %>% 
+  select(avgDO.pctsat, all_of(c(predVars))) %>% 
+  drop_na()
+# Split the data into training and testing sets
+set.seed(123)  # For reproducibility
+datSplit <- initial_split(lmDat, prop = 0.8)
+trainDat <- training(datSplit)
+testDat <- testing(datSplit)
+```
+
+# Ridge Regression
+
+```{r}
+# Define the recipe
+ridgeRec <- recipe(avgDO.pctsat ~ ., data = trainDat) %>%
+  step_select(where(is.numeric)) %>% 
+  step_normalize(all_predictors()) %>%   # Normalizes predictors (important for Ridge)
+  step_naomit()
+# Define the Ridge Regression model using tidymodels and parsnip
+ridgeSpec <- linear_reg(penalty = tune(), mixture = 0) %>%  # mixture = 0 for Ridge
+  set_engine("glmnet")
+
+# Set up a workflow
+ridgeFlow <- workflow() %>%
+  add_recipe(ridgeRec) %>%
+  add_model(ridgeSpec)
+
+# Set up cross-validation
+cvFolds <- vfold_cv(trainDat, v = 10)
+
+# Tune the penalty parameter (lambda)
+ridge_tune <- tune_grid(
+  ridgeFlow,
+  resamples = cvFolds,
+  grid = 10,  # Number of penalty values to test
+  metrics = metric_set(rmse, rsq)  # Evaluate with RMSE and R^2
+)
+
+# Find the best penalty value
+best_penalty <- select_best(ridge_tune, "rmse")
+
+# Finalize the Ridge Regression model with the best lambda
+final_ridge <- finalize_workflow(ridge_workflow, best_penalty)
+
+```
+
+```{r}
+ridge_spec <- linear_reg(mixture = 0, penalty = 0) %>%
+  set_mode("regression") %>%
+  set_engine("glmnet")
+
+ridge_fit <- fit(ridge_spec, avgDO.pctsat ~ ., data = lmDat)
+
+tidy(ridge_fit)
+tidy(ridge_fit, penalty = 11498)
+tidy(ridge_fit, penalty = 705)
+tidy(ridge_fit, penalty = 50)
+
+ridge_fit %>%
+  autoplot()
+
+
+
+ridge_spec <- 
+  linear_reg(penalty = tune(), mixture = 0) %>% 
+  set_mode("regression") %>% 
+  set_engine("glmnet")
+
+ridge_recipe <- 
+  recipe(formula = avgDO.pctsat ~ ., data = trainDat) %>% 
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_predictors())
+
+# Set up cross-validation
+cvFolds <- vfold_cv(trainDat, v = 10)
+
+ridge_workflow <- workflow() %>% 
+  add_recipe(ridge_recipe) %>% 
+  add_model(ridge_spec)
+
+penalty_grid <- grid_regular(penalty(range = c(-10, 10)), levels = 50)
+
+tune_res <- tune_grid(
+  ridge_workflow,
+  resamples = cvFolds, 
+  grid = penalty_grid
+)
+
+tune_res %>% autoplot()
+best_penalty <- select_best(tune_res, metric = "rsq")
+```
+
+```{r}
+lasso_recipe <- 
+  recipe(formula = avgDO.pctsat ~ ., data = trainDat) %>% 
+  step_corr(all_predictors(), threshold = 0.9) %>%
+  step_nzv(all_predictors()) %>%
+  step_normalize(all_predictors())
+# Inspect retained predictors after preprocessing
+prepped_recipe <- lasso_recipe %>% prep(training = trainDat)
+
+tidy(prepped_recipe, number = 1)  # For `step_corr`
+tidy(prepped_recipe, number = 2)  # For `step_nzv`
+
+
+lasso_spec <- 
+  linear_reg(penalty = tune(), mixture = 1) %>% 
+  set_mode("regression") %>% 
+  set_engine("glmnet") 
+
+lasso_workflow <- workflow() %>% 
+  add_recipe(lasso_recipe) %>% 
+  add_model(lasso_spec)
+
+penalty_grid <- grid_regular(penalty(range = c(-5, 5)), levels = 50)
+cvFolds <- vfold_cv(trainDat, v = 10, strata = avgDO.pctsat)
+ctrl <- control_grid(verbose = T, save_pred = TRUE)
+tune_res <- tune_grid(
+  lasso_workflow,
+  resamples = cvFolds, 
+  grid = penalty_grid,
+  control = ctrl
+)
+
+autoplot(tune_res)
+best_penalty <- select_best(tune_res, metric = "rsq")
+
+lasso_final <- finalize_workflow(lasso_workflow, best_penalty)
+
+lasso_final_fit <- fit(lasso_final, data = trainDat)
+augment(lasso_final_fit, new_data = testDat) %>%
+  rsq(truth = avgDO.pctsat, estimate = .pred)
+```

@@ -1,0 +1,1197 @@
+---
+title: "USGS DO Metrics"
+author: "CLB"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+library(data.table)
+library(tidyverse, warn.conflicts = F)
+options(readr.show_col_types = F)
+library(googlesheets4)
+library(ggthemes)
+library(ggpmisc)
+library(here)
+library(styler)
+library(streamMetabolizer)
+library(rstan)
+options(mc.cores = parallel::detectCores())
+library(dataRetrieval)
+library(scales)
+library(knitr)
+library(lubridate)
+library(zoo)
+library(nasapower)
+library(imputeTS)
+library(rgbif)
+library(foreach)
+library(doParallel)
+library(broom)
+library(factoextra)
+library(cluster)
+source(here("Code/priceDrying.R"))
+```
+
+# Find USGS Data
+
+```{r}
+# Get site data from USGS
+usgsSites <- readNWISsite(c("02264000","02266200","08052700","11128500")) %>%
+  transmute(site_no,
+            siteName = case_when(
+              site_no == "02264000" ~ "Cypress Creek",
+              site_no == "02266200" ~ "Whittenhorse Creek",
+              site_no == "08052700" ~ "Little Elm Creek",
+              site_no == "11128500" ~ "Santa Ynez River"),
+            lat = dec_lat_va,
+            long = dec_long_va,
+            elev = alt_va * 0.3048, # ft to m
+            drainArea = drain_area_va / 0.38610216) # sqmi to sqkm
+
+# Get start and end dates from USGS
+avalDat <- whatNWISdata(siteNumber = usgsSites$site_no, parameterCd = "00300", service = "uv") %>%
+  transmute(site_no,
+            startDate = begin_date,
+            endDate = end_date)
+
+usgsSites <- left_join(usgsSites, avalDat, by = "site_no")
+write_csv(usgsSites, here("Data/usgsSites.csv"))
+```
+
+## Download DO Data
+
+```{r}
+#Leaves one core free for system use
+registerDoParallel(cores = detectCores() - 1)
+
+usgsRawDO <- foreach(i=1:nrow(usgsSites), .combine='rbind', .packages=c("dataRetrieval")) %dopar% {
+  parameterCd <- c("00300", "00010")
+  tempDat <- readNWISuv(usgsSites$site_no[i], parameterCd, usgsSites$startDate[i], usgsSites$endDate[i])
+  #Rename cols to make sense
+  tempDat <- renameNWISColumns(tempDat)
+  return(tempDat)
+}
+#Stop cluster
+stopImplicitCluster()
+
+
+usgsDO <- usgsRawDO %>% 
+    transmute(dateTime,
+              site_no,
+              siteName = factor(
+                case_when(
+                  site_no == "02264000" ~ "Cypress Creek",
+                  site_no == "02266200" ~ "Whittenhorse Creek",
+                  site_no == "08052700" ~ "Little Elm Creek",
+                  site_no == "11128500" ~ "Santa Ynez River"),
+                levels = c("Cypress Creek", "Whittenhorse Creek", "Little Elm Creek", "Santa Ynez River"),
+                ordered = T),
+              DO.obs = DO_Inst,
+              temp.water = Wtemp_Inst) %>%  
+    drop_na() %>% 
+  select(-site_no) %>% 
+    arrange(siteName, dateTime)
+
+usgsDO <- usgsDO %>% 
+  group_by(siteName) %>%
+  complete(dateTime = seq(floor_date(min(dateTime), "15 min"), floor_date(max(dateTime), "15 min"), by = "15 min")) %>%
+  arrange(dateTime) %>%
+  mutate(across(where(is.numeric), ~ na.approx(.x, na.rm = FALSE, maxgap = 6))) %>%
+  filter(minute(dateTime) %% 15 == 0) %>%
+  ungroup()
+```
+
+## Download Q
+
+```{r}
+#Leaves one core free for system use
+registerDoParallel(cores = detectCores() - 1)
+
+usgsRawQ <- foreach(i=1:nrow(usgsSites), .combine='rbind', .packages=c("dataRetrieval")) %dopar% {
+  parameterCd <- c("00060")
+  tempDat <- readNWISdv(usgsSites$site_no[i], parameterCd, startDate = "1979-01-01", usgsSites$endDate[i])
+  #Rename cols to make sense
+  tempDat <- renameNWISColumns(tempDat)
+  return(tempDat)
+}
+#Stop cluster
+stopImplicitCluster()
+
+
+usgsQ <- usgsRawQ %>% 
+    transmute(Date,
+              site_no,
+              Flow,
+              Flow_cms = Flow * 0.028316847) %>% 
+    drop_na() %>% 
+    arrange(site_no, Date)
+
+for (i in 1:nrow(usgsSites)) {
+  tempDat <- usgsQ %>% 
+    filter(site_no == usgsSites$site_no[i]) %>% 
+    rename(gage = site_no) %>% 
+    write_csv(paste0(here("Data/USGS_Q"), usgsSites$site_no[i], ".csv"))
+}
+
+usgsQ <- usgsQ %>% 
+  mutate(siteName = factor(
+                case_when(
+                  site_no == "02264000" ~ "Cypress Creek",
+                  site_no == "02266200" ~ "Whittenhorse Creek",
+                  site_no == "08052700" ~ "Little Elm Creek",
+                  site_no == "11128500" ~ "Santa Ynez River"),
+                levels = c("Cypress Creek", "Whittenhorse Creek", "Little Elm Creek", "Santa Ynez River"),
+                ordered = T))
+```
+
+## Download 15min Q
+
+```{r}
+#Leaves one core free for system use
+registerDoParallel(cores = detectCores() - 1)
+
+usgsRawQ15 <- foreach(i=1:nrow(usgsSites), .combine='rbind', .packages=c("dataRetrieval")) %dopar% {
+  parameterCd <- c("00060")
+  tempDat <- readNWISuv(usgsSites$site_no[i], parameterCd, startDate = "1979-01-01", usgsSites$endDate[i])
+  #Rename cols to make sense
+  tempDat <- renameNWISColumns(tempDat)
+  return(tempDat)
+}
+#Stop cluster
+stopImplicitCluster()
+
+
+usgsQ15 <- usgsRawQ15 %>% 
+  transmute(dateTime,
+              site_no,
+              Flow_Inst,
+              Flow_cms = Flow_Inst * 0.028316847) %>% 
+  mutate(siteName = factor(
+                case_when(
+                  site_no == "02264000" ~ "Cypress Creek",
+                  site_no == "02266200" ~ "Whittenhorse Creek",
+                  site_no == "08052700" ~ "Little Elm Creek",
+                  site_no == "11128500" ~ "Santa Ynez River"),
+                levels = c("Cypress Creek", "Whittenhorse Creek", "Little Elm Creek", "Santa Ynez River"),
+                ordered = T)) %>% 
+  drop_na() %>% 
+  arrange(site_no, dateTime)
+```
+
+## Check out data
+
+```{r}
+exceProb <- usgsQ %>% 
+  mutate(
+    Year = year(Date),
+    Period = case_when(Year <= 2020 ~ "Average",
+                       Year == 2021 ~ "2021",
+                       Year == 2022 ~ "2022",
+                       Year == 2023 ~ "2023",
+                       Year == 2024 ~ "2024")) %>% 
+  group_by(siteName, Period) %>%
+  arrange(desc(Flow_cms),, .by_group = TRUE) %>%
+  mutate(
+    Rank = row_number(),
+    ExceedanceProbability = (Rank / (n() + 1)) * 100)
+
+exceProb %>% 
+  ggplot(aes(Date, Flow_cms)) +
+  geom_line(color = "#0084a8") +
+  geom_rect(data = exceProb %>% filter(Flow_cms <= 0), aes(xmin = Date, xmax = Date + 1, ymin = -Inf, ymax = +Inf),
+    fill = "#ff7f50",
+    alpha = 0.1) +
+  labs(x = "",
+       y = expression(Discharge~("m"^3*"s"^{-1})))+
+  theme_few() +
+  scale_x_date(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~siteName, scales = "free")
+
+
+
+exceProb %>% 
+  ggplot(aes(x = ExceedanceProbability, y = Flow_cms, color = Period)) +
+  geom_line() +
+  scale_y_log10(labels = label_number()) +
+  scale_color_manual(values = c("Average" = "black", "2021" = "#1B9E77", "2022" = "#D95F02", "2023" = "#7570B3", "2024" = "#E7298A")) +
+  labs(x = "Exceedance Probability (%)",
+       y = expression(Discharge~("m"^3*"s"^{-1}))) +
+  theme_few()+
+  facet_wrap(~siteName, scales = "free")
+
+exceProb15 <- usgsQ15 %>% 
+  mutate(
+    Year = year(dateTime),
+    Period = case_when(Year <= 2020 ~ "Average",
+                       Year == 2021 ~ "2021",
+                       Year == 2022 ~ "2022",
+                       Year == 2023 ~ "2023",
+                       Year == 2024 ~ "2024")) %>% 
+  group_by(siteName, Period) %>%
+  arrange(desc(Flow_cms),, .by_group = TRUE) %>%
+  mutate(
+    Rank = row_number(),
+    ExceedanceProbability = (Rank / (n() + 1)) * 100)
+
+exceProb15 %>% 
+  ggplot(aes(dateTime, Flow_cms)) +
+  geom_line(color = "#0084a8") +
+  geom_rect(data = exceProb15 %>% filter(Flow_cms <= 0), aes(xmin = dateTime, xmax = dateTime + 1, ymin = -Inf, ymax = +Inf),
+    fill = "#ff7f50",
+    alpha = 0.1) +
+  labs(x = "",
+       y = expression(Discharge~("m"^3*"s"^{-1})))+
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~siteName, scales = "free")
+
+
+
+exceProb15 %>% 
+  ggplot(aes(x = ExceedanceProbability, y = Flow_cms, color = Period)) +
+  geom_line() +
+  scale_y_log10(labels = label_number()) +
+  scale_color_manual(values = c("Average" = "black", "2021" = "#1B9E77", "2022" = "#D95F02", "2023" = "#7570B3", "2024" = "#E7298A")) +
+  labs(x = "Exceedance Probability (%)",
+       y = expression(Discharge~("m"^3*"s"^{-1}))) +
+  theme_few()+
+  facet_wrap(~siteName, scales = "free")
+```
+
+```{r}
+usgsCumuQ <- usgsQ %>% 
+  mutate(Year = year(Date),
+    DOY = yday(Date),
+    Month = month(Date, label = TRUE, abbr = TRUE),
+    DateForPlot = as.Date(paste("2020", DOY), format = "%Y %j")
+  ) %>% 
+  group_by(siteName, Year) %>%
+  mutate(
+    TotalYearlyQ = sum(Flow_cms, na.rm = TRUE),
+    CumulativeQ = cumsum(Flow_cms),
+    CumulativeProp = CumulativeQ / TotalYearlyQ
+  ) %>% 
+  ungroup() %>%
+  group_by(siteName, DOY) %>%
+  mutate(MeanQ = mean(Flow_cms, na.rm = TRUE),
+         MedianQ = median(Flow_cms, na.rm = T)) %>%
+  ungroup()
+
+# Calculate low flow statistics
+usgsLowFlow <- usgsCumuQ %>%
+  mutate(WaterYear = calcWaterYear(Date)) %>% 
+  group_by(siteName, WaterYear) %>%
+  summarize(
+    WetDays = sum(Flow_cms > 0, na.rm = TRUE),
+    DryDays = sum(Flow_cms == 0, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# Calculate the cumulative discharge for each day of the year, the total discharge for each year, merge the total discharge with the original data, calculate the relative cumulative discharge, and find the date of the center of mass (50% cumulative discharge) all in one go.
+
+q50perc <- usgsCumuQ %>%
+  group_by(siteName) %>% 
+  mutate(
+    CumulativeQ = cumsum(Flow_cms),
+    TotalQ = sum(Flow_cms, na.rm = TRUE),
+    RelativeCumulativeQ = CumulativeQ / TotalQ
+  ) %>%
+  summarize(CentroidDOY = DOY[which.min(abs(RelativeCumulativeQ - 0.5))])
+```
+
+```{r}
+yearColor <- c("2021" = "#1B9E77", "2022" = "#D95F02", "2023" = "#7570B3", "2024" = "#E7298A", "Average" = "black")
+ggplot() +
+  geom_line(data = usgsCumuQ %>% filter(Year == 2021), aes(x = DateForPlot, y = CumulativeProp, color = factor(Year)), linetype = "solid") +
+  geom_line(data = usgsCumuQ %>% filter(Year == 2022), aes(x = DateForPlot, y = CumulativeProp, color = factor(Year)), linetype = "solid") +
+  geom_line(data = usgsCumuQ %>% filter(Year == 2023), aes(x = DateForPlot, y = CumulativeProp, color = factor(Year)), linetype = "solid") +
+  geom_line(data = usgsCumuQ %>% filter(Year == 2024), aes(x = DateForPlot, y = CumulativeProp, color = factor(Year)), linetype = "solid") +
+  geom_line(data = usgsCumuQ %>% group_by(DOY) %>%
+              summarise(DateForPlot = first(DateForPlot), AverageCumulativeProp = mean(CumulativeProp, na.rm = TRUE)), 
+            aes(x = DateForPlot, y = AverageCumulativeProp, color = "Average"), linetype = "dashed") +
+  labs(x = "", y = "Cumulative Proportion \n of Total Yearly Discharge") +
+  scale_x_date(date_labels = "%b", date_breaks = "1 month") +
+  scale_color_manual(values = yearColor, labels = c("2021", "2022", "2023", "2024", "Average")) +
+  theme_few() +
+  theme(legend.position = "bottom",
+        legend.title = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~siteName, scales = "free")
+```
+
+```{r}
+usgsCumuQ15 <- usgsQ15 %>% 
+  mutate(Year = year(dateTime),
+    DOY = yday(dateTime),
+    Month = month(dateTime, label = TRUE, abbr = TRUE),
+    DateForPlot = as.Date(paste("2020", DOY), format = "%Y %j")
+  ) %>% 
+  group_by(siteName, Year) %>%
+  mutate(
+    TotalYearlyQ = sum(Flow_cms, na.rm = TRUE),
+    CumulativeQ = cumsum(Flow_cms),
+    CumulativeProp = CumulativeQ / TotalYearlyQ
+  ) %>% 
+  ungroup() %>%
+  group_by(siteName, DOY) %>%
+  mutate(MeanQ = mean(Flow_cms, na.rm = TRUE),
+         MedianQ = median(Flow_cms, na.rm = T)) %>%
+  ungroup()
+
+# Calculate low flow statistics
+usgsLowFlow15 <- usgsCumuQ15 %>%
+  mutate(WaterYear = calcWaterYear(dateTime)) %>% 
+  group_by(siteName, WaterYear) %>%
+  summarize(
+    WetDays = sum(Flow_cms > 0, na.rm = TRUE),
+    DryDays = sum(Flow_cms == 0, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# Calculate the cumulative discharge for each day of the year, the total discharge for each year, merge the total discharge with the original data, calculate the relative cumulative discharge, and find the date of the center of mass (50% cumulative discharge) all in one go.
+
+q50perc15 <- usgsCumuQ15 %>%
+  group_by(siteName) %>% 
+  mutate(
+    CumulativeQ = cumsum(Flow_cms),
+    TotalQ = sum(Flow_cms, na.rm = TRUE),
+    RelativeCumulativeQ = CumulativeQ / TotalQ
+  ) %>%
+  summarize(CentroidDOY = DOY[which.min(abs(RelativeCumulativeQ - 0.5))])
+```
+
+```{r}
+ggplot() +
+  geom_line(data = usgsCumuQ15 %>% filter(Year == 2021), aes(x = DateForPlot, y = CumulativeProp, color = factor(Year)), linetype = "solid") +
+  geom_line(data = usgsCumuQ15 %>% filter(Year == 2022), aes(x = DateForPlot, y = CumulativeProp, color = factor(Year)), linetype = "solid") +
+  geom_line(data = usgsCumuQ15 %>% filter(Year == 2023), aes(x = DateForPlot, y = CumulativeProp, color = factor(Year)), linetype = "solid") +
+  geom_line(data = usgsCumuQ15 %>% filter(Year == 2024), aes(x = DateForPlot, y = CumulativeProp, color = factor(Year)), linetype = "solid") +
+  geom_line(data = usgsCumuQ15 %>% group_by(DOY) %>%
+              summarise(DateForPlot = first(DateForPlot), AverageCumulativeProp = mean(CumulativeProp, na.rm = TRUE)), 
+            aes(x = DateForPlot, y = AverageCumulativeProp, color = "Average"), linetype = "dashed") +
+  labs(x = "", y = "Cumulative Proportion \n of Total Yearly Discharge") +
+  scale_x_date(date_labels = "%b", date_breaks = "1 month") +
+  scale_color_manual(values = yearColor, labels = c("2021", "2022", "2023", "2024", "Average")) +
+  theme_few() +
+  theme(legend.position = "bottom",
+        legend.title = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~siteName, scales = "free")
+```
+
+# Download NASA
+
+```{r}
+#Download shortwave radiation, barometric presssure, and temperature from NASAPower for each site
+nasaDat <- list()
+for(i in 1:nrow(usgsSites)) {
+  #All sky shortwave downward radiation
+  cat(paste("Downloading data for", usgsSites$siteName[i],"\n"))
+  
+  tempDat <- get_power(
+    community = "sb",
+    pars = c("PSC", "ALLSKY_SFC_SW_DWN", "PRECTOTCORR"),
+    temporal_api = "hourly",
+    lonlat = c(usgsSites$long[i], usgsSites$lat[i]),
+    dates = c(usgsSites$startDate[i], usgsSites$endDate[i]),
+    site_elevation = usgsSites$elev[i],
+    time_standard = "UTC")
+  
+  cat(paste("Finished downloading data for", usgsSites$siteName[i], "\n"))
+  #Fix date time stamp and convert kilopascals to millibar
+  tempDat <- tempDat %>%
+    mutate(Time = paste0(str_pad(HR, 2, side = "left", pad = "0"), ":00")) %>% 
+    unite("dateTime", YYYYMMDD, Time, sep = " ") %>% 
+    mutate(dateTime = ymd_hm(dateTime, tz = "UTC"),
+           BP = PSC * 10,
+           PAR.obs = convert_SW_to_PAR(ALLSKY_SFC_SW_DWN)) %>% 
+    select(dateTime, BP, PAR.obs, PPT_mm = PRECTOTCORR)
+
+  # Simply a data frame of date and time running the course of the data set
+  min.fill <- data.frame(dateTime = seq(
+    from = floor_date(min(tempDat$dateTime), "15 mins"), 
+    to = ceiling_date(max(tempDat$dateTime), "15 mins"),
+    by = "15 mins"))
+  
+  # Merge and interpolate gaps
+  tempDat <- merge(min.fill, tempDat, by = "dateTime", all = T) %>%
+    mutate(siteName = usgsSites$siteName[i],
+           lat = usgsSites$lat[i],
+           long = usgsSites$long[i],
+           BP = na.approx(BP, na.rm = F, maxgap = 5),
+           PAR.obs = na.approx(PAR.obs, na.rm = F, maxgap = 5),
+           PPT_mm = na.approx(PPT_mm, na.rm = F, maxgap = 5))
+  #Save to list
+  nasaDat[[i]] <- tempDat
+  #Break loop on last iteration
+  if(i == nrow(usgsSites)){break}
+} 
+
+nasaDat <- do.call(rbind, nasaDat)
+nasaDat <- nasaDat %>% 
+  arrange(dateTime, siteName) %>% 
+  mutate(solar.time = convert_UTC_to_solartime(dateTime, long, "mean solar"))
+```
+
+## Model Missing Light Data
+
+```{r}
+# Set the number of cores to use
+numCores <- detectCores() - 1  # Use one less than the number of available cores
+cl <- makeCluster(numCores)
+registerDoParallel(cl)
+
+# Parallel processing with foreach
+nasaDat <- foreach(i = unique(nasaDat$siteName), .combine = rbind, .packages = c("dplyr", "data.table", "streamMetabolizer")) %dopar% {
+  tempDat <- nasaDat %>% filter(siteName == i)
+  # Get max observed light value
+  maxLight <- max(tempDat$PAR.obs, na.rm = TRUE)
+  tempDat$PAR.mod <- calc_light(tempDat$solar.time, latitude = tempDat$lat, longitude =  tempDat$long, max.PAR = maxLight)
+  # Merge calc and obs light
+  tempDat$light <- fcoalesce(tempDat$PAR.obs, tempDat$PAR.mod)
+  tempDat
+}
+
+# Stop the cluster
+stopCluster(cl)
+rm(cl)
+
+nasaDat <- nasaDat %>% 
+  select(dateTime, siteName, BP, PAR.obs, PAR.mod, light, PPT_mm)
+
+nasaDat %>%
+  ggplot(aes(dateTime, PAR.obs)) +
+  geom_line(color = "darkgoldenrod1") +
+  ylab(expression(PAR~(mu*"mol m"^-2*"s"^-1))) +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y"), breaks = "1 year") +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~siteName, ncol = 2, scales = "free")
+
+nasaDat %>%
+  ggplot(aes(dateTime, PAR.mod)) +
+  geom_line(color = "darkgoldenrod1") +
+  ylab(expression(PAR~(mu*"mol m"^-2*"s"^-1))) +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y"), breaks = "1 year") +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~siteName, ncol = 2, scales = "free")
+```
+
+## Merge with DO
+
+```{r}
+# Merge usgsDat with nasaDat
+usgsDO <- usgsDO %>% 
+  left_join(nasaDat, by = c("dateTime", "siteName")) %>%
+  # Get lat and long from usgsSites
+  left_join(usgsSites %>% select(siteName, lat, long), by = "siteName") %>% 
+  rename(utc.time = dateTime) %>%
+  mutate(
+    # Calc dissolved oxygen saturation and percentage saturation
+    DO.sat = calc_DO_sat(
+      temp.water = temp.water,
+      pressure.air = BP,
+      model = "garcia-benson"),
+    # Calc % DO sat
+    DO.pctsat = (DO.obs/DO.sat)*100, 
+    # Convert UTC time to mean solar time based on longitude
+    solar.time = convert_UTC_to_solartime(
+      date.time = utc.time, 
+      longitude = long,
+      time.type = "mean solar"),
+    # Determine if it is daytime
+    isDaytime = calc_is_daytime(solar.time, lat = lat)) %>% 
+  select(utc.time, solar.time, siteName, DO.obs, DO.sat, DO.pctsat, temp.water, BP, PAR.obs, PAR.mod, light, PPT_mm, isDaytime) %>% 
+  #drop_na() %>% 
+  arrange(solar.time, siteName)
+```
+
+```{r}
+usgsDO %>%
+  ggplot(aes(utc.time, DO.pctsat)) +
+  geom_line(color = "#5d782e") + 
+  ylab("DO % Sat") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y"), breaks = "1 year") +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~siteName, ncol = 2, scales = "free")
+
+usgsDO %>%
+  ggplot(aes(utc.time, light)) +
+  geom_line(color = "darkgoldenrod1") +
+  ylab(expression(PAR~(mu*"mol m"^-2*"s"^-1))) +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y"), breaks = "1 year") +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~siteName, ncol = 2, scales = "free")
+```
+
+# Calc DO Metrics
+
+```{r}
+# Function to determine the season
+calcSeason <- function(date) {
+  m <- lubridate::month(date)
+  d <- lubridate::day(date)
+  if ((m == 12 && d >= 21) || (m %in% c(1, 2)) || (m == 3 && d < 21)) {
+    return("Winter")
+  } else if ((m == 3 && d >= 21) || (m %in% c(4, 5)) || (m == 6 && d < 21)) {
+    return("Spring")
+  } else if ((m == 6 && d >= 21) || (m %in% c(7, 8)) || (m == 9 && d < 21)) {
+    return("Summer")
+  } else if ((m == 9 && d >= 21) || (m %in% c(10, 11)) || (m == 12 && d < 21)) {
+    return("Fall")
+  }
+  return(NA)
+}
+```
+
+```{r}
+# Daily metrics
+dailyDO <- usgsDO %>% 
+  mutate(Date = floor_date(solar.time, "1 day")) %>%
+  group_by(siteName, Date) %>%
+  summarize(
+    minDO.obs = min(DO.obs, na.rm = T),
+    maxDO.obs = max(DO.obs, na.rm = T),
+    minDO.pctsat = min(DO.pctsat, na.rm = T),
+    maxDO.pctsat = max(DO.pctsat, na.rm = T),
+    avgDO.obs = mean(DO.obs, na.rm = T),
+    avgDO.pctsat = mean(DO.pctsat, na.rm = T),
+    DOSat.hyp = sum(DO.pctsat <= 50, na.rm = T),
+    DO.hyp = sum(DO.obs <= 2, na.rm = T),
+    totalDO = n()
+    ) %>% 
+  mutate(across(where(is.numeric), ~ ifelse(is.finite(.), ., NA))) %>% 
+  mutate(across(where(is.numeric), ~ ifelse(if_any(everything(), is.na), NA, .))) %>% 
+  mutate(across(minDO.obs:avgDO.pctsat, ~ ifelse(. == 0, NA, .))) %>% 
+  mutate(DO.amp = maxDO.obs - minDO.obs,
+         DOpctsat.amp = maxDO.pctsat - minDO.pctsat,
+         probHyp = DO.hyp / totalDO,
+         probHypSat = DOSat.hyp / totalDO,
+         WaterYear = calcWaterYear(Date),
+         season = sapply(Date, calcSeason),
+         Year = year(Date))
+
+#nighttime hypoxia ratio
+nightHypRat <- usgsDO %>% 
+  mutate(across(c("DO.obs", "DO.pctsat", "DO.sat"), ~ ifelse(. == 0, NA, .))) %>% 
+  select(siteName, utc.time, solar.time, DO.obs, DO.pctsat, DO.sat, isDaytime) %>% 
+  mutate(Date = floor_date(solar.time, "1 day")) %>%
+  group_by(Date, siteName, isDaytime) %>% 
+  summarise(DO.hyp.obs = sum(DO.obs <= 2, na.rm = TRUE),
+            DO.hyp.sat = sum(DO.pctsat <= 50, na.rm = TRUE), .groups = 'drop') %>% 
+  pivot_wider(names_from = isDaytime, 
+              values_from = c(DO.hyp.obs, DO.hyp.sat), 
+              names_prefix = "DO_hyp_", 
+              names_sep = "_") %>% 
+  rename(DayHyp_obs = DO.hyp.obs_DO_hyp_TRUE, 
+         NightHyp_obs = DO.hyp.obs_DO_hyp_FALSE,
+         DayHyp_sat = DO.hyp.sat_DO_hyp_TRUE, 
+         NightHyp_sat = DO.hyp.sat_DO_hyp_FALSE) %>% 
+  mutate(NHR_obs = NightHyp_obs / DayHyp_obs,
+         NHR_sat = NightHyp_sat / DayHyp_sat,
+         WaterYear = calcWaterYear(Date),
+         Year = year(Date)) %>% 
+  mutate(across(where(is.numeric), ~ ifelse(is.finite(.), ., NA))) %>% 
+  select(Date, siteName, NHR_obs, NHR_sat)
+
+
+# Calculate probabilities for daytime
+dayHypProb <- usgsDO %>% 
+  mutate(across(c("DO.obs", "DO.pctsat", "DO.sat"), ~ ifelse(. == 0, NA, .))) %>% 
+  select(siteName, utc.time, solar.time, DO.obs, DO.pctsat, DO.sat, isDaytime) %>% 
+  mutate(Date = floor_date(solar.time, "1 day")) %>%
+  filter(isDaytime) %>%
+  group_by(siteName, Date) %>%
+  summarise(
+    dayProbConc = mean(DO.obs < 2, na.rm = TRUE),
+    dayProbSat = mean(DO.pctsat < 50, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Calculate probabilities for nighttime
+nightHypProb <- usgsDO %>%
+  mutate(across(c("DO.obs", "DO.pctsat", "DO.sat"), ~ ifelse(. == 0, NA, .))) %>% 
+  select(siteName, utc.time, solar.time, DO.obs, DO.pctsat, DO.sat, isDaytime) %>% 
+  mutate(Date = floor_date(solar.time, "1 day")) %>%
+  filter(!isDaytime) %>%
+  group_by(siteName, Date) %>%
+  summarise(
+    nightProbConc = mean(DO.obs < 2, na.rm = TRUE),
+    nightProbSat = mean(DO.pctsat < 50, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Join the daytime and nighttime probabilities
+nightHypRat <- dayHypProb %>%
+  inner_join(nightHypProb, by = c("siteName", "Date")) %>% 
+  mutate(NHR_obs = nightProbConc/dayProbConc,
+         NHR_sat = nightProbSat/dayProbSat) %>% 
+  mutate(across(where(is.numeric), ~ ifelse(is.finite(.), ., NA))) %>% 
+  mutate(WaterYear = calcWaterYear(Date),
+         Year = year(Date))
+
+
+
+
+#Merge DO Metrics
+doMet <- dailyDO %>% 
+  full_join(nightHypRat) %>% 
+  arrange(siteName, Date, WaterYear)
+```
+
+## DO Exceedance
+
+```{r}
+# Calculate the exceedance values
+doDur <- dailyDO %>%
+  mutate(Period = case_when(WaterYear <= 2020 ~ "Long Term Average",
+                       WaterYear == 2021 ~ "2021",
+                       WaterYear == 2022 ~ "2022",
+                       WaterYear == 2023 ~ "2023",
+                       WaterYear == 2024 ~ "2024")) %>% 
+  select(siteName, Period, avgDO.pctsat) %>% 
+  group_by(siteName, Period) %>%
+  filter(!is.na(avgDO.pctsat)) %>%
+  mutate(exceedance = 100 * (rank(-avgDO.pctsat) / (length(avgDO.pctsat) + 1)))
+# Calculate undersaturation
+underSat <- doDur %>%
+  group_by(siteName, Period) %>%
+  summarise(
+    modalUndersat = 100 - as.numeric(names(sort(table(avgDO.pctsat), decreasing = TRUE))[1]),
+    meanUndersat = mean(avgDO.pctsat)
+  )
+
+doDur <- doDur %>%
+  left_join(underSat)
+
+doDur %>% 
+  ggplot(aes(x = exceedance, y = avgDO.pctsat, color = Period)) +
+  geom_line() +
+  geom_hline(yintercept = 50, linetype = "dashed", alpha = 0.5)+
+  #scale_y_log10() +
+  scale_color_manual(values = c("Long Term Average" = "black", "2021" = "#1B9E77", "2022" = "#D95F02", "2023" = "#7570B3", "2024" = "#E7298A")) +
+  labs(title = "",
+       color = "Year",
+       x = "Exceedance Probability (%)",
+       y = expression(Daily ~ DO["%Sat"])) +
+  theme_few()+
+  theme(legend.title = element_blank(),
+        legend.position = "bottom")+
+  facet_wrap(~ siteName)
+```
+
+```{r}
+doDur <- usgsDO %>%
+  mutate(WaterYear = calcWaterYear(utc.time),
+    Period = case_when(WaterYear <= 2020 ~ "Long Term Average",
+                       WaterYear == 2021 ~ "2021",
+                       WaterYear == 2022 ~ "2022",
+                       WaterYear == 2023 ~ "2023",
+                       WaterYear == 2024 ~ "2024")) %>% 
+  select(siteName, Period, DO.pctsat) %>% 
+  group_by(siteName, Period) %>%
+  filter(!is.na(DO.pctsat)) %>%
+  mutate(exceedance = 100 * (rank(-DO.pctsat) / (length(DO.pctsat) + 1)))
+# Calculate undersaturation
+underSat <- doDur %>%
+  group_by(siteName, Period) %>%
+  summarise(
+    modalUndersat = 100 - as.numeric(names(sort(table(DO.pctsat), decreasing = TRUE))[1]),
+    meanUndersat = mean(DO.pctsat)
+  )
+
+doDur <- doDur %>%
+  left_join(underSat)
+
+doDur %>% 
+  ggplot(aes(x = exceedance, y = DO.pctsat, color = Period)) +
+  geom_line() +
+  geom_hline(yintercept = 50, linetype = "dashed", alpha = 0.5)+
+  #scale_y_log10() +
+  scale_color_manual(values = c("Long Term Average" = "black", "2021" = "#1B9E77", "2022" = "#D95F02", "2023" = "#7570B3", "2024" = "#E7298A")) +
+  labs(title = "",
+       color = "Year",
+       x = "Exceedance Probability (%)",
+       y = expression(DO["%Sat"])) +
+  theme_few()+
+  theme(legend.title = element_blank(),
+        legend.position = "bottom")+
+  facet_wrap(~ siteName)
+```
+
+```{r}
+dailyDO %>%
+  filter(WaterYear < 2024) %>% 
+  ggplot(aes(x = avgDO.obs, fill = siteName, after_stat(scaled))) +
+  geom_density(alpha = 0.5) +
+  scale_fill_brewer(palette = "Dark2") +
+  geom_vline(xintercept = 2, linetype = "dashed") +
+  labs(x = "DO (mg/L)", y = "Density") +
+  theme_few() +
+  theme(legend.title = element_blank(), legend.position = "bottom")+
+  facet_wrap(~WaterYear, ncol = 4, scale = "free_y") 
+
+dailyDO %>%
+  filter(WaterYear < 2024) %>% 
+  ggplot(aes(x = avgDO.pctsat, fill = siteName, after_stat(scaled))) +
+  geom_density(alpha = 0.5) +
+  #geom_histogram(aes(y=..density..), alpha=0.5, 
+  #              position="identity")+
+  scale_fill_brewer(palette = "Dark2") +
+  geom_vline(xintercept = 50, linetype = "dashed") +
+  labs(x = expression(DO["%sat"]), y = "Density") +
+  theme_few() +
+  theme(legend.title = element_blank(), legend.position = "bottom")+
+  facet_wrap(~WaterYear, ncol = 4, scale = "free_y")
+
+dailyDO %>%
+  filter(WaterYear < 2024) %>% 
+  ggplot(aes(x = avgDO.pctsat, fill = siteName)) +
+  geom_histogram(alpha = 0.5)+
+  scale_fill_brewer(palette = "Dark2") +
+  geom_vline(xintercept = 50, linetype = "dashed") +
+  labs(x = expression(DO["%sat"])) +
+  theme_few() +
+  theme(legend.title = element_blank(), legend.position = "bottom")+
+  facet_wrap(~WaterYear, ncol = 4, scale = "free_y")
+
+dailyDO %>%
+  filter(WaterYear < 2024) %>%
+  ggplot(aes(x = DOpctsat.amp, fill = siteName, after_stat(scaled))) +
+  geom_density(alpha = 0.5) +
+  scale_fill_brewer(palette = "Dark2") +
+  #geom_vline(xintercept = 50, linetype = "dashed") +
+  labs(x = expression(Daily ~ DO["%Sat"] ~ "Amplitude"),
+       y = "Density")+
+  theme_few() +
+  theme(legend.title = element_blank(), legend.position = "bottom")+
+  facet_wrap(~WaterYear, ncol = 4, scale = "free_y")
+
+doMet %>%
+  filter(WaterYear < 2024) %>%
+  ggplot(aes(Date, probHypSat, color = siteName)) +
+  geom_point(shape = 4, alpha = 0.8) +
+  theme_few() +
+  labs(y = expression(DO["%Sat"] ~ "Probability of Hypoxia"))+
+  scale_x_datetime(labels = date_format("%b"), breaks = "2 months") +
+  scale_color_brewer(palette = "Dark2")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.title.x = element_blank()) +
+  facet_wrap(~WaterYear, ncol = 4, scales = "free")
+
+doMet %>%
+  filter(WaterYear < 2024) %>%
+  ggplot(aes(Date, DOpctsat.amp, color = siteName)) +
+  geom_point(shape = 4, alpha = 0.8) +
+  theme_few() +
+  labs(y = expression(Daily ~ DO["%Sat"] ~ "Amplitude"))+
+  scale_x_datetime(labels = date_format("%b"), breaks = "2 months") +
+  scale_color_brewer(palette = "Dark2")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.title.x = element_blank()) +
+  facet_wrap(~WaterYear, ncol = 4, scales = "free") 
+
+doMet %>%
+  filter(WaterYear < 2024) %>%
+  ggplot(aes(Date, NHR_obs, color = siteName)) +
+  geom_point(shape = 4, alpha = 0.8) +
+  theme_few() +
+  labs(y = expression(DO["mg/L"] ~ "Night Hypoxia Ratio"))+
+  scale_x_datetime(labels = date_format("%b"), breaks = "2 months") +
+  scale_color_brewer(palette = "Dark2")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.title.x = element_blank()) +
+  facet_wrap(~WaterYear, ncol = 4, scales = "free")
+
+doMet %>%
+  filter(WaterYear < 2024) %>%
+  ggplot(aes(Date, NHR_sat, color = siteName)) +
+  geom_point(shape = 4, alpha = 0.8) +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b"), breaks = "2 months") +
+  scale_color_brewer(palette = "Dark2")+
+  labs(y = expression(DO["%Sat"] ~ "Night Hypoxia Ratio"))+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.title.x = element_blank()) +
+  facet_wrap(~WaterYear, ncol = 4, scales = "free")
+```
+
+## DO PCA
+
+```{r}
+usgsDOmet <- doMet %>% 
+  drop_na() %>% 
+  ungroup()
+#PCA
+doPca <- usgsDOmet %>%
+  select(minDO.pctsat, maxDO.pctsat, avgDO.pctsat, DOpctsat.amp, probHypSat,  NHR_sat) %>% 
+  #m dayProbSat, nightProbSat,
+  select(where(is.numeric)) %>% # retain only numeric columns
+  prcomp(center = T, scale = T) # do PCA on scaled data
+
+#extract loadings
+doPcaLoad <- doPca %>%
+  tidy(matrix = "loadings")
+doPcaLoad
+#Variance explained
+doPcaEig <- doPca %>%
+  tidy(matrix = "eigenvalues")
+doPcaEig
+#Scree plot
+fviz_eig(doPca, addlabels = TRUE)
+
+#Qual of representation
+fviz_cos2(doPca, choice = "var", axes = 1)
+fviz_cos2(doPca, choice = "var", axes = 2)
+
+#Biplot
+fviz_pca_biplot(doPca, 
+                col.ind = usgsDOmet$siteName,
+                palette =  RColorBrewer::brewer.pal(4, "Dark2"), 
+                addEllipses = F,
+                label = "var",
+                col.var = "black",
+                repel = TRUE,
+                legend.title = "")+
+  theme_few()
+```
+
+# Calc Hydro Metrics
+
+```{r}
+## Run sub_annual_metrics script
+dryingMet <- read_csv(here("Data/USGS_dryingMetrics.csv")) %>% 
+  drop_na(event_id, peak_date, p_value) %>%
+  mutate(dryDateStart = ymd(paste0(calendar_year, "-01-01")) + days(dry_date_start - 1),
+         peakDate = ymd(paste0(calendar_year, "-01-01")) + days(peak_date - 1),
+         siteName = factor(
+                case_when(
+                  gage == "02264000" ~ "Cypress Creek",
+                  gage == "02266200" ~ "Whittenhorse Creek",
+                  gage == "08052700" ~ "Little Elm Creek",
+                  gage == "11128500" ~ "Santa Ynez River"),
+                levels = c("Cypress Creek", "Whittenhorse Creek", "Little Elm Creek", "Santa Ynez River"),
+                ordered = T)) %>% 
+    select(-season, -meteorologic_year, -calendar_year, -peak_date, -dry_date_start, -dry_date_mean) %>% 
+    filter(dryDateStart >= peakDate)
+
+
+```
+
+```{r}
+usgsDryMet <- dryingMet %>% 
+  ungroup() %>% 
+  drop_na()
+#PCA
+dryPca <- usgsDryMet %>% 
+  ungroup() %>% 
+  select(peak2zero, drying_rate, dry_dur, peak_value, peak_quantile) %>% 
+  select(where(is.numeric)) %>% # retain only numeric columns
+  prcomp(center = T, scale = T) # do PCA on scaled data
+
+#extract loadings
+dryPcaLoad <- dryPca %>%
+  tidy(matrix = "loadings")
+dryPcaLoad
+#Variance explained
+dryPcaEig <- dryPca %>%
+  tidy(matrix = "eigenvalues")
+dryPcaEig
+#Scree plot
+fviz_eig(dryPca, addlabels = TRUE)
+
+#Qual of representation
+fviz_cos2(dryPca, choice = "var", axes = 1)
+fviz_cos2(dryPca, choice = "var", axes = 2)
+
+#Biplot
+fviz_pca_biplot(dryPca, 
+                col.ind = usgsDryMet$siteName,
+                palette =  RColorBrewer::brewer.pal(4, "Dark2"), 
+                addEllipses = F,
+                label = "var",
+                col.var = "black",
+                repel = TRUE,
+                legend.title = "")+
+  theme_few()
+```
+
+## Merge DO metrics and Q
+
+```{r}
+dryingMetExp <- dryingMet %>%
+  rowwise() %>%
+  do(data.frame(Date = seq(.$peakDate, .$dryDateStart, by = "day"), .)) %>%
+  ungroup()
+
+allMetrics <- doMet %>% 
+  left_join(dryingMetExp) %>% 
+  drop_na() %>% 
+  select(-WaterYear, -Year, -season, -minDO.obs, -maxDO.obs, -avgDO.obs, -totalDO, -DO.amp, -probHyp, -dayProbConc, -nightProbConc, -NHR_obs, -DO.hyp, -DOSat.hyp, -dryDateStart, -peakDate, -gage, -event_id) %>% 
+  write_csv(here("Data/USGS_AllMetrics.csv"))
+## I use this till tidyverse implements a scale function
+scale_numeric <- function(x) mutate_if(x, is.numeric, function(y) as.vector(scale(y)))
+
+dat <- allMetrics %>%
+  ungroup() %>% 
+  select(where(is.numeric)) %>% # retain only numeric columns
+  scale_numeric() %>%  # center and scale
+  cor(method = "pearson") %>%
+  car::scatterplotMatrix()
+
+dat <- allMetrics %>%
+  ungroup() %>% 
+  select(where(is.numeric)) %>% # retain only numeric columns
+  scale_numeric() %>%  # center and scale
+  cor(method = "pearson") %>%
+  corrplot::corrplot(type = "upper")
+
+allMetrics %>% 
+  ungroup() %>% 
+  select(where(is.numeric)) %>% # retain only numeric columns
+  scale_numeric() %>%
+  GGally::ggpairs(ggplot2::aes(colour = allMetrics$siteName),
+                  lower = list(continuous = "points", combo = "dot_no_facet"))
+```
+
+# 
+
+```{r}
+allMetrics %>%
+  ggplot(aes(drying_rate, DOpctsat.amp, group = siteName, color = siteName)) +
+  geom_point() +
+  labs(x = "Drying Rate",
+       y = expression(Daily ~ DO["%Sat"] ~ "Amplitude"))+
+  theme_few() 
+
+allMetrics %>%
+  ggplot(aes(drying_rate, avgDO.pctsat, group = siteName, color = siteName)) +
+  geom_point() +
+  labs(x = "Drying Rate",
+       y = expression(Daily ~ DO["%Sat"]))+
+  theme_few() 
+
+allMetrics %>%
+  ggplot(aes(drying_rate, probHypSat, group = siteName, color = siteName)) +
+  geom_point() +
+  labs(x = "Drying Rate",
+       y = "Probability of Hypoxia")+
+  theme_few() 
+
+allMetrics %>%
+  ggplot(aes(drying_rate, NHR_sat, group = siteName, color = siteName)) +
+  geom_point() +
+  ylim(0, 10)+
+  labs(x = "Drying Rate",
+       y = "Night Hypoxia Ratio")+
+  theme_few() 
+```
+
+```{r}
+allMetrics %>%
+  ggplot(aes(peak2zero, DOpctsat.amp, group = siteName, color = siteName)) +
+  geom_point() +
+  labs(x = "Peak to Zero",
+       y = expression(Daily ~ DO["%Sat"] ~ "Amplitude"))+
+  theme_few() 
+
+allMetrics %>%
+  ggplot(aes(peak2zero, avgDO.pctsat, group = siteName, color = siteName)) +
+  geom_point() +
+  labs(x = "Peak to Zero",
+       y = expression(Daily ~ DO["%Sat"]))+
+  theme_few() 
+
+allMetrics %>%
+  ggplot(aes(peak2zero, probHypSat, group = siteName, color = siteName)) +
+  geom_point() +
+  labs(x = "Peak to Zero",
+       y = "Probability of Hypoxia")+
+  theme_few() 
+
+allMetrics %>%
+  ggplot(aes(peak2zero, NHR_sat, group = siteName, color = siteName)) +
+  geom_point() +
+  ylim(0, 10)+
+  labs(x = "Peak to Zero",
+       y = "Night Hypoxia Ratio")+
+  theme_few() 
+```
+
+```{r}
+allMetrics %>%
+  ggplot(aes(peak_value, DOpctsat.amp, group = siteName, color = siteName)) +
+  geom_point() +
+  labs(x = "Peak Q",
+       y = expression(Daily ~ DO["%Sat"] ~ "Amplitude"))+
+  theme_few() 
+
+allMetrics %>%
+  ggplot(aes(peak_value, avgDO.pctsat, group = siteName, color = siteName)) +
+  geom_point() +
+  labs(x = "Peak Q",
+       y = expression(Daily ~ DO["%Sat"]))+
+  theme_few() 
+
+allMetrics %>%
+  ggplot(aes(peak_value, probHypSat, group = siteName, color = siteName)) +
+  geom_point() +
+  labs(x = "Peak Q",
+       y = "Probability of Hypoxia")+
+  theme_few() 
+
+allMetrics %>%
+  ggplot(aes(peak_value, NHR_sat, group = siteName, color = siteName)) +
+  geom_point() +
+  ylim(0, 10)+
+  labs(x = "Peak Q",
+       y = "Night Hypoxia Ratio")+
+  theme_few() 
+```
+
+```{r}
+allMetrics %>%
+  ggplot(aes(peak_quantile, DOpctsat.amp, group = siteName, color = siteName)) +
+  geom_point() +
+  labs(x = "Peak Q",
+       y = expression(Daily ~ DO["%Sat"] ~ "Amplitude"))+
+  theme_few() 
+
+allMetrics %>%
+  ggplot(aes(peak_quantile, avgDO.pctsat, group = siteName, color = siteName)) +
+  geom_point() +
+  labs(x = "Peak Q",
+       y = expression(Daily ~ DO["%Sat"]))+
+  theme_few() 
+
+allMetrics %>%
+  ggplot(aes(peak_quantile, probHypSat, group = siteName, color = siteName)) +
+  geom_point() +
+  labs(x = "Peak Q",
+       y = "Probability of Hypoxia")+
+  theme_few() 
+
+allMetrics %>%
+  ggplot(aes(peak_quantile, NHR_sat, group = siteName, color = siteName)) +
+  geom_point() +
+  ylim(0, 10)+
+  labs(x = "Peak Q",
+       y = "Night Hypoxia Ratio")+
+  theme_few() 
+```
+
+```{r}
+rowN <- allMetrics$siteName
+allMetrics <- allMetrics %>%
+  select(-siteName) %>% 
+  ungroup() %>% 
+  select(where(is.numeric)) %>% # retain only numeric columns
+  scale_numeric()
+
+fviz_nbclust(allMetrics, kmeans, method = "wss")
+gapStat <- clusGap(allMetrics, FUN = kmeans, K.max = 10, B = 100)
+fviz_gap_stat(gapStat)
+
+usgsKmeans <- kmeans(allMetrics, centers = 4, nstart = 25)
+fviz_cluster(usgsKmeans, allMetrics)
+```
+
+```{r}
+allMetrics_numeric <- allMetrics %>%
+  ungroup() %>% 
+  select(-siteName, -Date)
+
+# Scale the data
+allMetrics_scaled <- scale(allMetrics_numeric)
+
+# Determine the optimal number of clusters using the Elbow method
+fviz_nbclust(allMetrics_scaled, kmeans, method = "wss") +
+  labs(subtitle = "Elbow method")
+
+# Set the number of clusters (k)
+set.seed(123) # For reproducibility
+k <- 4  # You can choose the optimal k based on the Elbow method
+
+# Perform k-means clustering
+kmeans_result <- kmeans(allMetrics_scaled, centers = k, nstart = 25)
+
+# Ungroup the tibble if it is grouped
+allMetrics <- allMetrics %>% ungroup()
+
+# Add the cluster assignment to the original data
+allMetrics <- allMetrics %>%
+  mutate(cluster = kmeans_result$cluster)
+
+# Visualize the clusters using the first two principal components
+fviz_cluster(kmeans_result, data = allMetrics_scaled,
+             geom = "point", ellipse.type = "norm") +
+  labs(title = "K-means Clustering",
+       x = "Principal Component 1",
+       y = "Principal Component 2")
+
+# If you want to visualize clusters based on the original features,
+# you can use pairs plot or ggplot for specific feature pairs
+ggplot(allMetrics, aes(x = minDO.pctsat, y = maxDO.pctsat, color = as.factor(cluster))) +
+  geom_point() +
+  labs(title = "Clusters based on minDO.pctsat and maxDO.pctsat",
+       x = "Minimum DO % Saturation",
+       y = "Maximum DO % Saturation",
+       color = "Cluster")
+```
+
+```{r}
+allMetrics_numeric <- allMetrics %>%
+  ungroup() %>% 
+  select(-siteName, -Date)
+
+# Scale the data
+allMetrics_scaled <- scale(allMetrics_numeric)
+
+# Compute the distance matrix
+dist_matrix <- dist(allMetrics_scaled)
+
+# Perform hierarchical clustering using the complete linkage method
+hclust_result <- hclust(dist_matrix, method = "complete")
+
+# Plot the dendrogram
+fviz_dend(hclust_result, rect = TRUE, show_labels = FALSE) +
+  labs(title = "Hierarchical Clustering Dendrogram",
+       x = "Observations",
+       y = "Height")
+
+# Cut the dendrogram to obtain the desired number of clusters
+k <- 4  # You can choose the number of clusters based on the dendrogram
+cluster_assignments <- cutree(hclust_result, k = k)
+
+# Add the cluster assignment to the original data
+allMetrics <- allMetrics %>%
+  ungroup() %>%
+  mutate(cluster = cluster_assignments)
+
+# Visualize the clusters using the first two principal components
+fviz_cluster(list(data = allMetrics_scaled, cluster = cluster_assignments),
+             geom = "point", ellipse.type = "norm") +
+  labs(title = "Hierarchical Clustering",
+       x = "Principal Component 1",
+       y = "Principal Component 2")
+
+# Visualize clusters based on the original features and add site names
+ggplot(allMetrics, aes(x = minDO.pctsat, y = maxDO.pctsat, color = as.factor(cluster))) +
+  geom_point() +
+  geom_text(aes(label = siteName), hjust = 1.5, vjust = 1.5) +
+  labs(title = "Clusters based on minDO.pctsat and maxDO.pctsat",
+       x = "Minimum DO % Saturation",
+       y = "Maximum DO % Saturation",
+       color = "Cluster")
+```

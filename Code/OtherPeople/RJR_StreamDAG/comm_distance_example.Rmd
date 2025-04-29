@@ -1,0 +1,455 @@
+---
+title: "Comm Distance and Q"
+author: "Robert J. Ramos"
+date: '`r format(Sys.time(), "%B %d, %Y")`'
+output: 
+  html_document:
+    df_print: paged
+    keep_md: true
+  pdf_document:
+    keep_tex: yes
+    latex_engine: xelatex
+mainfont: Trebuchet MS
+sansfont: Trebuchet MS
+monofont: Consolas 
+mathfont: Trebuchet MS
+header-includes:
+- \usepackage{booktabs}
+- \usepackage{longtable}
+- \usepackage{sansmath}\sansmath
+- \usepackage{float}
+- \usepackage{booktabs}
+- \centering
+---
+
+```{r setup, include=F}
+#===========================================================
+# These packages are needed for knitting document on VSCode
+#===========================================================
+# install.packages(c("languageserver", "renv","rmarkdown","lintr","snakecase","Cairo"))
+
+#======================================================================
+# Setting working Directory when running code manually/troubleshooting
+#======================================================================
+setwd("~/Public/Google/AIMS/Manuscripts/Application_of_Communication_Distance_Ramos/code/analysis")
+
+#=====================================================================
+# Im experimenting with the renv package to try and make my code more
+# reproducible
+#=====================================================================
+renv::use(
+  "tidyr", "dplyr", "readxl", "stringr", "lubridate", "ggplot2",
+  "missForest", "doParallel", "igraph", "sf", "streamDAG",
+  library = "~/.var/lib/renv",
+  isolate = FALSE, sandbox = FALSE, attach = TRUE
+)
+
+registerDoParallel(cores = 12) # adjust this to the number of threads on your PC
+
+theme_set(
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "top",
+    legend.direction = "horizontal",
+    legend.box = "vertical",
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_blank(),
+    axis.title = element_text(size = rel(1.1), face = "bold"),
+    axis.text = element_text(size = rel(1.1), face = "bold"),
+    strip.text = element_text(size = rel(1.1), face = "bold")
+  )
+)
+Okabe_Ito <- c(
+  "#0072B2", "#E69F00", "#CC79A7", "#009E73", "#56B4E9",
+  "#D55E00", "#F0E442", "#999999", "#000000"
+)
+
+options(
+  contrasts = c("contr.sum", "contr.poly"),
+  tibble.print_max = Inf, tibble.width = Inf,
+  ggplot2.discrete.fill = Okabe_Ito,
+  ggplot2.discrete.colour = Okabe_Ito
+  # ggplot2.discrete.fill = function() {
+  #   scale_fill_brewer(palette = "4-class Paired", direction = 1)
+  # },
+  # ggplot2.discrete.colour = function() {
+  #   scale_colour_brewer(palette = "4-class Paired", direction = 1)
+  # }
+)
+knitr::opts_chunk$set(
+  echo = FALSE, dev = "png", dpi = 600, fig.width = 5, fig.height = 5,
+  dev.args = list(family = "Arial", type = "cairo")
+)
+
+``` 
+
+```{r dropping_sites, eval = FALSE}
+# reading had merged table
+wetness_table_combined <- as.data.frame(read_excel(
+  "wetness_table_combined.xlsx",
+  sheet = 1,
+  na = "NA",
+  guess_max = 1048576
+))
+
+# Moving timestamps to rownames
+row.names(wetness_table_combined) <- wetness_table_combined$datetime
+wetness_table_combined <- wetness_table_combined[
+  colnames(wetness_table_combined) != "datetime"
+]
+
+# Checking if sites have at least 50% data
+lost_columns <- colnames(wetness_table_combined[
+  !(colSums(
+    unname(is.na(wetness_table_combined))) < nrow(wetness_table_combined) * 0.5
+  )
+])
+
+# Removing sites that have less than 50% NA
+wetness_table_filtered <- wetness_table_combined[
+  (colSums(unname(is.na(wetness_table_combined))) < nrow(wetness_table_combined) * 0.5)
+]
+
+paste("The locations",paste(lost_columns), "had recordings for less than 50% of the time and were removed.")
+```
+
+```{r gap_filling, cache = TRUE, eval = FALSE}
+# Function to do the gap filling, using the missForest package
+# This is probably no longer necessary, I think Ken has this
+# incoporated in a StreamDag function now
+STIC.RFimpute <- function(p.a, ...) {
+  # ensure the object p.a is a dataframe
+  new <- data.frame(p.a, check.names = FALSE)
+  # make every column a factor
+  for(i in 1:ncol(new)){
+    new[, i] <- factor(p.a[, i], levels = c(0, 1))
+    }
+  # Apply random forest model
+  mf <- missForest(xmis = new, parallelize = "forests", ...)
+  # Give the output a class of "STICimpute"
+  class(mf) <- "STICimpute"
+  # return our STICimput object when function is run
+  return(mf)
+}
+
+wetness_table_filled <- STIC.RFimpute(wetness_table_filtered)
+wetness_table_error <- wetness_table_filled[["OOBerror"]]
+wetness_table_filled <- wetness_table_filled[["ximp"]]
+wetness_table_filled[] <- lapply(wetness_table_filled, as.character)
+wetness_table_filled[] <- lapply(wetness_table_filled, as.integer)
+write.table(wetness_table_filled, "wetness_table_filled.tsv", sep = "\t")
+
+paste(
+  "The Random Forest gapfilling algorithm estimates that",
+  wetness_table_error, "proportion of entries were falsely classified."
+)
+
+paste("The following sites were retained:", colnames(wetness_table_filled))
+
+```
+
+```{r setup_network}
+# Manualy describe network at Konza
+full_network <- graph_from_literal(
+  "04M13" --+ "04M12",
+  "04M12" --+ "04M11",
+  "04M11" --+ "04M10",
+  "04M10" --+ "04M09",
+  "04M09" --+ "04M08",
+  "04T02" --+ "04M08",
+  "04M08" --+ "04M07",
+  "04M07" --+ "04M06",
+  "04T01" --+ "04M06",
+  "04M06" --+ "04M05",
+  "04M05" --+ "04M04",
+  "04M04" --+ "04M03",
+  "04M03" --+ "04M02",
+  "04M02" --+ "04M01",
+  "04M01" --+ "SFM02",
+  "04W04" --+ "04W03",
+  "04W03" --+ "04W02",
+  "04W02" --+ "04W01",
+  "04W01" --+ "04M01",
+  "02M11" --+ "02M10",
+  "02M10" --+ "02M09",
+  "02M09" --+ "02M08",
+  "02M08" --+ "02M07",
+  "02M07" --+ "02M06",
+  "02M06" --+ "02M05",
+  "02M05" --+ "02M04",
+  "02M04" --+ "02M03",
+  "02M03" --+ "02M02",
+  "02M02" --+ "02M01",
+  "02M01" --+ "SFM01",
+  "20M05" --+ "20M04",
+  "20M04" --+ "20M03",
+  "20M03" --+ "20M02",
+  "20M02" --+ "20M01",
+  "20M01" --+ "SFM07",
+  "01M06" --+ "01M05",
+  "01M05" --+ "01M04",
+  "01M04" --+ "01M03",
+  "01M03" --+ "01M02",
+  "01M02" --+ "01M01",
+  "01M01" --+ "SFM07",
+  "SFM07" --+ "SFM06",
+  "SFM06" --+ "SFM05",
+  "SFT02" --+ "SFM05",
+  "SFM05" --+ "SFM04",
+  "SFM04" --+ "SFM03",
+  "SFT01" --+ "SFM03",
+  "SFM03" --+ "SFM02",
+  "SFM02" --+ "SFM01"
+)
+
+#===============================================================================
+# I tried, I really did to automate this. This problem sucks to  work through,
+# and ultimatly this did not work. I still need to redraw the network by hand
+# when we drop locations do to missing data. Ken's delete.nodes.pa does
+# NOT redraw arcs so it does not work for this use case.
+#===============================================================================
+
+# network <- full_network
+# V(network)$joining <- V(network)$name
+# for(location in lost_columns) {
+#   # I hate that this is so complicated. Renaming each node that I want
+#   # to remove by its downstream location's name. This will let me 
+#   # use contract to remove them while redrawing the network. 
+#   # This assumes one downstream, so it wont work with islands.
+#   network <- set.vertex.attribute(
+#     network,
+#     index = V(network)[name=location],
+#     name = "joining",
+#     names(unlist(ego(
+#       network,
+#       order = 1,
+#       nodes = V(full_network)[name=lost_columns[1]],
+#       mode = c("out"),
+#       mindist = 1
+#     )))
+#   )
+# }
+
+# plot(network)
+# network <- contract.vertices(
+#   network, factor(V(network)$joining), "first"
+# )
+# plot(network)
+# network <- simplify(network)
+# plot(network)
+
+#===============================================================================
+
+# Hand modified network
+network <- graph_from_literal(
+  "04M13" --+ "04M12",
+  "04M12" --+ "04M11",
+  "04M11" --+ "04M10",
+  "04M10" --+ "04M09",
+  "04M09" --+ "04M08",
+  "04T02" --+ "04M08",
+  "04M08" --+ "04M07",
+  "04M07" --+ "04M06",
+  "04T01" --+ "04M06",
+  "04M06" --+ "04M05",
+  "04M05" --+ "04M04",
+  "04M04" --+ "04M02",
+  # "04M03" --+ "04M02", Removed 04M03
+  "04M02" --+ "04M01",
+  "04M01" --+ "SFM02",
+  "04W04" --+ "04W03",
+  "04W03" --+ "04W02",
+  "04W02" --+ "04W01",
+  "04W01" --+ "04M01",
+  "02M11" --+ "02M10",
+  "02M10" --+ "02M09",
+  "02M09" --+ "02M08",
+  "02M08" --+ "02M07",
+  "02M07" --+ "02M06",
+  "02M06" --+ "02M04",
+  # "02M05" --+ "02M04", Removed 02M05
+  "02M04" --+ "02M03",
+  "02M03" --+ "02M02",
+  "02M02" --+ "02M01",
+  "02M01" --+ "SFM01",
+  "20M05" --+ "20M04",
+  "20M04" --+ "20M02",
+  # "20M03" --+ "20M02", Removed 20M03
+  "20M02" --+ "20M01",
+  "20M01" --+ "SFM07",
+  "01M06" --+ "01M04",
+  # "01M05" --+ "01M04", Removed 01M05
+  "01M04" --+ "01M03",
+  "01M03" --+ "01M02",
+  "01M02" --+ "01M01",
+  "01M01" --+ "SFM07",
+  "SFM07" --+ "SFM06",
+  "SFM06" --+ "SFM05",
+  "SFT02" --+ "SFM05",
+  "SFM05" --+ "SFM04",
+  "SFM04" --+ "SFM03",
+  # "SFT01" --+ "SFM03", Removed SFT01
+  "SFM03" --+ "SFM02",
+  "SFM02" --+ "SFM01"
+)
+
+```
+
+```{r marginal_probabilities, warning = FALSE}
+wetness_table_filled <- read.table(
+  "wetness_table_filled.tsv", sep = "\t", check.names = FALSE
+)
+
+date_function <- function(startdate, enddate, increment, window) {
+  # iter_length is going to be the number of days. if you increase the
+  # window you can increase increment here to keep time windows
+  # non-overlapping
+  iter_length <- trunc(
+    days(as.integer(ymd_hms(enddate) - ymd_hms(startdate))) /
+    days(increment)
+  )
+  iter <- c(0:iter_length)
+  list_of_dates <- list()
+  for (i in iter[-length(iter)]) {
+    list_of_dates <- append(list_of_dates, list(data.frame(
+      # substract (i - #) day to date, increasing this allows for overlapping
+      # periods
+      start = ymd_hms(startdate) + days(i-window) * increment,
+      # end date
+      end = ymd_hms(startdate) + days(i) * increment
+    )))
+  }
+  list_of_intervals <- list()
+  for (dates in list_of_dates) {
+    list_of_intervals <- append(
+      list_of_intervals, list(
+        as.character(seq(
+        ymd_hms(dates[["start"]]), ymd_hms(dates[["end"]]),
+        by = "15 mins"
+        ))
+      )
+    )
+  }
+  return(list_of_intervals)
+}
+
+list_of_intervals <- date_function(
+  "2021-05-22 12:00:00", "2022-10-30 12:00:00", 1, 2
+)
+
+results <- data.frame()
+for (interval in list_of_intervals) {
+  presences <- arc.pa.from.nodes(
+    network,
+    wetness_table_filled[rownames(wetness_table_filled) %in% interval, ]
+  )
+  # Correlation Matrix
+  corr <- cor(presences, use = "pairwise.complete.obs")
+
+  # Marginal Probs
+  marginal <- colMeans(presences, na.rm = TRUE)
+
+  # Impossible correlations (given marginal probabilities) are adjusted
+  corrected_corr <- R.bounds(marginal, corr)
+
+  results <- rbind(
+    results,
+    data.frame(
+      t(marginal),
+      row.names = c(interval[length(interval)]),
+      check.names = FALSE
+    )
+  )
+}
+
+marginal_probabilities <- t(results)
+# remove spaces in rownames
+row.names(marginal_probabilities) <- str_replace_all(
+  rownames(marginal_probabilities), " ", ""
+)
+
+bayesian_results <- data.frame()
+
+for (interval in list_of_intervals) {
+  presences <- arc.pa.from.nodes(
+    network,
+    wetness_table_filled[rownames(wetness_table_filled) %in% interval, ]
+  )
+  b <- beta.posterior(
+    p.prior = 0.5,
+    dat = presences,
+    w = 0.25
+  )
+  means <- b$alpha / (b$alpha + b$beta)
+  bayesian_results <- rbind(
+    bayesian_results,
+    data.frame(
+      t(means),
+      row.names = c(interval[length(interval)]),
+      check.names = FALSE
+    )
+  )
+}
+
+bayesian_marginal_probabilities <- t(bayesian_results)
+# remove spaces in rownames
+row.names(bayesian_marginal_probabilities) <- str_replace_all(
+  rownames(bayesian_marginal_probabilities), " ", ""
+)
+
+```
+
+```{r plot_distribution, warning = FALSE}
+#===================================================================
+# This is just a proof of concept creating a plot like in streamDAG
+#===================================================================
+presences_test <- arc.pa.from.nodes(
+  network,
+  wetness_table_filled[
+    rownames(wetness_table_filled) %in% list_of_intervals[[90]]
+  , ]
+)
+b <- beta.posterior(p.prior = 0.5, dat = presences_test, w = 1 / 4)
+
+means <- b$alpha / (b$alpha + b$beta)
+
+# setting up full plot
+col <- gray(means / max(means))
+
+par(mfrow = c(9, 5), oma = c(4, 4.5, 0.1, 1), mar = c(0, 0, 1.2, 0.6))
+
+# individual sub-plots
+for (i in 1:44) {
+  x <- seq(0.0, 1, by = .001)
+  y <- dbeta(x, b$alpha[i], b$beta[i])
+  n <- length(x)
+  plot(
+    x,
+    yaxt = ifelse(i %in% c(1,6,11,16,21,26,31,36,41), "s", "n"),
+    xaxt = ifelse(i %in% 41:45, "s", "n"),
+    xlim = c(0, 1), ylim = c(0, 5.5),
+    type = "n", cex.axis = .8
+  )
+  polygon(c(x, x[n:1]), c(y, rep(0, n)), col = col[i], border = "grey")
+  segments(
+    means[i], 0, means[i], dbeta(means[i], b$alpha[i], b$beta[i]), lty = 2
+  )
+  mtext(side = 3, names(b$beta)[i], cex = .5)
+}
+
+# axis labels
+mtext(
+  side = 2, outer = T,
+  expression(
+    paste(italic(f), "(", theta[italic(k)], "|", italic(x[k]), ")")
+  ), line = 2.5
+)
+
+mtext(
+  side = 1, outer = TRUE,
+  expression(paste(theta[italic(k)], "|", italic(x[k]))),
+  line = 2.5
+)
+```

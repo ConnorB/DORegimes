@@ -1,0 +1,1446 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+#| echo: false
+
+library(tidyverse)
+library(tidygraph)
+library(data.table)
+library(ggthemes)
+library(here)
+library(sf)
+library(streamDAG)
+library(furrr)
+library(future)
+library(riverdist)
+library(sfnetworks)
+source(here("Code/paths+packages.R"))
+library(mapview)
+gpGeopkg <- "~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg"
+# EPSG for NAD83 / UTM zone 14N
+UTM_14N <- 26914
+source(here("Code/AIMS_DAGs.R"))
+```
+
+```{r}
+stream <- st_read(gpGeopkg, layer = "Streams", quiet = T) |> 
+  filter(watershed %in% c("KNZ", "SHN", "YMR"))
+
+# Load sites
+coords <- st_read(gpGeopkg, layer = "Sites", quiet = TRUE) |> 
+  filter(watershed %in% c("KNZ", "SHN", "YMR")) |> 
+  st_transform(crs = 4326) |> 
+  mutate(
+    lon = st_coordinates(geom)[, "X"],
+    lat  = st_coordinates(geom)[, "Y"]
+  ) |> 
+  # Transform back to original CRS (NAD83 / UTM zone 14N)
+  st_transform(crs = UTM_14N) 
+
+shnStream <- stream |> filter(watershed == "SHN")
+shnCoords <- coords |> filter(watershed == "SHN")
+
+kmzStream <- stream |> filter(watershed == "KNZ")
+kmzCoords <- coords |> filter(watershed == "KNZ")
+
+ymrStream <- stream |> filter(watershed == "YMR")
+ymrCoords <- coords |> filter(watershed == "YMR")
+map <- mapview(
+    coords,
+    map.types = "Esri.WorldImagery",
+    col.regions = "red",
+    cex = 5,
+    layer.name = "Sampling Sites"
+  ) +
+  mapview(
+    stream,
+    color = "blue",
+    lwd = 2,
+    layer.name = "Streams"
+  ) 
+map
+```
+
+# STICs
+
+```{r}
+
+sticsRaw <- list.files(here("Data/STICs"), full.names = TRUE, recursive = TRUE) |>
+  # Only keep files in folders that end with _combined
+  keep(\(x) basename(dirname(x)) |> str_detect("_combined$")) |>
+  lapply(\(file) {
+    read_csv(file, col_types = cols(.default = col_character()))
+  }) |>
+  bind_rows() |>
+  rename(dateTime = datetime) |>
+  filter(qual_rating != "poor") |>
+  #filter(siteId %in% seSites$siteId & qual_rating != "poor") |>
+  mutate(
+    dateTime = ymd_hms(dateTime),
+    wetdry = case_when(
+    wetdry %in% c("dry", "0") ~ 0,
+    wetdry %in% c("wet", "1") ~ 1,
+    TRUE ~ NA_real_),
+    site_subloc = coalesce(siteID, siteId)) |> 
+  select(dateTime, site_subloc, wetdry)
+
+
+# Step 1: Extract base ID and set priority
+sticsRaw <- sticsRaw |>
+  mutate(
+    siteId = str_remove(site_subloc, "_(1|2|DUP)$"),
+    priority = case_when(
+      str_ends(site_subloc, "_1")   ~ 2,
+      str_ends(site_subloc, "_DUP") ~ 3,
+      str_ends(site_subloc, "_2")   ~ 4,
+      TRUE                     ~ 1  # fallback for others
+    )
+  )
+
+# Step 2: Convert to data.table
+setDT(sticsRaw)
+
+# Step 3: Sort so that higher priority comes first
+setorder(sticsRaw, siteId, dateTime, priority)
+
+# Step 4: Coalesce wetdry using first non-NA value with priority
+sticsRaw <- sticsRaw[
+  !is.na(wetdry), 
+  .SD[1], 
+  by = .(siteId, dateTime)
+][, priority := NULL]
+
+
+#sticsRaw[, sublocation := ifelse(is.na(rep), "HS", rep)]
+
+sticsRaw <- sticsRaw |> 
+  drop_na(siteId) |> 
+  select(dateTime, siteId, wetdry) |> 
+  filter(siteId %in% coords$siteId) |> 
+  group_by(siteId) |>
+  complete(dateTime = seq(min(dateTime), max(dateTime), by = "15 min")) |>
+  arrange(siteId, dateTime) |>
+  # Fill missing wetdry values with the last observation carried forward;
+  # maxgap = 4 means only fill if the gap is no longer than 4 intervals (i.e. 1 hour)
+  mutate(wetdry = zoo::na.locf(wetdry, na.rm = FALSE, maxgap = 8)) |>
+  ungroup() |> 
+  filter(minute(dateTime) %% 15 == 0) |> 
+  pivot_wider(
+    names_from = siteId,
+    values_from = wetdry
+    )
+
+sticsRaw |> 
+  ggplot(aes(y = SFM01, x = dateTime)) +
+  geom_line(linewidth = 0.75) +
+  theme_few()+
+  labs(title = "SFM01",
+       x = "")
+
+sticsRaw |> 
+  ggplot(aes(y = ENM01, x = dateTime)) +
+  geom_line(linewidth = 0.75) +
+  theme_few()+
+  labs(title = "ENM01",
+       x = "")
+
+sticsRaw |> 
+  ggplot(aes(y = SHM01, x = dateTime)) +
+  geom_line(linewidth = 0.75) +
+  theme_few()+
+  labs(title = "SHM01",
+       x = "")
+```
+
+# Fake STICs
+
+```{r}
+#Read in PTs for LTMs, since there are no STICs
+pts <- aims_read(here("Data/STICs/PTs"), rType = "PRES", sublocation = "SW", fill = T) |> 
+  select(siteId, dateTime = datetime, wetdry) |> 
+  mutate(wetdry = ifelse(wetdry == "wet", 1, 
+                          ifelse(wetdry == "dry", 0, NA))) |> 
+  group_by(siteId) |>
+  complete(dateTime = seq(min(dateTime), max(dateTime), by = "15 min")) |>
+  arrange(siteId, dateTime) |>
+  # Fill missing wetdry values with the last observation carried forward;
+  # maxgap = 4 means only fill if the gap is no longer than 4 intervals (i.e. 1 hour)
+  mutate(wetdry = zoo::na.locf(wetdry, na.rm = FALSE, maxgap = 4)) |>
+  ungroup() |> 
+  filter(minute(dateTime) %% 15 == 0) |> 
+  mutate(siteId = paste0(siteId, "_PT")) |> 
+  pivot_wider(
+    names_from = siteId,
+    values_from = wetdry
+    )
+
+
+pts |> 
+  ggplot(aes(y = SFM01_PT, x = dateTime)) +
+  geom_line(linewidth = 0.75) +
+  theme_few()+
+  labs(title = "SFM01",
+       x = "")
+
+pts |> 
+  ggplot(aes(y = ENM01_PT, x = dateTime)) +
+  geom_line(linewidth = 0.75) +
+  theme_few()+
+  labs(title = "ENM01",
+       x = "")
+
+pts |> 
+  ggplot(aes(y = SHM01_PT, x = dateTime)) +
+  geom_line(linewidth = 0.75) +
+  theme_few()+
+  labs(title = "SHM01",
+       x = "")
+```
+
+# Join STICs and PTs
+
+```{r}
+# 1. Pivot both to long format
+pts <- pts |> 
+  pivot_longer(-dateTime, names_to = "siteId", values_to = "wet_PT") |>
+  mutate(siteId = str_remove(siteId, "_PT$"))
+
+sticsRaw <- sticsRaw |> 
+  pivot_longer(-dateTime, names_to = "siteId", values_to = "wet_STIC")
+
+# 2. Join and coalesce values
+stics_wide <- full_join(sticsRaw, pts, by = c("dateTime", "siteId")) |>
+  mutate(wetdry = coalesce(wet_STIC, wet_PT)) |>
+  select(dateTime, siteId, wetdry) |> 
+  pivot_wider(names_from = siteId, values_from = wetdry) |> 
+  mutate(ENM10 = coalesce(ENM10, ENM11),
+         EN202 = coalesce(EN202, EN201)) |> 
+    select(-ENM10, -EN201)
+
+
+stics_wide |> 
+  ggplot(aes(y = SFM01, x = dateTime)) +
+  geom_line(linewidth = 0.75) +
+  theme_few()+
+  labs(title = "SFM01",
+       x = "")
+
+stics_wide |> 
+  ggplot(aes(y = ENM01, x = dateTime)) +
+  geom_line(linewidth = 0.75) +
+  theme_few()+
+  labs(title = "ENM01",
+       x = "")
+
+stics_wide |> 
+  ggplot(aes(y = SHM01, x = dateTime)) +
+  geom_line(linewidth = 0.75) +
+  theme_few()+
+  labs(title = "SHM01",
+       x = "")
+
+
+stics_wide |> 
+  ggplot(aes(y = EN302, x = dateTime)) +
+  geom_line(linewidth = 0.75) +
+  theme_few()+
+  labs(title = "EN302",
+       x = "")
+```
+
+# Daily % Wet
+
+```{r}
+dailyPercWet <- stics_wide |>
+  pivot_longer(-dateTime, names_to = "siteId", values_to = "wetdry") |> 
+  left_join(coords |> select(siteId, watershed) |> st_drop_geometry(), by = "siteId") |> 
+  mutate(Date = as.Date(dateTime)) |> 
+  group_by(watershed, Date) |>                                
+  summarize(
+    PercWet_1d = sum(wetdry == 1, na.rm = TRUE) / sum(!is.na(wetdry)),
+    n_stics = n_distinct(siteId[!is.na(wetdry)]),
+    tot_stics = n_distinct(siteId),  # ← counted from all sites present on that day in this watershed
+    pct_coverage = n_stics / tot_stics,
+    .groups = "drop"
+  ) |> 
+  group_by(watershed) |> 
+  mutate(dPercWet_1d = PercWet_1d - lag(PercWet_1d)) |> 
+  ungroup() |> 
+  filter(!is.na(PercWet_1d) & !is.na(dPercWet_1d)) |> 
+  write_csv(here("Data/gpDailyPercWet.csv"))
+
+
+dailyPercWet |>
+  ggplot(aes(Date, PercWet_1d)) +
+  geom_point() +
+  theme_few() +
+    theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~watershed, scales = "free", ncol = 1) 
+
+dailyPercWet |>
+  ggplot(aes(Date, dPercWet_1d)) +
+  geom_point() +
+  theme_few() +
+    theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~watershed, scales = "free", ncol = 1)
+
+dailyPercWet |>
+  ggplot(aes(Date, n_stics)) +
+  geom_point() +
+  theme_few() +
+    theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~watershed, scales = "free", ncol = 1)
+```
+
+# StreamDAG
+
+```{r}
+source(here("Code/AIMS_DAGs.R"))
+```
+
+## Clean STICs
+
+```{r}
+stics <- stics_wide |>
+  pivot_longer(-dateTime, names_to = "siteId", values_to = "wetdry") |> 
+  left_join(coords |> select(siteId, watershed) |> st_drop_geometry(), by = "siteId")
+
+daily_presAbs <- stics |>
+  mutate(
+    date = as_date(dateTime)
+  ) |>
+  filter(!is.na(watershed)) |>
+  group_by(watershed, siteId, date) |>
+  summarise(wetdry = get_mode(wetdry), .groups = "drop") |>
+  split(~watershed, drop = TRUE) |> 
+  lapply(\(df) {
+    df |>
+      select(date, siteId, wetdry) |>
+      pivot_wider(
+        names_from = siteId,
+        values_from = wetdry
+      )
+  })
+daily_presAbs <- daily_presAbs |> imap(\(df, ws) {
+  site_data <- df |> select(-date)
+  
+  # Logical vector: TRUE if any site has non-NA on that row
+  non_na_rows <- site_data |> 
+    pmap_lgl(\(...) any(!is.na(c(...))))
+  
+  # Find the first and last row with any data
+  row_start <- which(non_na_rows) |> first()
+  row_end   <- which(non_na_rows) |> last()
+  
+  # Slice to keep only rows between first and last data
+  df |> slice(row_start:row_end)
+})
+
+daily_presAbs_clean <- map(daily_presAbs, stics_not_na)
+doParallel::registerDoParallel(cores = nCores)
+daily_presAbs_filled <- map(daily_presAbs_clean, STIC.RFimpute_parallel)
+
+# Trim and rebuild networks based on daily_presAbs_filled
+aimsNets <- imap(aimsNets, \(net, wshed) {
+  keep_nodes <- names(daily_presAbs_filled[[wshed]])[-1]
+  reconnect_and_remove_nodes(net, keep_nodes)
+})
+```
+
+```{r}
+shnDailyPresAbs <- daily_presAbs_clean[["SHN"]]
+kmzDailyPresAbs <- daily_presAbs_clean[["KNZ"]]
+ymrDailyPresAbs <- daily_presAbs_clean[["YMR"]]
+```
+
+```{r}
+
+global_metrics <- c(
+  "Size", "Diameter", "Graph.order", "n.Sources", "Mean.a.centrality", 
+  "n.Paths.to.sink", "Path.length.mean", "Path.length.var", "Path.length.skew", 
+  "Path.length.kurt", "Degree.mean", "Degree.var", "Degree.skew", "Degree.kurt", 
+  "Shreve.number", "Strahler.number", "First.Zagreb", "Second.Zagreb", "ABC", 
+  "Harary", "Global.efficiency", "Assort.in.out", "Assort.in.in"
+)
+```
+
+# Shane
+
+## Network Graph
+
+```{r}
+
+# Check which site IDs are not in the graph
+missing_graph <- setdiff(shnCoords$siteId, names(V(aimsNets[["SHN"]])))
+# Check which graph nodes are not in the coordinate data
+missing_coords <- setdiff(names(V(aimsNets[["SHN"]])), shnCoords$siteId)
+# Combine all sites from coords or graph
+all_sites <- union(names(V(aimsNets[["SHN"]])), shnCoords$siteId)
+# Find sites missing from the presence/absence data
+missing_from_presabs <- setdiff(all_sites, colnames(shnDailyPresAbs)[-1])
+
+spatial.plot(aimsNets[["SHN"]], shnCoords$long, shnCoords$lat, shnCoords$siteId, cex.text = .7)
+```
+
+## Unweighted
+
+### Local
+
+```{r}
+localMetrics <- local.summary(aimsNets[["SHN"]]) |> 
+  as_tibble(rownames = "metrics") |> 
+  drop_na() |> 
+  column_to_rownames("metrics") |>
+  t() |>
+  scale() |>
+  t() |>
+  as_tibble(rownames = "metrics") |> 
+  pivot_longer(-metrics, names_to = "siteId", values_to = "value") |> 
+  mutate(siteId = factor(siteId, levels = topo_sort(aimsNets[["SHN"]], mode = "out")$name))
+
+
+localMetrics |> 
+  ggplot(aes(x = siteId, y = value)) +
+   geom_bar(stat = "identity") +
+   theme_few() + 
+   theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+   ylab("Standardized local measures") +
+   xlab("\nNode")+
+  facet_wrap(~metrics, ncol = 2)
+```
+
+### Global
+
+```{r}
+#global_metrics <- rownames(global.summary(aimsNets[["SHN"]], sink = "SHM01"))
+
+# Set up parallel processing
+plan(multisession, workers = 6)
+
+# Process all rows in the original dataset
+# No filtering by date range - use all dates in shnPresAbs$dateTime
+global_list <- future_map(1:nrow(shnDailyPresAbs), function(i) {
+  global.summary(
+    delete.nodes.pa(aimsNets[["SHN"]], shnDailyPresAbs[i, -1], na.response = "treat.as.1"),
+    sink = "SHM01"
+  )
+}, .options = furrr_options(seed = TRUE), .progress = TRUE)
+
+
+global_df <- bind_rows(lapply(global_list, function(x) {
+  as_tibble_row(setNames(as.list(x), global_metrics))
+})) |> 
+  mutate(dateTime = shnDailyPresAbs[[1]]) |> 
+  relocate(dateTime, .before = 1) |> 
+  mutate(across(
+    where(is.numeric) & !all_of(c("Strahler.number", "Shreve.number")),
+    ~ scale(.x) |> as.vector()
+  )) |>
+  pivot_longer(
+    cols = -dateTime,           # All columns except date
+    names_to = "metric",    # New column for metric names
+    values_to = "value"     # New column for the values
+  )
+
+global_df |> 
+  ggplot(aes(y = value, x = dateTime)) +
+  geom_line(linewidth = 0.75, aes(color = metric)) +
+  facet_wrap(~metric) +
+  theme_few()+
+    scale_color_manual(values = rep(okabeIto, length.out = length(unique(global_df$metric))))+
+  labs(title = "Unweighted",
+    x = "",
+       y = "Stand. Global Measures") +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+
+
+```
+
+## Calculate Stream Distance
+
+```{r}
+# Calculate the distance along the stream network
+streamDist <- calc_stream_dist(shnStream, shnCoords)
+# Extract edges from aimsNets[["SHN"]] and format them as "From -> To"
+shnEdges <- aimsNets[["SHN"]] |> 
+  as_edgelist() |> 
+  apply(1, paste, collapse = " -> ")
+
+# Filter streamDist to keep only arcs found in shnEdges
+shn_lengths <- streamDist |> 
+  filter(Arcs %in% shnEdges) |> 
+  mutate(Lengths = dist_m / 1000) |> 
+  select(Arcs, Lengths)
+
+library(viridis)
+
+# Map lengths to colors
+shn_lengths$col <- viridis(nrow(shn_lengths))[rank(shn_lengths$Lengths)]
+# match edge colors by name
+edge_colors <- shn_lengths$col[match(shnEdges, shn_lengths$Arcs)]
+
+spatial.plot(aimsNets[["SHN"]], shnCoords$lon, shnCoords$lat, shnCoords$siteId,
+             arrow.col = edge_colors, arrow.lwd = 1.5, 
+             col = "lightblue", cex.text = .7, plot.bg = "white")
+
+```
+
+## Weighted
+
+### Local
+
+```{r}
+# Add lengths as weights to aimsNets[["SHN"]]
+aimsNets[["SHN"]] <- aimsNets[["SHN"]] |> 
+  as_tbl_graph() |> 
+  activate(edges) |> 
+  mutate(weight = shn_lengths$Lengths)
+
+# Calculate strength and alpha centrality
+weighted_local_scaled <- aimsNets[["SHN"]] |> 
+  activate(nodes) |> 
+  mutate(
+    topological_order = node_topo_order(),  # Correct function for topological sorting
+    StrengthLength = centrality_degree(weights = weight),
+    AlphaCentrality = centrality_alpha(weights = weight)
+  ) |> 
+  as_tibble() |> 
+  arrange(topological_order) |> 
+  mutate(across(c(StrengthLength, AlphaCentrality), scale)) |> 
+  pivot_longer(cols = c(StrengthLength, AlphaCentrality), names_to = "Measure", values_to = "Value") |> 
+  mutate(name = factor(name, levels = unique(name)))
+
+# Plot the results
+ggplot(weighted_local_scaled, aes(x = name, y = Value)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~Measure, scales = "free_y") +
+  theme_few() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, size = 4.3)) +
+  labs(
+    title = "Weighted", 
+    y = "Stand. Local Measures",
+    x = "Node"
+  )
+```
+
+### Global
+
+```{r}
+# Define the metrics names
+metric_names <- c(
+  icsl = "ICSL",
+  intact_to_sink = "IntactStreamLength",
+  a_cent = "AlphaCentrality",
+  harary = "Harary"
+)
+
+# Set up parallel processing
+plan(multisession)
+
+# Compute global metrics for each row of the dataframe
+gWeightedList <- future_map(1:nrow(shnDailyPresAbs), function(i) {
+  
+  temp_graph <- delete.nodes.pa(aimsNets[["SHN"]], shnDailyPresAbs[i, -1], na.response = "treat.as.1")
+  
+  # Match arcs to lengths explicitly
+  edges_attr <- attributes(E(temp_graph))$vname
+  namelv <- gsub(" -> ", "|", shn_lengths$Arcs)
+  length_sub <- shn_lengths$Lengths[match(edges_attr, namelv)]
+  
+  E(temp_graph)$weights <- length_sub
+  
+  tibble(
+    icsl = ICSL(temp_graph, lengths = length_sub),
+    intact_to_sink = size.intact.to.sink(temp_graph, sink = "SHM01"),
+    a_cent = mean(alpha_centrality(temp_graph), na.rm = TRUE),
+    harary = harary(temp_graph)
+  )
+}, .options = furrr_options(seed = TRUE), .progress = TRUE)
+plan(sequential)
+
+# Combine the list into a dataframe
+gWeighted <- bind_rows(gWeightedList) |> 
+  mutate(dateTime = shnDailyPresAbs[[1]]) |> 
+  relocate(dateTime, .before = 1) |> 
+  pivot_longer(cols = -dateTime, names_to = "metric", values_to = "value") |> 
+  mutate(metric = recode(metric, !!!metric_names))
+
+shnGlobalWeighted <- gWeighted |> 
+  pivot_wider(names_from = metric, values_from = value) |> 
+  mutate(siteId = "SHN")
+
+gWeightedScaled <- bind_rows(gWeightedList) |> 
+  mutate(dateTime = shnDailyPresAbs[[1]]) |> 
+  relocate(dateTime, .before = 1) |> 
+  mutate(across(where(is.numeric), ~ scale(.x) |> as.vector())) |> 
+  pivot_longer(cols = -dateTime, names_to = "metric", values_to = "value") |> 
+  mutate(metric = recode(metric, !!!metric_names))
+
+# Plot using ggplot2
+gWeighted |> 
+  ggplot(aes(x = dateTime, y = value)) +
+  geom_line(linewidth = 0.75, aes(color = metric)) +
+  facet_wrap(~factor(metric, levels = metric_names), scales = "free_y") +
+  theme_few() +
+  scale_color_manual(values = okabeIto)+
+  labs(
+    title = "Weighted",
+    x = "",
+    y = "Global Measures",
+    color = "Metric"
+  ) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+
+gWeightedScaled |> 
+  ggplot(aes(x = dateTime, y = value)) +
+  geom_line(linewidth = 0.75, aes(color = metric)) +
+  facet_wrap(~factor(metric, levels = metric_names)) +
+  theme_few() +
+  scale_color_manual(values = okabeIto)+
+  labs(
+    title = "Shane Weighted STIC Metrics",
+    x = "",
+    y = "Stand. Global Measures",
+    color = "Metric"
+  ) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none") -> p
+  ggsave(filename = "SHN_weightedGlobal.png", plot = p, path = here("Figs/STICs/"), device = "png", width = 25.4, height = 14.2875, units = "cm", dpi = "retina")
+
+
+
+```
+
+## Arc Probabilities
+
+```{r}
+shnArcDailyPresAbs <- arc.pa.from.nodes(aimsNets[["SHN"]], shnDailyPresAbs[, -1])
+shnMargProb  <- colMeans(shnArcDailyPresAbs, na.rm = T)
+shnArcProb <- cor(shnArcDailyPresAbs, use = "pairwise.complete.obs")
+shnArcCorProb <- R.bounds(shnMargProb, shnArcProb)
+shnProb <- apply(shnArcCorProb, 2, mean)
+
+
+ordProb <- order(shnProb)
+ordProb <- order(ordProb)
+
+col <- hcl.colors(27,  palette = "Inferno", rev = T)[ordProb]
+
+spatial.plot(aimsNets[["SHN"]], shnCoords$lon, shnCoords$lat, shnCoords$siteId, arrow.col = col, arrow.lwd = 1.5,
+             col = "lightblue", cex.text = .7, plot.bg = "white")
+```
+
+# Konza
+
+## Site Info
+
+```{r}
+# Load stream network
+kmzStream <- st_read(gpGeopkg, layer = "Streams", quiet = T) |> 
+  filter(watershed == "KNZ") 
+
+# Load sites
+kmzCoords <- st_read(gpGeopkg, layer = "Sites", quiet = TRUE) |> 
+  filter(watershed == "KNZ") |> 
+  st_transform(crs = 4326) |> 
+  mutate(
+    longitude = st_coordinates(geom)[, "X"],
+    latitude  = st_coordinates(geom)[, "Y"]
+  ) |> 
+  # Transform back to original CRS (NAD83 / UTM zone 14N)
+  st_transform(crs = UTM_14N) 
+# 
+# knzKings <- mapview(
+#     sfkcStreams, 
+#     zcol = "strahler_order",  # Color by stream order
+#     legend = TRUE, 
+#     col.regions = viridis::viridis(3),  # Use Viridis color palette
+#     map.types = "Esri.WorldImagery"
+#   )
+# 
+# knzKings
+# #shnS <- pointshp2segvert(path = here("Data/STICs/SHN_Coords.csv"), rivers = shnS)
+```
+
+## Network Graph
+
+```{r}
+# Check which site IDs are not in the graph
+missing_graph <- setdiff(kmzCoords$siteId, names(V(aimsNets[["KNZ"]])))
+# Check which graph nodes are not in the coordinate data
+missing_coords <- setdiff(names(V(aimsNets[["KNZ"]])), kmzCoords$siteId)
+# Combine all sites from coords or graph
+all_sites <- union(names(V(aimsNets[["KNZ"]])), kmzCoords$siteId)
+# Find sites missing from the presence/absence data
+missing_from_presabs <- setdiff(all_sites, colnames(kmzDailyPresAbs)[-1])
+
+spatial.plot(aimsNets[["KNZ"]], kmzCoords$long, kmzCoords$lat, kmzCoords$siteId, cex.text = .7)
+```
+
+## Unweighted
+
+### Local
+
+```{r}
+localMetrics <- local.summary(aimsNets[["KNZ"]]) |> 
+  as_tibble(rownames = "metrics") |> 
+  drop_na() |> 
+  column_to_rownames("metrics") |>
+  t() |>
+  scale() |>
+  t() |>
+  as_tibble(rownames = "metrics") |> 
+  pivot_longer(-metrics, names_to = "siteId", values_to = "value") |> 
+  mutate(siteId = factor(siteId, levels = topo_sort(aimsNets[["KNZ"]], mode = "out")$name))
+
+
+localMetrics |> 
+  ggplot(aes(x = siteId, y = value)) +
+   geom_bar(stat = "identity") +
+   theme_few() + 
+   theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+   ylab("Standardized local measures") +
+   xlab("\nNode")+
+  facet_wrap(~metrics, ncol = 2)
+```
+
+### Global
+
+```{r}
+global_metrics <- rownames(global.summary(aimsNets[["KNZ"]], sink = "SFM01"))
+
+# Set up parallel processing
+plan(multisession, workers = 6)
+
+# Process all rows in the original dataset
+# No filtering by date range - use all dates in shnPresAbs$dateTime
+global_list <- future_map(1:nrow(kmzDailyPresAbs), function(i) {
+  global.summary(
+    delete.nodes.pa(aimsNets[["KNZ"]], kmzDailyPresAbs[57, -1], na.response = "treat.as.1"),
+    sink = "SFM01"
+  )
+}, .options = furrr_options(seed = TRUE), .progress = TRUE)
+plan(sequential)
+
+global_df <- bind_rows(lapply(global_list, function(x) {
+  as_tibble_row(setNames(as.list(x), global_metrics))
+})) |> 
+  mutate(dateTime = kmzDailyPresAbs[[1]]) |> 
+  relocate(dateTime, .before = 1) |> 
+  # mutate(across(
+  #   where(is.numeric) & !all_of(c("Strahler.number", "Shreve.number")),
+  #   ~ scale(.x) |> as.vector()
+  # )) |>
+  pivot_longer(
+    cols = -dateTime,           # All columns except date
+    names_to = "metric",    # New column for metric names
+    values_to = "value"     # New column for the values
+  )
+
+global_df |> 
+  ggplot(aes(y = value, x = dateTime)) +
+  geom_line(linewidth = 0.75, aes(color = metric)) +
+  facet_wrap(~metric, scales = "free") +
+  theme_few()+
+    scale_color_manual(values = rep(okabeIto, length.out = length(unique(global_df$metric))))+
+  labs(title = "Unweighted",
+    x = "",
+       y = "Stand. Global Measures") +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+
+
+```
+
+```{r}
+# Calculate the distance along the stream network
+streamDist <- kmzStream |>
+  st_combine() |> # Combine all stream lines into a single geometry
+  st_distance(kmzCoords, along = _) |> # Calculate the distance along the stream network between snapped points
+  # Set the row and column names of the distances matrix
+  `rownames<-`(kmzCoords$siteId) |>
+  `colnames<-`(kmzCoords$siteId) |>
+  as_tibble(rownames = "From") |> 
+  pivot_longer(-From, names_to = "To", values_to = "dist_m") |>
+  mutate(Arcs = paste(From, "->", To),
+         dist_m = as.numeric(dist_m))
+
+# Extract edges from aimsNets[["SHN"]] and format them as "From -> To"
+kmzEdges <- aimsNets[["KNZ"]] |> 
+  as_edgelist() |> 
+  apply(1, paste, collapse = " -> ")
+
+# Filter streamDist to keep only arcs found in shnEdges
+kmz_lengths <- streamDist |> 
+  filter(Arcs %in% kmzEdges) |> 
+  mutate(Lengths = dist_m / 1000) |> 
+  select(Arcs, Lengths)
+
+library(viridis)
+
+# Map lengths to colors
+kmz_lengths$col <- viridis(nrow(kmz_lengths))[rank(kmz_lengths$Lengths)]
+# match edge colors by name
+edge_colors <- kmz_lengths$col[match(kmzEdges, kmz_lengths$Arcs)]
+
+spatial.plot(aimsNets[["KNZ"]], kmzCoords$long, kmzCoords$lat, kmzCoords$siteId,
+             arrow.col = edge_colors, arrow.lwd = 1.5, 
+             col = "lightblue", cex.text = .7, plot.bg = "white")
+
+```
+
+## Weighted
+
+### Local
+
+```{r}
+# Add lengths as weights to aimsNets[["SHN"]]
+aimsNets[["KNZ"]] <- aimsNets[["KNZ"]] |> 
+  as_tbl_graph() |> 
+  activate(edges) |> 
+  mutate(weight = kmz_lengths$Lengths)
+
+# Calculate strength and alpha centrality
+weighted_local_scaled <- aimsNets[["KNZ"]] |> 
+  activate(nodes) |> 
+  mutate(
+    topological_order = node_topo_order(),  # Correct function for topological sorting
+    StrengthLength = centrality_degree(weights = weight),
+    AlphaCentrality = centrality_alpha(weights = weight)
+  ) |> 
+  as_tibble() |> 
+  arrange(topological_order) |> 
+  mutate(across(c(StrengthLength, AlphaCentrality), scale)) |> 
+  pivot_longer(cols = c(StrengthLength, AlphaCentrality), names_to = "Measure", values_to = "Value") |> 
+  mutate(name = factor(name, levels = unique(name)))
+
+# Plot the results
+ggplot(weighted_local_scaled, aes(x = name, y = Value)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~Measure, scales = "free_y") +
+  theme_few() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, size = 4.3)) +
+  labs(
+    title = "Weighted", 
+    y = "Stand. Local Measures",
+    x = "Node"
+  )
+```
+
+### Global
+
+```{r}
+# Define the metrics names
+metric_names <- c(
+  icsl = "ICSL",
+  intact_to_sink = "IntactStreamLength",
+  a_cent = "AlphaCentrality",
+  harary = "Harary"
+)
+
+# Set up parallel processing
+plan(multisession)
+# Compute global metrics for each row of the dataframe
+gWeightedList <- future_map(1:nrow(kmzDailyPresAbs), function(i) {
+
+  temp_graph <- delete.nodes.pa(aimsNets[["KNZ"]], kmzDailyPresAbs[i, -1], na.response = "treat.as.1")
+
+  # Match arcs to lengths explicitly
+  edges_attr <- attributes(E(temp_graph))$vname
+  namelv <- gsub(" -> ", "|", kmz_lengths$Arcs)
+  length_sub <- kmz_lengths$Lengths[match(edges_attr, namelv)]
+  
+  E(temp_graph)$weights <- length_sub
+  
+  tibble(
+    icsl = ICSL(temp_graph, lengths = length_sub),
+    intact_to_sink = size.intact.to.sink(temp_graph, sink = "SFM01"),
+    a_cent = mean(alpha_centrality(temp_graph), na.rm = TRUE),
+    harary = harary(temp_graph)
+  )
+}, .options = furrr_options(seed = TRUE), .progress = TRUE)
+plan(sequential)
+
+# Combine the list into a dataframe
+gWeighted <- bind_rows(gWeightedList) |> 
+  mutate(dateTime = kmzDailyPresAbs[[1]]) |> 
+  relocate(dateTime, .before = 1) |> 
+  pivot_longer(cols = -dateTime, names_to = "metric", values_to = "value") |> 
+  mutate(metric = recode(metric, !!!metric_names))
+
+kmzGlobalWeighted <- gWeighted |> 
+  pivot_wider(names_from = metric, values_from = value) |> 
+  mutate(siteId = "KNZ")
+
+gWeightedScaled <- bind_rows(gWeightedList) |> 
+  mutate(dateTime = kmzDailyPresAbs[[1]]) |> 
+  relocate(dateTime, .before = 1) |> 
+  mutate(across(where(is.numeric), ~ scale(.x) |> as.vector())) |> 
+  pivot_longer(cols = -dateTime, names_to = "metric", values_to = "value") |> 
+  mutate(metric = recode(metric, !!!metric_names))
+
+# Plot using ggplot2
+gWeighted |> 
+  ggplot(aes(x = dateTime, y = value)) +
+  geom_line(linewidth = 0.75, aes(color = metric)) +
+  facet_wrap(~factor(metric, levels = metric_names), scales = "free_y") +
+  theme_few() +
+  scale_color_manual(values = okabeIto)+
+  labs(
+    title = "Weighted",
+    x = "",
+    y = "Global Measures",
+    color = "Metric"
+  ) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+
+gWeightedScaled |> 
+  ggplot(aes(x = dateTime, y = value)) +
+  geom_line(linewidth = 0.75, aes(color = metric)) +
+  facet_wrap(~factor(metric, levels = metric_names)) +
+  theme_few() +
+  scale_color_manual(values = okabeIto)+
+  labs(
+    title = "Konza Weighted STIC Metrics",
+    x = "",
+    y = "Stand. Global Measures",
+    color = "Metric"
+  ) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none") -> p
+p
+ggsave(filename = "KNZ_weightedGlobal.png", plot = p, path = here("Figs/STICs/"), device = "png", width = 25.4, height = 14.2875, units = "cm", dpi = "retina")
+```
+
+## Arc Probabilities
+
+```{r}
+kmzArcDailyPresAbs <- arc.pa.from.nodes(aimsNets[["KNZ"]], kmzDailyPresAbs[, -1])
+kmzMargProb  <- colMeans(kmzArcDailyPresAbs, na.rm = T)
+kmzArcProb <- cor(kmzArcDailyPresAbs, use = "pairwise.complete.obs")
+kmzArcCorProb <- R.bounds(kmzMargProb, kmzArcProb)
+kmzProb <- apply(kmzArcCorProb, 2, mean)
+
+
+ordProb <- order(kmzProb)
+ordProb <- order(ordProb)
+
+col <- hcl.colors(27,  palette = "Inferno", rev = T)[ordProb]
+
+spatial.plot(aimsNets[["KNZ"]], kmzCoords$long, kmzCoords$lat, kmzCoords$siteId, arrow.col = col, arrow.lwd = 1.5,
+             col = "lightblue", cex.text = .7, plot.bg = "white")
+```
+
+# YMR
+
+## Site Info
+
+```{r}
+# Load stream network
+ymrStream <- st_read(gpGeopkg, layer = "Streams", quiet = T) |> 
+  filter(watershed == "YMR") 
+
+# Load sites
+ymrCoords <- st_read(gpGeopkg, layer = "Sites", quiet = TRUE) |> 
+  filter(watershed == "YMR") |> 
+  st_transform(crs = 4326) |> 
+  mutate(
+    longitude = st_coordinates(geom)[, "X"],
+    latitude  = st_coordinates(geom)[, "Y"]
+  ) |> 
+  # Transform back to original CRS (NAD83 / UTM zone 14N)
+  st_transform(crs = UTM_14N) 
+```
+
+## STICs
+
+```{r}
+# Check which site IDs are not in the graph
+missing_graph <- setdiff(ymrCoords$siteId, names(V(aimsNets[["YMR"]])))
+# Check which graph nodes are not in the coordinate data
+missing_coords <- setdiff(names(V(aimsNets[["YMR"]])), ymrCoords$siteId)
+# Combine all sites from coords or graph
+all_sites <- union(names(V(aimsNets[["YMR"]])), ymrCoords$siteId)
+# Find sites missing from the presence/absence data
+missing_from_presabs <- setdiff(all_sites, colnames(ymrDailyPresAbs)[-1])
+
+spatial.plot(aimsNets[["YMR"]], ymrCoords$long, ymrCoords$lat, ymrCoords$siteId, cex.text = .7)
+```
+
+## Unweighted
+
+### Local
+
+```{r}
+localMetrics <- local.summary(aimsNets[["YMR"]]) |> 
+  as_tibble(rownames = "metrics") |> 
+  drop_na() |> 
+  column_to_rownames("metrics") |>
+  t() |>
+  scale() |>
+  t() |>
+  as_tibble(rownames = "metrics") |> 
+  pivot_longer(-metrics, names_to = "siteId", values_to = "value") |> 
+  mutate(siteId = factor(siteId, levels = topo_sort(aimsNets[["YMR"]], mode = "out")$name))
+
+
+localMetrics |> 
+  ggplot(aes(x = siteId, y = value)) +
+   geom_bar(stat = "identity") +
+   theme_few() + 
+   theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+   ylab("Standardized local measures") +
+   xlab("\nNode")+
+  facet_wrap(~metrics, ncol = 2)
+```
+
+### Global
+
+```{r}
+global_metrics <- rownames(global.summary(aimsNets[["YMR"]], sink = "ENM01"))
+
+# Set up parallel processing
+plan(multisession, workers = 6)
+
+# Process all rows in the original dataset
+# No filtering by date range - use all dates in shnPresAbs$dateTime
+global_list <- future_map(1:nrow(ymrDailyPresAbs), function(i) {
+  global.summary(
+    delete.nodes.pa(aimsNets[["YMR"]], ymrDailyPresAbs[i, -1], na.response = "treat.as.1"),
+    sink = "ENM01"
+  )
+}, .options = furrr_options(seed = TRUE), .progress = TRUE)
+
+
+global_df <- bind_rows(lapply(global_list, function(x) {
+  as_tibble_row(setNames(as.list(x), global_metrics))
+})) |> 
+  mutate(dateTime = ymrDailyPresAbs[[1]]) |> 
+  relocate(dateTime, .before = 1) |> 
+  mutate(across(
+    where(is.numeric) & !all_of(c("Strahler.number", "Shreve.number")),
+    ~ scale(.x) |> as.vector()
+  )) |>
+  pivot_longer(
+    cols = -dateTime,           # All columns except date
+    names_to = "metric",    # New column for metric names
+    values_to = "value"     # New column for the values
+  )
+
+global_df |> 
+  ggplot(aes(y = value, x = dateTime)) +
+  geom_line(linewidth = 0.75, aes(color = metric)) +
+  facet_wrap(~metric) +
+  theme_few()+
+    scale_color_manual(values = rep(okabeIto, length.out = length(unique(global_df$metric))))+
+  labs(title = "Unweighted",
+    x = "",
+       y = "Stand. Global Measures") +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+
+
+```
+
+## Calculate Stream Length
+
+```{r}
+# Calculate the distance along the stream network
+streamDist <- ymrStream |>
+  st_combine() |> # Combine all stream lines into a single geometry
+  st_distance(ymrCoords, along = _) |> # Calculate the distance along the stream network between snapped points
+  # Set the row and column names of the distances matrix
+  `rownames<-`(ymrCoords$siteId) |>
+  `colnames<-`(ymrCoords$siteId) |>
+  as_tibble(rownames = "From") |> 
+  pivot_longer(-From, names_to = "To", values_to = "dist_m") |>
+  mutate(Arcs = paste(From, "->", To),
+         dist_m = as.numeric(dist_m))
+
+# Extract edges from aimsNets[["SHN"]] and format them as "From -> To"
+ymrEdges <- aimsNets[["YMR"]] |> 
+  as_edgelist() |> 
+  apply(1, paste, collapse = " -> ")
+
+# Filter streamDist to keep only arcs found in shnEdges
+ymr_lengths <- streamDist |> 
+  filter(Arcs %in% ymrEdges) |> 
+  mutate(Lengths = dist_m/1000) |> 
+  select(Arcs, Lengths)
+
+library(viridis)
+
+# Map lengths to colors
+ymr_lengths$col <- viridis(nrow(ymr_lengths))[rank(ymr_lengths$Lengths)]
+# match edge colors by name
+edge_colors <- ymr_lengths$col[match(ymrEdges, ymr_lengths$Arcs)]
+
+spatial.plot(aimsNets[["YMR"]], ymrCoords$long, ymrCoords$lat, ymrCoords$siteId,
+             arrow.col = edge_colors, arrow.lwd = 1.5, 
+             col = "lightblue", cex.text = .7, plot.bg = "white")
+
+```
+
+## Weighted
+
+### Local
+
+```{r}
+# Add lengths as weights to aimsNets[["SHN"]]
+aimsNets[["YMR"]] <- aimsNets[["YMR"]] |> 
+  as_tbl_graph() |> 
+  activate(edges) |> 
+  mutate(weight = ymr_lengths$Lengths)
+
+# Calculate strength and alpha centrality
+weighted_local_scaled <- aimsNets[["YMR"]] |> 
+  activate(nodes) |> 
+  mutate(
+    topological_order = node_topo_order(),  # Correct function for topological sorting
+    StrengthLength = centrality_degree(weights = weight),
+    AlphaCentrality = centrality_alpha(weights = weight)
+  ) |> 
+  as_tibble() |> 
+  arrange(topological_order) |> 
+  mutate(across(c(StrengthLength, AlphaCentrality), scale)) |> 
+  pivot_longer(cols = c(StrengthLength, AlphaCentrality), names_to = "Measure", values_to = "Value") |> 
+  mutate(name = factor(name, levels = unique(name)))
+
+# Plot the results
+ggplot(weighted_local_scaled, aes(x = name, y = Value)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~Measure, scales = "free_y") +
+  theme_few() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, size = 4.3)) +
+  labs(
+    title = "Weighted", 
+    y = "Stand. Local Measures",
+    x = "Node"
+  )
+```
+
+### Global
+
+```{r}
+# Define the metrics names
+metric_names <- c(
+  icsl = "ICSL",
+  intact_to_sink = "IntactStreamLength",
+  a_cent = "AlphaCentrality",
+  harary = "Harary"
+)
+
+# Set up parallel processing
+plan(multisession)
+
+# Compute global metrics for each row of the dataframe
+gWeightedList <- future_map(1:nrow(ymrDailyPresAbs), function(i) {
+
+  temp_graph <- delete.nodes.pa(aimsNets[["YMR"]], ymrDailyPresAbs[i, -1], na.response = "treat.as.1")
+
+  # Match arcs to lengths explicitly
+  edges_attr <- attributes(E(temp_graph))$vname
+  namelv <- gsub(" -> ", "|", ymr_lengths$Arcs)
+  length_sub <- ymr_lengths$Lengths[match(edges_attr, namelv)]
+  
+  E(temp_graph)$weights <- length_sub
+  
+  tibble(
+    icsl = ICSL(temp_graph, lengths = length_sub),
+    intact_to_sink = size.intact.to.sink(temp_graph, sink = "ENM01"),
+    a_cent = mean(alpha_centrality(temp_graph), na.rm = TRUE),
+    harary = harary(temp_graph)
+  )
+}, .options = furrr_options(seed = TRUE), .progress = TRUE)
+plan(sequential)
+
+# Combine the list into a dataframe
+gWeighted <- bind_rows(gWeightedList) |> 
+  mutate(dateTime = ymrDailyPresAbs[[1]]) |> 
+  relocate(dateTime, .before = 1) |> 
+  pivot_longer(cols = -dateTime, names_to = "metric", values_to = "value") |> 
+  mutate(metric = recode(metric, !!!metric_names))
+
+ymrGlobalWeighted <- gWeighted |> 
+  pivot_wider(names_from = metric, values_from = value) |> 
+  mutate(siteId = "YMR")
+
+gWeightedScaled <- bind_rows(gWeightedList) |> 
+  mutate(dateTime = ymrDailyPresAbs[[1]]) |> 
+  relocate(dateTime, .before = 1) |> 
+  mutate(across(where(is.numeric), ~ scale(.x) |> as.vector())) |> 
+  pivot_longer(cols = -dateTime, names_to = "metric", values_to = "value") |> 
+  mutate(metric = recode(metric, !!!metric_names))
+
+# Plot using ggplot2
+gWeighted |> 
+  ggplot(aes(x = dateTime, y = value)) +
+  geom_line(linewidth = 0.75, aes(color = metric)) +
+  facet_wrap(~factor(metric, levels = metric_names), scales = "free_y") +
+  theme_few() +
+  scale_color_manual(values = okabeIto)+
+  labs(
+    title = "Weighted",
+    x = "",
+    y = "Global Measures",
+    color = "Metric"
+  ) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+
+gWeightedScaled |> 
+  ggplot(aes(x = dateTime, y = value)) +
+  geom_line(linewidth = 0.75, aes(color = metric)) +
+  facet_wrap(~factor(metric, levels = metric_names)) +
+  theme_few() +
+  scale_color_manual(values = okabeIto)+
+  labs(
+    title = "Youngmeyer Weighted STIC Metrics",
+    x = "",
+    y = "Stand. Global Measures",
+    color = "Metric"
+  ) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none") -> p
+p
+ggsave(filename = "YMR_weightedGlobal.png", plot = p, path = here("Figs/STICs/"), device = "png", width = 25.4, height = 14.2875, units = "cm", dpi = "retina")
+```
+
+# Save Global Metrics
+
+```{r}
+gWeightedMet <- shnGlobalWeighted |> 
+  full_join(kmzGlobalWeighted) |> 
+  full_join(ymrGlobalWeighted) |> 
+  write_csv(here("Data/sticGlobalMetricsUnscaled.csv"))
+
+gWeightedMet |>
+  group_by(siteId) |>
+  mutate(across(where(is.numeric), ~ scale(.x) |> as.vector())) |> 
+  ggplot(aes(x = dateTime, y = AlphaCentrality, color = siteId, group = siteId)) +
+  geom_line() +
+  scale_color_manual(values = okabeIto) +  
+  labs(title = "",
+       x = "Date",
+       y = "Alpha-Centrality",
+       color = "") +
+  theme_few() +
+  theme(legend.position = "bottom") -> p
+p
+ggsave(filename = "AC.png", plot = p, path = here("Figs/STICs/"), device = "png", width = 25.4, height = 14.2875, units = "cm", dpi = "retina")
+
+
+gWeightedMet |>
+  group_by(siteId) |> 
+  mutate(across(where(is.numeric), ~ scale(.x) |> as.vector())) |> 
+  ggplot(aes(x = dateTime, y = ICSL, color = siteId, group = siteId)) +
+  geom_line() +
+  scale_color_manual(values = okabeIto) +  
+  labs(title = "",
+       x = "Date",
+       y = "Integral Connectivity Scale Length",
+       color = "") +
+  theme_few() +
+  theme(legend.position = "bottom") -> p
+p
+ggsave(filename = "ICSL.png", plot = p, path = here("Figs/STICs/"), device = "png", width = 25.4, height = 14.2875, units = "cm", dpi = "retina")
+
+
+gWeightedMet |>
+  group_by(siteId) |>
+  mutate(across(where(is.numeric), ~ scale(.x) |> as.vector())) |> 
+  ggplot(aes(x = dateTime, y = Harary, color = siteId, group = siteId)) +
+  geom_line() +
+  scale_color_manual(values = okabeIto) +  
+  labs(title = "",
+       x = "Date",
+       y = "Harary Index",
+       color = "") +
+  theme_few() +
+  theme(legend.position = "bottom") -> p
+p
+ggsave(filename = "Harary.png", plot = p, path = here("Figs/STICs/"), device = "png", width = 25.4, height = 14.2875, units = "cm", dpi = "retina")
+
+gWeightedMet |>
+  group_by(siteId) |>
+  mutate(across(where(is.numeric), ~ scale(.x) |> as.vector())) |> 
+  ggplot(aes(x = dateTime, y = IntactStreamLength, color = siteId, group = siteId)) +
+  geom_line() +
+  scale_color_manual(values = okabeIto) +  
+  labs(title = "",
+       x = "Date",
+       y = "Intact Stream Length",
+       color = "") +
+  theme_few() +
+  theme(legend.position = "bottom") -> p
+p
+ggsave(filename = "IntactStreamLength.png", plot = p, path = here("Figs/STICs/"), device = "png", width = 25.4, height = 14.2875, units = "cm", dpi = "retina")
+
+```
+
+## Arc Probabilities
+
+```{r}
+ymrArcDailyPresAbs <- arc.pa.from.nodes(aimsNets[["YMR"]], ymrDailyPresAbs[, -1])
+ymrMargProb  <- colMeans(ymrArcDailyPresAbs, na.rm = T)
+ymrArcProb <- cor(ymrArcDailyPresAbs, use = "pairwise.complete.obs")
+ymrArcCorProb <- R.bounds(ymrMargProb, ymrArcProb)
+ymrProb <- apply(ymrArcCorProb, 2, mean)
+
+
+ordProb <- order(ymrProb)
+ordProb <- order(ordProb)
+
+col <- hcl.colors(27,  palette = "Inferno", rev = T)[ordProb]
+
+spatial.plot(aimsNets[["YMR"]], ymrCoords$long, ymrCoords$lat, ymrCoords$siteId, arrow.col = col, arrow.lwd = 1.5, col = "lightblue", cex.text = .7, plot.bg = "white")
+title("Youngmeyer Ranch")
+```
+
+# Calculate Upstream Active Network Length
+
+```{r}
+# KMZ
+kmzUpstreamNodes <- calculate_network_metrics(
+  network = aimsNets[["KNZ"]],
+  lengths_data = kmz_lengths,
+  pres_abs_data = kmzDailyPresAbs,
+  site_id = "SFM01"
+)
+
+# SHN
+shnUpstreamNodes <- calculate_network_metrics(
+  network = aimsNets[["SHN"]],
+  lengths_data = shn_lengths,
+  pres_abs_data = shnDailyPresAbs,
+  site_id = "SHM01"
+)
+
+# YMR
+ymrUpstreamNodes <- calculate_network_metrics(
+  network = aimsNets[["YMR"]],
+  lengths_data = ymr_lengths,
+  pres_abs_data = ymrDailyPresAbs,
+  site_id = "ENM01"
+)
+
+
+
+kmzUpstreamNodes |>
+  ggplot(aes(x = date, y = upstream_length)) +
+  geom_line() +
+  labs(x = "Date", y = "Upstream Connected Length (m)", 
+       title = "Konza")
+
+shnUpstreamNodes |>
+  ggplot(aes(x = date, y = upstream_length)) +
+  geom_line() +
+  labs(x = "Date", y = "Upstream Connected Length (m)", 
+       title = "Shane")
+
+ymrUpstreamNodes |>
+  ggplot(aes(x = date, y = upstream_length)) +
+  geom_line() +
+  labs(x = "Date", y = "Upstream Connected Length (m)", 
+       title = "Youngmeyer")
+
+kmzUpstreamNodes |>
+  ggplot(aes(x = date, y = percentConnected)) +
+  geom_line() +
+  labs(x = "Date", y = "% Upstream Connected", 
+       title = "Konza")
+
+shnUpstreamNodes |>
+  ggplot(aes(x = date, y = percentConnected)) +
+  geom_line() +
+  labs(x = "Date", y = "% Upstream Connected", 
+       title = "Shane")
+
+ymrUpstreamNodes |>
+  ggplot(aes(x = date, y = percentConnected)) +
+  geom_line() +
+  labs(x = "Date", y = "% Upstream Connected", 
+       title = "Youngmeyer")
+```
+
+```{r}
+upstreamNodes <- kmzUpstreamNodes |> 
+  mutate(siteId = "KNZ") |> 
+  full_join(shnUpstreamNodes |> mutate(siteId = "SHN")) |> 
+  full_join(ymrUpstreamNodes |>  mutate(siteId = "YMR")) |> 
+  group_by(siteId) |> 
+  mutate(dPercCon = percentConnected - lag(percentConnected)) |> 
+  ungroup()
+
+upstreamNodes |> 
+  select(-data) |> 
+  rename(Date = date) |> 
+  write_csv(here("Data/sticUpstream.csv"))
+
+upstreamNodes |>
+ # mutate(upstream_length = ifelse(is.infinite(upstream_length), NA, upstream_length)) |> 
+ # group_by(siteId) |>
+ # mutate(across(where(is.numeric), ~ scale(.x) |> as.vector())) |> 
+  ggplot(aes(x = date, y = upstream_length, color = siteId, group = siteId)) +
+  geom_line() +
+  scale_color_manual(values = okabeIto) +  
+  labs(title = "",
+       x = "Date",
+       y = "Upstream Connected Length (m)",
+       color = "") +
+  theme_few() +
+  theme(legend.position = "bottom")
+
+
+upstreamNodes |>
+ # mutate(upstream_length = ifelse(is.infinite(upstream_length), NA, upstream_length)) |> 
+ # group_by(siteId) |>
+ # mutate(across(where(is.numeric), ~ scale(.x) |> as.vector())) |> 
+  ggplot(aes(x = date, y = percentConnected, color = siteId, group = siteId)) +
+  geom_line() +
+  scale_color_manual(values = okabeIto) +  
+  labs(title = "",
+       x = "Date",
+       y = "% Upstream Connected",
+       color = "") +
+  theme_few() +
+  theme(legend.position = "bottom")
+
+upstreamNodes |>
+ # mutate(upstream_length = ifelse(is.infinite(upstream_length), NA, upstream_length)) |> 
+ # group_by(siteId) |>
+ # mutate(across(where(is.numeric), ~ scale(.x) |> as.vector())) |> 
+  ggplot(aes(x = date, y = dPercCon, color = siteId, group = siteId)) +
+  geom_line() +
+  lims(y = c(-50,50))+
+  scale_color_manual(values = okabeIto) +  
+  labs(title = "",
+       x = "Date",
+       y = "\u394 % Upstream Connected",
+       color = "") +
+  theme_few() +
+  theme(legend.position = "bottom")+
+  facet_wrap(~siteId)
+```
+
+\

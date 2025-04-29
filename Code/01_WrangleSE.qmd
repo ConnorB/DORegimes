@@ -1,0 +1,3868 @@
+---
+title: "GP Drying Events"
+author: "CLB"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+library(here)
+
+source(here("Code/paths+packages.R"))
+#source(here("Code/priceDrying.R"))
+#source(here("Code/Functions/exoPipeline.R"))
+#source(here("Code/Functions/BaseflowSeparation.R"))
+library(preMetabolizer)
+library(sf)
+library(mapview)
+library(streamDAG)
+library(sfnetworks)
+library(riverdist)
+library(tidygraph)
+library(ggraph)
+```
+
+```{r}
+seSites <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_SouthEast.gpkg", layer = "sites") |> 
+  filter(!sublocation == "HW") |> 
+  st_transform(4326) |>
+  mutate(
+    lon = st_coordinates(geom)[, 1],
+    lat = st_coordinates(geom)[, 2]
+  ) #|> 
+  #st_transform(26916)
+
+seStreams <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_SouthEast.gpkg", layer = "streams") |> 
+  st_transform(4326)
+
+seSites <- snap_points_to_lines(seSites, seStreams)
+```
+
+# Wrangle Data
+
+## Q Data
+
+```{r}
+########### Discharge from PT Pipeline ########### 
+seQ <- list.files(here("Data/SE/Q"), full.names = T) |> 
+  lapply(read_csv) |> 
+  bind_rows() |> 
+  rename(dateTime = datetime, Site = site, Q_Ls = Q.Ls) |> 
+  mutate(datetimeCDT = mdy_hm(dateTime, tz = "Etc/GMT-5")) |> 
+  mutate(datetimeLocal = mdy_hm(dateTime, tz = "America/Chicago"),
+         Site = case_when(Site == "PRM01" ~ "PRF",
+                          Site == "TLM01" ~ "TAL",
+                          Site == "WHM01" ~ "WHR")) |> 
+  select(-year) |> 
+  mutate(dateTime = with_tz(datetimeCDT, tzone = "UTC")) |> 
+  select(-datetimeCDT, -datetimeLocal)
+
+sePT <- list.files(here("Data/SE/PT"), full.names = T) |> 
+  lapply(read_csv) |> 
+  bind_rows() |> 
+  rename(dateTime = datetime, Site = siteId) |> 
+  filter(!QAQC %in% c("E", "T", "Z", "ZD")) |> 
+mutate(Site = case_when(Site == "PRM01" ~ "PRF",
+                          Site == "TLM01" ~ "TAL",
+                          Site == "WHM01" ~ "WHR")) |> 
+  select(Site, dateTime, sublocation, waterDepth_m, wetdry) |> 
+  filter(!(Site == "WHR" & sublocation == "SW" & 
+             dateTime %in% as_datetime(c("2022-09-20 08:30:00", "2023-06-17 08:45:00")))) |> 
+  pivot_wider(names_from = sublocation, values_from = c(waterDepth_m, wetdry)) |> 
+  rename(swDepth = waterDepth_m_SW, gwDepth = waterDepth_m_PI) |> 
+  mutate(head_gradient = (gwDepth-swDepth))
+
+seQ <- seQ |> 
+  full_join(sePT) |> 
+  group_by(Site) |>
+  complete(dateTime = seq(floor_date(min(dateTime), "15 min"), floor_date(max(dateTime), "15 min"), by = "15 min")) |>
+  arrange(dateTime) |>
+  mutate(across(where(is.numeric), ~ na.approx(.x, na.rm = F, maxgap = 10))) |>
+  filter(minute(dateTime) %% 15 == 0) |>
+  ungroup() |> 
+  group_by(Site) |>  # Group by Site
+  fill(wetdry_SW, .direction = "down") |>  # Fill NA values downward
+  ungroup() 
+
+seQ |>
+  ggplot(aes(dateTime, swDepth, color = wetdry_SW)) +
+  geom_point() +
+  theme_few() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~Site, scales = "free")
+seQ |>
+  ggplot(aes(dateTime, Q_Ls, color = wetdry_SW)) +
+  geom_point() +
+  theme_few() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~Site, scales = "free")
+
+setDT(seQ)
+dailyQ <- seQ[, .(
+  minQ = min(Q_Ls, na.rm = TRUE),
+  maxQ = max(Q_Ls, na.rm = TRUE),
+  Q_1d = mean(Q_Ls, na.rm = TRUE),
+  minDepth = min(swDepth, na.rm = TRUE),
+  maxDepth = max(swDepth, na.rm = TRUE),
+  Depth_1d = mean(swDepth, na.rm = TRUE),
+  headGradient_1d = mean(head_gradient, na.rm = T) 
+), by = .(Site, Date = as.Date(dateTime))]
+# Replace NA/NaN in all numeric columns
+# dailyQ[, names(dailyQ)[sapply(dailyQ, is.numeric)] := lapply(.SD, function(x) fifelse(is.na(x), 0, x)), .SDcols = names(dailyQ)[sapply(dailyQ, is.numeric)]]
+
+# Calculate exceedance probabilities and scale depth
+plan(multisession)  # Enable parallelization
+dailyQ <- dailyQ |> 
+  group_split(Site) |> 
+  future_map_dfr(~ .x |> 
+                   mutate(across(c(minDepth, maxDepth, Depth_1d), 
+                                 ~ bestNormalize(.x)$x.t, 
+                                 .names = "{.col}_norm"),  # Normalization
+                          across(c(minDepth, maxDepth, Depth_1d), 
+                                 ~ rescale(.x),  # Min-max scaling from 0 to 1
+                                 .names = "{.col}_scaled"), 
+                          excProb = calc_exceedance_prob(Q_1d)),
+                 .options = furrr_options(seed = TRUE), 
+                 .progress = FALSE) |> 
+  ungroup()
+plan(sequential)
+
+
+dailyQ <- dailyQ |> 
+  select(Site, Date, minQ, maxQ, Q_1d, minDepth, maxDepth, Depth_1d, excProb, headGradient_1d)
+
+dailyQ |>
+  ggplot(aes(excProb, Q_1d)) +
+  geom_line() +
+  theme_few() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~Site, scales = "free")
+dailyQ |>
+  ggplot(aes(Date, Depth_1d)) +
+  geom_line() +
+  theme_few() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~Site, scales = "free")
+dailyQ |>
+  ggplot(aes(Date, Q_1d)) +
+  geom_line() +
+  theme_few() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~Site, scales = "free")
+```
+
+```{r}
+# Get all unique site IDs
+site_ids <- seQ |> distinct(Site) |> pull()
+
+for (site_id in site_ids) {
+  
+  # Filter data for current site
+  seQ_site <- seQ |> filter(Site == site_id)
+
+  # Prepare xts data
+  xts_data <- seQ_site |> 
+    select(dateTime, Q_Ls, swDepth) |> 
+    arrange(dateTime) |> 
+    xts::xts(order.by = seQ_site$dateTime)
+  
+  # Build dygraph with separate y-axes
+  dy <- dygraph(xts_data, main = site_id) |>
+    dySeries("Q_Ls", label = "Q (L/s)", axis = "y") |>
+    dySeries("swDepth", label = "swDepth (m)", axis = "y2") |>
+    dyOptions(colors = c("blue", "green")) |>
+    dyAxis("y", label = "Q (L/s)") |>
+    dyAxis("y2", label = "Water Depth (m)") |> 
+    dyRangeSelector() |>
+      dyOptions(useDataTimezone = T, connectSeparatedPoints = F) |>
+      dyLegend(show = "always", width = 400)
+  
+   print(dy)
+}
+```
+
+## DO Data
+
+```{r}
+
+prfDO <- list.files(here("Data/SE/DO"), full.names = T) |> 
+  Filter(f = \(x) grepl("PRF", basename(x))) |> 
+  lapply(\(file) {
+    read_csv(file, col_types = cols(.default = col_character())) |>
+      mutate(Site = "PRF")
+  }) |> 
+  bind_rows() |> 
+  mutate(dateTime = mdy_hm(datetime.utc)) |> 
+  select(dateTime, Site, DO.obs = ODO_mg_L, temp.water = Temp_EXO_C)
+
+whrDO <- list.files(here("Data/SE/DO"), full.names = TRUE) |>
+  Filter(f = \(x) grepl("WHR", basename(x))) |>
+  lapply(\(file) {
+    read_csv(file, col_types = cols(.default = col_character())) |>
+      select(timestamp, DO.obs = ODO_mg_L, temp.water = Temp_EXO_C) |>
+      mutate(Site = "WHR")
+  }) |> 
+  bind_rows() |> 
+  mutate(dateTime_CT = parse_date_time(
+    timestamp,orders = c("mdy HM", "ymd HMS"), tz = "America/Chicago"),
+    dateTime = with_tz(dateTime_CT, "UTC")) |> 
+    select(dateTime, Site, temp.water, DO.obs)
+
+  
+
+talDO <- read_csv(here("Data/SE/DO/TLM01_oxy_20210915_20231231.csv"), col_types = cols(.default = col_character())) |> 
+  #select(datetime.local, temp.water = Temp.C, DO.obs = DO.mgL, DO.sat) |> 
+    mutate(
+    Date = sub(" .*", "", datetime.local),
+    leadDate = lead(sub(" .*", "", datetime.local)),
+    cleanDate = coalesce(Date, leadDate),
+    Time = ifelse(
+      grepl("\\d{1,2}:\\d{2}", datetime.local),
+      sub("^.* ", "", datetime.local),
+      "00:00"),
+    Time = sub("^([0-9]):", "0\\1:", Time),
+    cleanDateTime = paste(cleanDate, Time)) |> 
+  mutate(localCT = mdy_hm(cleanDateTime, tz = "Etc/GMT+6"),
+         dateTime = with_tz(localCT, tzone = "UTC"),
+         Site = "TAL") |> 
+  select(dateTime, Site, temp.water = Temp.C, DO.obs = DO.mgL)
+
+seDO <- prfDO |> 
+  full_join(whrDO) |> 
+  full_join(talDO) |> 
+  drop_na(dateTime) |> 
+  mutate(DO.obs = as.numeric(DO.obs),
+         temp.water = as.numeric(temp.water)) |> 
+  group_by(Site) |>
+  complete(dateTime = seq(floor_date(min(dateTime), "15 min"), floor_date(max(dateTime), "15 min"), by = "15 min")) |>
+  arrange(dateTime) |>
+  mutate(across(where(is.numeric), ~ na.approx(.x, na.rm = F, maxgap = 4))) |>
+  filter(minute(dateTime) %% 15 == 0) |>
+  ungroup()
+
+
+seDO |>
+  ggplot(aes(dateTime, DO.obs)) +
+  geom_line(color = "#0084a8") +
+  ylab("DO (mg/L)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~Site, ncol = 1, scales = "free") 
+```
+
+## BP Data
+
+```{r}
+talBP <- read_csv(here("Data/SE/BP/TLM01_baro_20210928_20230808.csv"), col_names = c("index", "utc_5", "bp_kPa", "temp.air"), skip = 1) |> 
+  mutate(dateTime = with_tz(mdy_hm(utc_5,tz = "Etc/GMT-5"), "UTC"),
+         Site = "TAL") |> 
+  select(-index, -utc_5) |> 
+  distinct(dateTime, Site, bp_kPa, temp.air) |> 
+  group_by(Site) |>
+  complete(dateTime = seq(floor_date(min(dateTime), "15 min"), floor_date(max(dateTime), "15 min"), by = "15 min")) |>
+  arrange(dateTime) |>
+  mutate(across(where(is.numeric), ~ na.approx(.x, na.rm = F, maxgap = 4))) |>
+  filter(minute(dateTime) %% 15 == 0) |>
+  ungroup()
+
+
+
+selSites <- seSites |> 
+  filter(siteId %in% c("PRM01", "WHM01", "TLM01"))
+#Download barometric presssure from NASAPower for each site
+nasaDat <- list()
+for (i in 1:nrow(selSites)) {
+  cat(paste("Downloading data for", selSites$watershed[i], "\n"))
+  tempDat <- seDO |> 
+    filter(Site == selSites$watershed[i])
+  sDate <- as_date(min(tempDat$dateTime, na.rm = T))
+  eDate <- as_date(max(tempDat$dateTime, na.rm = T))
+  
+  nasaDat[[i]] <- get_power(
+    community = "sb",
+    pars = c("PSC", "ALLSKY_SFC_SW_DWN", "PRECTOTCORR"),
+    temporal_api = "hourly",
+    lonlat = c(selSites$lon[i], selSites$lat[i]),
+    dates = c(sDate, eDate),
+    site_elevation = selSites$elevation[i],
+    time_standard = "UTC"
+  )
+  nasaDat[[i]]$Site <- selSites$watershed[i]
+  cat(paste("Finished downloading data for", selSites$watershed[i], "\n"))
+  #Break loop on last iteration
+  if (i == nrow(selSites)) {
+    break
+  }
+}
+
+nasaDf <- do.call(rbind, nasaDat)
+nasaDf <- nasaDf |> 
+  select(Site, YYYYMMDD, HR, PSC, ALLSKY_SFC_SW_DWN) |> 
+  mutate(HR = paste0(str_pad(HR, 2, side = "left", pad = 0), ":00:00")) |> 
+  mutate(dateTime = ymd_hms(paste(YYYYMMDD, HR, " ")),
+         bp_mb = PSC*10, #Convert kilopascals to millibar
+         PAR.obs = convert_SW_to_PAR(ALLSKY_SFC_SW_DWN)) |> 
+  select(-HR, -ALLSKY_SFC_SW_DWN, -YYYYMMDD) |> 
+  group_by(Site) |>
+  complete(dateTime = seq(floor_date(min(dateTime), "15 min"), floor_date(max(dateTime), "15 min"), by = "15 min")) |>
+  arrange(dateTime) |>
+  mutate(across(where(is.numeric), ~ na.approx(.x, na.rm = F, maxgap = 4))) |>
+  filter(minute(dateTime) %% 15 == 0) |>
+  ungroup()
+```
+
+## Merge DO and BP
+
+```{r}
+doDat <- seDO |> 
+  #full_join(talBP, by = c("Site", "dateTime")) |>
+  full_join(nasaDf, by = c("Site", "dateTime"))
+
+
+doDat <- doDat |> 
+  left_join(selSites |> rename(Site = watershed) |> select(Site, lat, lon)) |>
+  group_by(Site) |>
+  mutate(solar.time = convert_UTC_to_solartime(dateTime, longitude = lon, time.type = "mean solar"),
+         isDaytime = suppressWarnings(calc_is_daytime(solar.time, lat)),
+         DO.sat = calc_DO_sat(temp.water = temp.water, bp_mb, model = "garcia-benson"),
+         DO.pctsat = 100 * (DO.obs/ DO.sat),
+         WaterYear = calcWaterYear(dateTime)) |> 
+  select(-lat, -lon) |> 
+  ungroup()
+```
+
+```{r}
+doDat |> 
+  ggplot(aes(dateTime, PAR.obs)) +
+  geom_line(color = "darkgoldenrod1") +
+  ylab(expression(PAR~(mu*"mol m"^-2*"s"^-1))) +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~Site, ncol = 2, scales = "free")
+
+doDat |>
+  ggplot(aes(dateTime, DO.pctsat)) +
+  geom_line(color = "#5d782e") + 
+  ylab("DO (% Sat)") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~Site, ncol = 2, scales = "free")
+
+doDat |> 
+  filter(temp.water > 0) |> 
+  select(dateTime, Site, starts_with('DO')) |>
+  gather(type, DO.value, starts_with('DO')) |>
+  mutate(units = ifelse(type == 'DO.pctsat', 'DO\n(% sat)', 'DO\n(mg/L)')) |>
+  ggplot(aes(x = dateTime, y = DO.value, color = type)) + 
+  geom_point(size = 0.5, alpha = 0.1) + 
+  facet_grid(units ~ Site, scale = 'free') + 
+  theme_few() +
+  labs(x = "", y = "")+
+  scale_color_manual(name = "variable",
+                     values = c("DO.sat" = "#f58231",
+                                "DO.pctsat" = "#0082c8",
+                                "DO.obs" = "#3cb44b"),
+                     labels = c("DO.pctsat" = "DO (% Sat)",
+                                "DO.obs" = "DO (Obs)",
+                                "DO.sat" = "DO (Sat)"))+
+  theme(legend.title = element_blank(),
+        legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha = 1)),
+         shape = guide_legend(override.aes = list(size = 3)))
+
+```
+
+## Calc DO Metrics
+
+```{r}
+#dailyDOtest <- daily_summary(doDat)
+# Daily metrics
+dailyDO <- doDat |> 
+  #filter(wetQf != "Dry") |> 
+  mutate(Date = as_date(dateTime)) |>
+  group_by(Site, Date) |>
+  arrange(Date, .by_group = TRUE) |>
+  summarize(
+    maxPar = max(PAR.obs, na.rm = TRUE),
+    avgPar = mean(PAR.obs, na.rm = TRUE),
+    water.temp = mean(temp.water, na.rm = T),
+    minDO.obs = min(DO.obs, na.rm = T),
+    maxDO.obs = max(DO.obs, na.rm = T),
+    minDO.pctsat = min(DO.pctsat, na.rm = T),
+    maxDO.pctsat = max(DO.pctsat, na.rm = T),
+    avgDO.obs = mean(DO.obs, na.rm = T),
+    avgDO.pctsat = mean(DO.pctsat, na.rm = T),
+    DOSat.hyp = sum(DO.pctsat <= 50, na.rm = T),
+    DO.hyp = sum(DO.obs <= 2, na.rm = T),
+    cvDO.pctsat = (sd(DO.pctsat, na.rm = T)/mean(DO.pctsat, na.rm = T))*100,
+    sdDO.pctsat = sd(DO.pctsat, na.rm = T),
+    totalDO = n()
+    ) |> 
+  mutate(DOSat.slope = (avgDO.pctsat - lag(avgDO.pctsat))) |> 
+  mutate(across(where(is.numeric), ~ ifelse(is.finite(.), ., NA))) |> 
+  mutate(across(where(is.numeric), ~ ifelse(if_any(everything(), is.na), NA, .))) |> 
+  mutate(across(minDO.obs:avgDO.pctsat, ~ ifelse(. == 0, NA, .))) |> 
+  mutate(DO.amp = maxDO.obs - minDO.obs,
+         DOpctsat.amp = maxDO.pctsat - minDO.pctsat,
+         probHyp = DO.hyp / totalDO,
+         probHypSat = DOSat.hyp / totalDO) |> 
+  mutate(dDOpctsat.amp = DOpctsat.amp - lag(DOpctsat.amp),
+         dMinDO.pctsat = minDO.pctsat - lag(minDO.pctsat)) |> 
+  ungroup() |> 
+  group_by(Site) |> 
+  mutate(
+         DOSat.exc = calc_exceedance_prob(avgDO.pctsat)) |> 
+  ungroup()
+#nighttime hypoxia ratio
+nightHypRat <- doDat |> 
+  #filter(wetQf != "Dry") |> 
+  mutate(across(c("DO.obs", "DO.pctsat", "DO.sat"), ~ ifelse(. == 0, NA, .))) |> 
+  select(Site, dateTime, solar.time, DO.obs, DO.pctsat, DO.sat, isDaytime) |> 
+  mutate(Date = as_date(dateTime)) |>
+  group_by(Date, Site, isDaytime) |> 
+  summarise(DO.hyp.obs = sum(DO.obs <= 2, na.rm = TRUE),
+            DO.hyp.sat = sum(DO.pctsat <= 50, na.rm = TRUE), .groups = 'drop') |> 
+  ungroup() |> 
+  pivot_wider(names_from = isDaytime, 
+              values_from = c(DO.hyp.obs, DO.hyp.sat), 
+              names_prefix = "DO_hyp_", 
+              names_sep = "_") |> 
+  rename(DayHyp_obs = DO.hyp.obs_DO_hyp_TRUE, 
+         NightHyp_obs = DO.hyp.obs_DO_hyp_FALSE,
+         DayHyp_sat = DO.hyp.sat_DO_hyp_TRUE, 
+         NightHyp_sat = DO.hyp.sat_DO_hyp_FALSE) |> 
+  mutate(NHR_obs = NightHyp_obs / DayHyp_obs,
+         NHR_sat = NightHyp_sat / DayHyp_sat) |> 
+  mutate(across(where(is.numeric), ~ ifelse(is.finite(.), ., NA))) |> 
+  select(Date, Site, NHR_obs, NHR_sat)
+
+
+# Calculate probabilities for daytime
+dayHypProb <- doDat |> 
+  #filter(wetQf != "Dry") |> 
+  mutate(across(c("DO.obs", "DO.pctsat", "DO.sat"), ~ ifelse(. == 0, NA, .))) |> 
+  select(Site, dateTime, solar.time, DO.obs, DO.pctsat, DO.sat, isDaytime) |> 
+  mutate(Date = as_date(dateTime)) |>
+  filter(isDaytime) |>
+  group_by(Site, Date) |>
+  summarise(
+    dayProbConc = mean(DO.obs < 2, na.rm = TRUE),
+    dayProbSat = mean(DO.pctsat < 50, na.rm = TRUE),
+    .groups = 'drop'
+  ) |> 
+  ungroup()
+
+# Calculate probabilities for nighttime
+nightHypProb <- doDat |>
+  #filter(wetQf != "Dry") |> 
+  mutate(across(c("DO.obs", "DO.pctsat", "DO.sat"), ~ ifelse(. == 0, NA, .))) |> 
+  select(Site, dateTime, solar.time, DO.obs, DO.pctsat, DO.sat, isDaytime) |> 
+  mutate(Date = as_date(dateTime)) |>
+  filter(!isDaytime) |>
+  group_by(Site, Date) |>
+  summarise(
+    nightProbConc = mean(DO.obs < 2, na.rm = TRUE),
+    nightProbSat = mean(DO.pctsat < 50, na.rm = TRUE),
+    .groups = 'drop'
+  ) |> 
+  ungroup()
+
+# Join the daytime and nighttime probabilities
+nightHypRat <- dayHypProb |>
+  inner_join(nightHypProb, by = c("Site", "Date")) |> 
+  mutate(NHR_obs = nightProbConc/dayProbConc,
+         NHR_sat = nightProbSat/dayProbSat) |> 
+  mutate(across(where(is.numeric), ~ ifelse(is.finite(.), ., NA)))
+
+
+
+#Merge DO Metrics
+doMetrics <- dailyDO |> 
+  full_join(nightHypRat) 
+doMetrics |> 
+  write_csv(here("Data/seDO_metrics.csv"))
+```
+
+## 
+
+## PPT
+
+```{r}
+
+dailyPPT <- do.call(rbind, nasaDat) |> 
+  select(Site, YYYYMMDD, HR, ppt_mm = PRECTOTCORR) |> 
+  mutate(HR = paste0(str_pad(HR, 2, side = "left", pad = 0), ":00:00")) |> 
+  mutate(dateTime = ymd_hms(paste(YYYYMMDD, HR, " ")),
+         Date = as_date(dateTime)) |> 
+  group_by(Site, Date) |> 
+  summarise(PPT_1d = sum(ppt_mm, na.rm = TRUE), .groups = "drop")
+
+
+# Define rolling window sizes
+window_sizes <- c(7, 14, 30, 60)
+
+setDT(dailyPPT)
+dailyPPT[, (paste0("PPT_", window_sizes, "d")) := 
+              lapply(window_sizes, function(w) frollsum(get("PPT_1d"), n = w, align = "right", na.rm = TRUE)),
+           by = Site]
+
+```
+
+## STICs
+
+```{r}
+ptSTICs <- sePT |> 
+  rename(SuperSensor = wetdry_SW) |> 
+  mutate(siteId = case_when(Site == "PRF" ~ "PRM01",
+                          Site == "TAL" ~ "TLM01",
+                          Site == "WHR" ~ "WHM01"),
+         SuperSensor = case_when(
+    SuperSensor %in% c("dry", "0") ~ 0,
+    SuperSensor %in% c("wet", "1") ~ 1,
+    TRUE ~ NA_real_)) |> 
+  select(dateTime, siteId, SuperSensor)
+
+
+
+
+stics <- list.files(here("Data/SE/STICs"), full.names = T) |> 
+  lapply(\(file) {
+    read_csv(file, col_types = cols(.default = col_character()))
+  }) |> 
+  bind_rows() |> 
+  select(-project, -rType, -SN, -rep) |> 
+  rename(dateTime = datetime) |> 
+  filter(siteId %in% seSites$siteId & qual_rating != "poor") |> 
+  mutate(dateTime = ymd_hms(dateTime),
+         wetdry = case_when(
+    wetdry %in% c("dry", "0") ~ 0,
+    wetdry %in% c("wet", "1") ~ 1,
+    TRUE ~ NA_real_))
+  
+
+stics <- stics |> 
+  full_join(ptSTICs, by = c("siteId", "dateTime")) |> 
+  mutate(wetdry = coalesce(wetdry, SuperSensor)) |> 
+  select(-SuperSensor) |> 
+  group_by(siteId) |> 
+  complete(dateTime = seq(floor_date(min(dateTime), "15 min"), floor_date(max(dateTime), "15 min"), by = "15 min")) |> 
+  arrange(dateTime) |> 
+  mutate(Site = case_when(
+    startsWith(siteId, "W") ~ "WHR",
+    startsWith(siteId, "P") ~ "PRF",
+    startsWith(siteId, "T") ~ "TAL",
+    TRUE ~ NA_character_  
+  )) |> 
+  ungroup()
+
+dailyPercWet <- stics |>
+  mutate(Date = as.Date(dateTime)) |> 
+  group_by(Site, Date) |>                                
+  summarize(
+    PercWet_1d = sum(wetdry == 1, na.rm = TRUE) / sum(!is.na(wetdry)),
+    n_stics = n_distinct(siteId[!is.na(wetdry)]),
+    tot_stics = n_distinct(siteId),  # ← counted from all sites present on that day in this watershed
+    pct_coverage = n_stics / tot_stics,
+    .groups = "drop"
+  ) |> 
+  ungroup() |> 
+  group_by(Site) |> 
+  mutate(dPercWet_1d = PercWet_1d - lag(PercWet_1d, default = NA)) |> 
+  ungroup()
+
+
+dailyPercWet |>
+  ggplot(aes(Date, PercWet_1d)) +
+  geom_point() +
+  theme_few() +
+    theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~Site, scales = "free", ncol = 1) 
+
+dailyPercWet |>
+  ggplot(aes(Date, dPercWet_1d)) +
+  geom_point() +
+  theme_few() +
+    theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~Site, scales = "free", ncol = 1)
+```
+
+# StreamDAG
+
+### Daily PresAbs
+
+```{r}
+source(here("Code/AIMS_DAGs.R"))
+
+daily_presAbs <- stics |>
+  mutate(
+    date = as_date(dateTime)
+  ) |>
+  filter(!is.na(Site)) |>
+  group_by(Site, siteId, date) |>
+  summarise(wetdry = get_mode(wetdry), .groups = "drop") |>
+  split(~Site, drop = TRUE) |> 
+  lapply(\(df) {
+    df |>
+      select(date, siteId, wetdry) |>
+      pivot_wider(
+        names_from = siteId,
+        values_from = wetdry
+      )
+  })
+
+daily_presAbs_clean <- map(daily_presAbs, stics_not_na)
+doParallel::registerDoParallel(cores = nCores)
+daily_presAbs_filled <- map(daily_presAbs_clean, STIC.RFimpute_parallel)
+
+# Trim and rebuild aimsNets based on daily_presAbs_filled
+aimsNets <- imap(aimsNets, \(net, wshed) {
+  keep_nodes <- names(daily_presAbs_clean[[wshed]])[-1]
+  reconnect_and_remove_nodes(net, keep_nodes)
+})
+
+```
+
+```{r}
+map <- mapview(
+    seSites,
+    map.types = "Esri.WorldImagery",
+    col.regions = "red",
+    cex = 5,
+    layer.name = "Sampling Sites"
+  ) +
+  mapview(
+    seStreams,
+    color = "blue",
+    lwd = 2,
+    layer.name = "Streams"
+  ) 
+map
+sink_nodes <- list(
+  PRF = "PRM01",
+  TAL = "TLM01",
+  WHR = "WHM01"
+)
+# PRF
+plot_meta <- seSites |>
+  filter(siteId %in% V(aimsNets$PRF)$name)
+plot_sf_stics(aimsNets$PRF, plot_meta$lon, plot_meta$lat, plot_meta$siteId, shapefile = plot_meta, arrow.lwd = 0.7)
+
+# WHR
+plot_meta <- seSites |>
+  filter(siteId %in% V(aimsNets$WHR)$name)
+plot_sf_stics(aimsNets$WHR, plot_meta$lon, plot_meta$lat, plot_meta$siteId, shapefile = plot_meta, arrow.lwd = 0.7)
+
+# TAL
+plot_meta <- seSites |>
+  filter(siteId %in% V(aimsNets$TAL)$name)
+plot_sf_stics(aimsNets$TAL, plot_meta$lon, plot_meta$lat, plot_meta$siteId, shapefile = plot_meta, arrow.lwd = 0.7)
+```
+
+### 
+
+### Stream Dist
+
+```{r}
+# Function to compute arc lengths for a single watershed
+get_watershed_lengths <- function(watershed_name, sites, streams) {
+  # Subset data
+  ws_sites <- sites |> filter(watershed == watershed_name)
+  ws_streams <- streams |> filter(watershed == watershed_name)
+
+  # Skip if fewer than 2 sites or no streams
+  if (nrow(ws_sites) < 2 || nrow(ws_streams) < 1) return(NULL)
+
+  # Build network
+  net <- as_sfnetwork(ws_streams, directed = TRUE) |>
+    st_network_blend(ws_sites, tolerance = 4) |>
+    activate("edges") |> 
+    mutate(weight = edge_length())
+
+  # Get cost matrix
+  cost_mat <- net |>
+    st_network_cost(from = ws_sites, to = ws_sites, direction = "out", weights = "weight") |> 
+    units::drop_units()
+
+  rownames(cost_mat) <- ws_sites$siteId
+  colnames(cost_mat) <- ws_sites$siteId
+
+  # Format into long tibble
+  as.data.frame(as.table(cost_mat)) |>
+    rename(from = Var1, to = Var2, Length = Freq) |>
+    filter(is.finite(Length), Length > 0) |>
+    mutate(
+      Arc = paste(from, to, sep = " -> "),
+      Length = as.numeric(Length)
+    ) |>
+    select(Arc, Length) |>
+    as_tibble()
+}
+
+# Get list of unique watersheds
+watersheds <- intersect(unique(seSites$watershed), unique(seStreams$watershed))
+
+# Apply function across watersheds
+all_arc_lengths <- watersheds |> 
+  set_names() |>  # Name list by watershed
+  map(\(w) get_watershed_lengths(w, seSites, seStreams)) |> 
+  compact()  # Drop NULLs
+
+# Apply the function to the aimsNets list
+edge_lists <- get_edge_lists(aimsNets)
+
+# PRF
+plot_meta <- seSites |>
+  filter(siteId %in% V(aimsNets$PRF)$name)
+tmpEdge <- edge_lists$PRF
+tmpArc <- all_arc_lengths$PRF |> 
+  filter(Arc %in% tmpEdge)
+tmpArc <- tmpArc |> 
+  mutate(color = viridis::viridis(nrow(tmpArc))[rank(Length)])
+plot_sf_stics(aimsNets$PRF, plot_meta$lon, plot_meta$lat, plot_meta$siteId, shapefile = plot_meta, arrow.lwd = 0.7, arrow.col = tmpArc$color)
+
+# WHR
+tmpEdge <- edge_lists$WHR
+tmpArc <- all_arc_lengths$WHR |> 
+  filter(Arc %in% tmpEdge)
+tmpArc <- tmpArc |> 
+  mutate(color = viridis::viridis(nrow(tmpArc))[rank(Length)])
+plot_meta <- seSites |>
+  filter(siteId %in% V(aimsNets$WHR)$name)
+plot_sf_stics(aimsNets$WHR, plot_meta$lon, plot_meta$lat, plot_meta$siteId, shapefile = plot_meta, arrow.lwd = 0.7, arrow.col = tmpArc$color)
+
+# TAL
+tmpEdge <- edge_lists$TAL
+tmpArc <- all_arc_lengths$TAL |> 
+  filter(Arc %in% tmpEdge)
+tmpArc <- tmpArc |> 
+  mutate(color = viridis::viridis(nrow(tmpArc))[rank(Length)])
+plot_meta <- seSites |>
+  filter(siteId %in% V(aimsNets$TAL)$name)
+plot_sf_stics(aimsNets$TAL, plot_meta$lon, plot_meta$lat, plot_meta$siteId, shapefile = plot_meta, arrow.lwd = 0.7, arrow.col = tmpArc$color)
+
+```
+
+# Global Weighted
+
+```{r}
+# Define the metrics names
+metric_names <- c(
+  icsl = "ICSL",
+  intact_to_sink = "IntactStreamLength",
+  a_cent = "AlphaCentrality",
+  harary = "Harary"
+)
+
+# Set up parallel processing
+plan(multisession)
+
+# Compute metrics per watershed
+gWeighted <- imap(daily_presAbs_clean, \(df, wshed) {
+  
+  net <- aimsNets[[wshed]]
+  sink <- sink_nodes[[wshed]]
+  arc_lengths <- all_arc_lengths[[wshed]]
+  
+  # Prepare lookup for edge weights
+  arc_lengths <- arc_lengths |>
+    mutate(Arc_key = gsub(" -> ", "|", Arc))
+  
+  # Compute metrics for each day
+  metric_df <- future_map(1:nrow(df), \(i) {
+    temp_graph <- delete.nodes.pa(net, df[i, -1], na.response = "treat.as.1")
+    
+    edge_keys <- attributes(E(temp_graph))$vname
+    length_sub <- arc_lengths$Length[match(edge_keys, arc_lengths$Arc_key)]
+    
+    E(temp_graph)$weights <- length_sub
+    
+    tibble(
+      dateTime = df[[1]][i],
+      icsl = ICSL(temp_graph, lengths = length_sub),
+      intact_to_sink = size.intact.to.sink(temp_graph, sink = sink),
+      a_cent = mean(alpha_centrality(temp_graph), na.rm = TRUE),
+      harary = harary(temp_graph)
+    )
+  }, .options = furrr_options(seed = TRUE), .progress = TRUE) |> bind_rows()
+  
+  # Pivot to long and recode
+  metric_df |>
+    pivot_longer(cols = -dateTime, names_to = "metric", values_to = "value") |>
+    mutate(metric = recode(metric, !!!metric_names)) |> 
+    pivot_wider(names_from = metric, values_from = value) |> 
+    mutate(Site = wshed)
+})
+
+plan(sequential)
+# # Plot list for each watershed
+# gwPlots <- imap(gWeighted, \(df, wshed) {
+#   ggplot(df, aes(x = dateTime, y = value)) +
+#     geom_line(linewidth = 0.75, aes(color = metric)) +
+#     facet_wrap(~factor(metric, levels = metric_names), scales = "free_y") +
+#     theme_few() +
+#     scale_color_manual(values = okabeIto) +
+#     labs(
+#       title = paste("Weighted Metrics:", wshed),
+#       x = "",
+#       y = "Global Measures",
+#       color = "Metric"
+#     ) +
+#     theme(
+#       axis.title.x = element_blank(),
+#       axis.text.x = element_text(angle = 45, hjust = 1),
+#       legend.position = "none"
+#     )
+# })
+# 
+# gwPlots[["PRF"]]
+# gwPlots[["TAL"]]
+# gwPlots[["WHR"]]
+```
+
+# Upstream Lengths
+
+```{r}
+calculate_network_metrics <- function(network, lengths_data, pres_abs_data, site_id) {
+  node_names <- V(network)$name
+  
+  graph <- as_tbl_graph(network) |>
+    activate(edges) |>
+    mutate(
+      arc = paste0(node_names[from], " -> ", node_names[to])
+    ) |>
+    left_join(lengths_data, by = c("arc" = "Arc"))
+
+  daily_long <- pres_abs_data |>
+    pivot_longer(-date, names_to = "site", values_to = "present")
+
+  calculate_day_metrics <- function(day_data, graph_tbl, target_site) {
+    nodes_in_graph <- graph_tbl |>
+      activate(nodes) |>
+      as_tibble() |>
+      pull(name)
+
+    day_data_net <- day_data |>
+      filter(site %in% nodes_in_graph)
+
+    total_nodes <- nrow(day_data_net)
+    present_nodes <- sum(!is.na(day_data_net$present))
+
+    active_sites <- day_data_net |>
+      filter(present == 1) |>
+      pull(site)
+
+    if (!(target_site %in% active_sites)) {
+      return(list(
+        upstream_length = 0,  # <- changed from -Inf
+        wet_nodes = 0,
+        present_nodes = present_nodes,
+        total_nodes = total_nodes
+      ))
+    }
+
+    subgraph <- graph_tbl |>
+      activate(nodes) |>
+      filter(name %in% active_sites)
+
+    subgraph_igraph <- as.igraph(subgraph)
+
+    upstream_nodes <- subcomponent(subgraph_igraph, target_site, mode = "in")
+    induced_sub <- induced_subgraph(subgraph_igraph, upstream_nodes)
+
+    wet_nodes <- vcount(induced_sub)
+    upstream_length <- if (ecount(induced_sub) == 0) 0 else sum(E(induced_sub)$Length, na.rm = TRUE)
+    #upstream_length <- upstream_length * 1000  # km to meters
+
+    list(
+      upstream_length = upstream_length,
+      wet_nodes = wet_nodes,
+      present_nodes = present_nodes,
+      total_nodes = total_nodes
+    )
+  }
+
+  result <- daily_long |>
+    group_by(date) |>
+    nest() |>
+    mutate(metrics = map(data, \(x) calculate_day_metrics(x, graph, site_id))) |>
+    unnest_wider(metrics) |>
+    mutate(percentConnected = (wet_nodes / present_nodes) * 100)
+
+  return(result)
+}
+
+```
+
+```{r}
+aimsNets <- aimsNets[4:6]
+# Call the network metric function per watershed
+netMetricList <- imap(aimsNets, \(net, wshed) {
+  calculate_network_metrics(
+    network = net,
+    lengths_data = all_arc_lengths[[wshed]],
+    pres_abs_data = daily_presAbs_filled[[wshed]],
+    site_id = sink_nodes[[wshed]]
+  )
+})
+
+# Upstream length plot per watershed
+upstreamPlots <- imap(netMetricList, \(df, wshed) {
+  ggplot(df, aes(x = date, y = upstream_length)) +
+    geom_line() +
+    labs(
+      x = "Date",
+      y = "Upstream Connected Length (m)",
+      title = wshed
+    )
+})
+
+# % upstream connected plot per watershed
+percentConnectedPlots <- imap(netMetricList, \(df, wshed) {
+  ggplot(df, aes(x = date, y = percentConnected)) +
+    geom_line() +
+    labs(
+      x = "Date",
+      y = "% Upstream Connected",
+      title = wshed
+    )
+})
+
+upstreamPlots[["TAL"]]
+upstreamPlots[["WHR"]]
+upstreamPlots[["PRF"]]
+
+percentConnectedPlots[["TAL"]]
+percentConnectedPlots[["WHR"]]
+percentConnectedPlots[["PRF"]]
+
+netMetrics <- imap_dfr(netMetricList, \(df, site) {
+  df |> mutate(siteId = site) |> 
+    select(-data)
+})
+
+globalWeighted <- do.call(rbind, gWeighted) |> 
+  rename(siteId = Site) |> 
+  rename(date = dateTime)
+
+sticMetrics <- netMetrics |> 
+  full_join(globalWeighted) |> 
+  rename(Site = siteId, Date = date) |> 
+    mutate(upstream_length = if_else(wet_nodes == 0 | is.na(wet_nodes), 0, upstream_length),
+           IntactStreamLength = if_else(wet_nodes == 0 | is.na(wet_nodes), 0, upstream_length)) |> 
+  select(Date, Site, ICSL, IntactStreamLength, AlphaCentrality, Harary, upstream_length, percentConnected)
+```
+
+```{r}
+
+```
+
+# Merge Data
+
+```{r}
+# Remove unnecessary columns from doMet
+setDT(doMetrics)[, c("season", "Year") := NULL]
+
+# Convert to data.tables and set keys before merging
+datasets <- list(doMetrics, dailyQ, dailyPPT, dailyPercWet, sticMetrics)
+datasets <- lapply(datasets, as.data.table)  # Ensure all are data.tables
+
+# Set keys for efficient merging
+lapply(datasets, setkey, Site, Date)
+
+# Perform iterative merge with Reduce
+dailyDat <- Reduce(function(x, y) merge(x, y, by = c("Site", "Date"), all = TRUE), datasets)
+
+# Remove rows with NA Site
+dailyDat <- dailyDat[!is.na(Site)]
+
+# Define rolling window sizes
+window_sizes <- c(7, 14, 30, 60)
+
+# List of variables to compute rolling means for
+vars <- list(
+  Q_1d = "Q", 
+  Depth_1d = "Depth",
+  headGradient_1d = "headGradient",
+  PercWet_1d = "PercWet",
+  dPercWet_1d = "dPercWet"
+)
+
+# Generate rolling means for each variable and window size
+for (var in names(vars)) {
+  prefix <- vars[[var]]  # Get the appropriate prefix for the variable
+  dailyDat[, (paste0(prefix, "_", window_sizes, "d")) := 
+              lapply(window_sizes, function(w) frollmean(get(var), n = w, align = "right", na.rm = TRUE)),
+           by = Site]
+}
+
+# Gather the rolling mean data into a long format
+rollingCols <- grep("_(\\d+d)$", names(dailyDat), value = TRUE)  # Select columns like Q_7d, Depth_7d, etc.
+longDat <- melt(dailyDat, id.vars = c("Site", "Date"), measure.vars = rollingCols, 
+                variable.name = "Variable", value.name = "Value")
+
+# Extract the variable type (e.g., Q, Depth, etc.) and rolling window size (e.g., 7d, 14d)
+longDat[, c("VariableType", "Window") := tstrsplit(Variable, "_", fixed = TRUE)]
+
+# List to store plots
+plots <- list()
+
+longDat <- longDat |> 
+  group_by(Site, VariableType, Window) |> 
+  complete(Date = seq(min(Date, na.rm = TRUE), max(Date, na.rm = TRUE), by = "1 day")) |> 
+  ungroup()
+
+# Create separate plots for each VariableType
+unique_vars <- unique(longDat$VariableType)
+
+for (var in unique_vars) {
+  p <- longDat |> 
+    filter(VariableType == var) |>  # Use `filter()` instead of `[ ]`
+    ggplot(aes(x = Date, y = Value, color = Window, group = Window)) +
+    geom_line(linewidth = 0.8, linetype = "dashed", na.rm = T) +  
+    scale_color_manual(
+      values = c("1d" = "grey", "7d" = "blue", "14d" = "green", "30d" = "orange", "60d" = "red"),
+      name = "Rolling Window"
+    ) +
+    labs(x = "Date", y = var) +
+    theme_few() +
+    theme(legend.position = "bottom",
+          legend.title = element_text(size = 12),
+          legend.text = element_text(size = 10)) +
+    facet_wrap(~Site, scales = "free_y", ncol = 1)
+
+  # Store the plot
+  plots[[var]] <- p
+}
+
+# Display plots
+for (p in plots) {
+  print(p)
+}
+
+# Create an empty list to store plots
+plots <- list()
+
+# Loop through each unique variable
+for (var in unique_vars) {
+  # Center and scale the data for the current variable
+  centered_scaled_data <- longDat |>
+    filter(VariableType == var) |>
+    group_by(Site) |>  # Group by Site to center and scale within each site
+    mutate(Value = scale(Value)) |>  # Center and scale the Value column
+    ungroup() |>  # Ungroup to return to a regular data frame
+  filter(Window == "1d")
+  # Create the plot
+  p <- centered_scaled_data |> 
+    ggplot(aes(x = Date, y = Value, color = Site, group = Site)) +
+    geom_line(linewidth = 0.8, linetype = "dashed", na.rm = TRUE) +  
+    labs(x = "Date", y = paste("Centered & Scaled", var)) +  # Update y-axis label
+    theme_few() +
+    theme(legend.position = "bottom",
+          legend.title = element_text(size = 12),
+          legend.text = element_text(size = 10)) 
+  # Store the plot
+  plots[[var]] <- p
+}
+
+# Display plots
+for (p in plots) {
+  print(p)
+}
+```
+
+```{r}
+dailyDat |>
+  ggplot(aes(x = excProb, y = Q_1d, color = Site)) +
+  geom_line(na.rm = T) +
+  labs(x = "Exceedance Probability (%)", y = "Flow (L/s)", title = "Flow Exceedance Probability by Site") +
+  theme_few()
+
+dailyDat |>
+  ggplot(aes(x = DOSat.exc, y = avgDO.pctsat, color = Site)) +
+  geom_line(na.rm = T) +
+  labs(x = "Exceedance Probability (%)", y = "DO Sat (%)", title = "DO Exceedance Probability by Site") +
+  theme_few()
+
+dailyDat |>
+  ggplot(aes(x = Date, y = Depth_1d, color = Site)) +
+  geom_line(na.rm = T) +
+  labs(x = "", y = "Depth (m)", ) +
+  theme_few()
+
+
+dailyDat |>
+  mutate(across(where(is.numeric), ~ scale(.x) |> as.vector())) |> 
+  ggplot(aes(x = Date, y = AlphaCentrality, color = Site, group = Site)) +
+  geom_line() +
+  scale_color_manual(values = okabeIto) +  
+  labs(title = "",
+       x = "Date",
+       y = "Alpha-Centrality",
+       color = "") +
+  theme_few() +
+  theme(legend.position = "bottom")
+
+dailyDat |>
+  mutate(across(where(is.numeric), ~ scale(.x) |> as.vector())) |> 
+  ggplot(aes(x = Date, y = ICSL, color = Site, group = Site)) +
+  geom_line() +
+  scale_color_manual(values = okabeIto) +  
+  labs(title = "",
+       x = "Date",
+       y = "Integral Connectivity Scale Length",
+       color = "") +
+  theme_few() +
+  theme(legend.position = "bottom")
+
+dailyDat |>
+  mutate(across(where(is.numeric), ~ scale(.x) |> as.vector())) |> 
+  ggplot(aes(x = Date, y = Harary, color = Site, group = Site)) +
+  geom_line() +
+  scale_color_manual(values = okabeIto) +  
+  labs(title = "",
+       x = "Date",
+       y = "Harary Index",
+       color = "") +
+  theme_few() +
+  theme(legend.position = "bottom") 
+
+dailyDat |>
+  mutate(across(where(is.numeric), ~ scale(.x) |> as.vector())) |> 
+  ggplot(aes(x = Date, y = IntactStreamLength, color = Site, group = Site)) +
+  geom_line() +
+  scale_color_manual(values = okabeIto) +  
+  labs(title = "",
+       x = "Date",
+       y = "Harary Index",
+       color = "") +
+  theme_few() +
+  theme(legend.position = "bottom")
+```
+
+# Save Data
+
+```{r}
+# remove rows without DO Metrics and save to csv
+dailyDat <- dailyDat |> 
+  #drop_na(avgDO.pctsat) |> 
+  select(-n_stics, -tot_stics, -pct_coverage) |> 
+  write_csv(here("Data/SE_dailyData.csv"))
+```
+
+```{r}
+wetQf_colors <- c("Flowing" = "#0077BB", "Pooled" = "#BBBB00", "Dry" = "#E69F00")
+
+for (site_id in site_ids) {
+  
+  # Filter data for current site
+  gpQ_site <- dailyDat |> 
+    filter(Site == site_id)
+  
+  # Prepare xts data
+  xts_data <- gpQ_site |> 
+    select(Date, Q_1d, Depth_1d) |> 
+    arrange(Date) |> 
+    xts::xts(order.by = gpQ_site$Date)
+  
+  # Build dygraph with separate y-axes
+  dy <- dygraph(xts_data, main = site_id) |>
+    dySeries("Q_1d", label = "Q (L/s)", axis = "y") |>
+    dySeries("Depth_1d", label = "Depth (m)", axis = "y2") |>
+    dyOptions(colors = c("blue", "green")) |>
+    dyAxis("y", label = "Q (L/s)") |>
+    dyAxis("y2", label = "Water Depth (m)") |> 
+    dyRangeSelector() |>
+    dyOptions(useDataTimezone = TRUE, connectSeparatedPoints = FALSE) |>
+    dyLegend(show = "always", width = 400)
+  
+  # Add wetQf vertical lines with color coding from dailyDat
+  wet_events <- gpQ_site |> filter(!is.na(wetQf))
+  
+  for (i in seq_len(nrow(wet_events))) {
+    event_type <- wet_events$wetQf[i]
+    event_date <- wet_events$Date[i]
+    dy <- dy |> dyEvent(event_date,
+                        label = event_type,
+                        labelLoc = "bottom",
+                        color = wetQf_colors[[event_type]])
+  }
+  
+  print(dy)
+}
+
+```
+
+# SEM
+
+```{r}
+library(lavaan)
+
+# dailyDat |> 
+#   ggplot(aes(x = Depth_7d , y = avgDO.pctsat, color = Site)) +
+#   geom_point() +
+#   theme_few()
+
+# Define the SEM model as a string
+sem_model <- '  
+  # Regressions for DO
+  minDO.pctsat ~ PercWet_7d + Q_7d + Depth_7d + excProb
+
+  maxDO.pctsat ~ PercWet_7d + Q_7d + Depth_7d + excProb
+
+  avgDO.pctsat ~ PercWet_7d + Q_7d + Depth_7d + excProb
+  
+
+  # Regressions for Q, Depth, and PercWet
+  PercWet_7d ~ PPT_7d + Q_7d
+  Q_7d ~ PPT_7d + Depth_7d
+  
+  # Covariates
+  #minDO.pctsat ~~ maxDO.pctsat + avgDO.pctsat
+  Q_7d ~~ Depth_7d
+'
+
+# Fit the SEM model using a hypothetical dataset 'data'
+fit <- sem(sem_model, data = dailyDat)
+
+# Summarize the results
+summary(fit, fit.measures = TRUE, standardized = TRUE)
+library(semPlot)
+semPaths(fit, "std", "est", style = "lisrel")
+semPaths(fit, "Standardized", "Estimates")
+```
+
+```{r}
+library(lavaan)
+library(dplyr)
+library(doParallel)
+library(foreach)
+
+# List of variables for each component
+PPT_vars <- c("PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d")
+Depth_vars <- c("Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d")
+Q_vars <- c("Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d")
+PercWet_vars <- c("PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d")
+
+# Generate all combinations of variables
+combinations <- expand.grid(PPT = PPT_vars, Depth = Depth_vars, Q = Q_vars, PercWet = PercWet_vars)
+
+# Set up parallel backend
+num_cores <- parallel::detectCores() - 1 # Use one less than the total cores
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+# Parallel loop to fit SEM models
+results <- foreach(i = 1:nrow(combinations), .packages = c("lavaan", "dplyr")) %dopar% {
+  # Extract current combination
+  current_combo <- combinations[i, ]
+  
+  # Define the SEM model dynamically
+  sem_model <- paste0('  
+    # Regressions for DO
+    minDO.pctsat ~ ', current_combo$PercWet, ' + ', current_combo$Q, ' + ', current_combo$Depth, ' + excProb
+
+    maxDO.pctsat ~ ', current_combo$PercWet, ' + ', current_combo$Q, ' + ', current_combo$Depth, ' + excProb
+
+    avgDO.pctsat ~ ', current_combo$PercWet, ' + ', current_combo$Q, ' + ', current_combo$Depth, ' + excProb
+
+    # Regressions for Q, Depth, and PercWet
+    ', current_combo$PercWet, ' ~ ', current_combo$PPT, ' + ', current_combo$Q, '
+    ', current_combo$Q, ' ~ ', current_combo$PPT, ' + ', current_combo$Depth, '
+  ')
+  
+  # Fit the SEM model
+  fit <- sem(sem_model, data = dailyDat)
+  
+  # Extract key fit measures
+  fit_measures <- fitMeasures(fit, c("aic", "bic", "rmsea", "cfi"))
+  
+  # Return the results for the current combination
+  list(
+    combo = current_combo,
+    fit_measures = fit_measures
+  )
+}
+
+# Stop the parallel cluster
+stopCluster(cl)
+
+# Combine results into a data frame
+fit_measures <- do.call(rbind, lapply(results, function(x) {
+  data.frame(
+    Combination = paste(x$combo, collapse = ", "),
+    AIC = x$fit_measures["aic"],
+    BIC = x$fit_measures["bic"],
+    RMSEA = x$fit_measures["rmsea"],
+    CFI = x$fit_measures["cfi"]
+  )
+}))
+
+# View the fit measures
+print(fit_measures)
+
+```
+
+```{r}
+siteColors <- c('#1b9e77','#d95f02','#7570b3')
+siteShapes <- calc_shape_pal()(length(unique(dailyDat$Site)))
+```
+
+# 
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+# Specify the variables for which to create boxplots
+vars <- c("minDO.pctsat", "maxDO.pctsat", "avgDO.pctsat", "DOpctsat.amp", "probHypSat",
+  "PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d",
+  "dPercWet_1d", "dPercWet_7d", "dPercWet_14d", "dPercWet_30d", "dPercWet_60d",
+  "PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d", 
+  "Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d", "excProb",
+  "Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d"
+)
+
+# Define custom colors for clusters
+custom_colors <- c("1" = "#228833", "2" = "#66CCEE", "3" = "#AA3377")
+
+pdf(here("Figs/cluster/Boxplots_by_Cluster.pdf"), width = 8, height = 6)
+# Loop through variables and create boxplots
+for (var in vars) {
+  # Check if the variable exists in the dataframe
+  if (var %in% names(dailyDat)) {
+    # Create the boxplot
+    p <- ggplot(dailyDat, aes_string(x = "factor(cluster)", y = var, fill = "factor(cluster)")) +
+      geom_boxplot() +
+        scale_fill_manual(values = custom_colors) +
+      labs(
+        title = paste("Boxplot of", var, "by Cluster"),
+        x = "Cluster",
+        y = var,
+        fill = "Cluster"
+      ) +
+      theme_few()
+    
+    # Add the plot to the PDF
+    print(p) # Ensure that this writes to the PDF device
+  } else {
+    message(paste("Variable", var, "does not exist in the dataframe."))
+  }
+}
+
+# Close the PDF device
+dev.off()
+```
+
+```{r}
+# Specify the variables for which to create histograms
+vars <- c("minDO.pctsat", "maxDO.pctsat", "avgDO.pctsat", "DOpctsat.amp", "probHypSat",
+  "PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d",
+  "dPercWet_1d", "dPercWet_7d", "dPercWet_14d", "dPercWet_30d", "dPercWet_60d",
+  "PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d", 
+  "Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d", "excProb",
+  "Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d"
+)
+
+pdf(here("Figs/cluster/Histograms_by_Cluster.pdf"), width = 8, height = 6)
+# Create grouped bar plot for Site counts by cluster
+grouped_histogram <- ggplot(dailyDat, aes(x = Site, fill = factor(cluster))) +
+  geom_bar(position = "dodge") +
+  scale_fill_manual(values = custom_colors) +
+  labs(
+    title = "Site Counts by Cluster",
+    x = "Site",
+    y = "Count",
+    fill = "Cluster"
+  ) +
+  theme_few() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(grouped_histogram)
+
+# Loop through variables and create histograms
+for (var in vars) {
+  # Check if the variable exists in the dataframe
+  if (var %in% names(dailyDat)) {
+    # Create the histogram
+    p <- ggplot(dailyDat, aes_string(x = var, fill = "factor(cluster)")) +
+      geom_histogram(alpha = 0.6, position = "identity") +
+        scale_fill_manual(values = custom_colors) +
+      labs(
+        title = paste("Histogram of", var),
+        x = var,
+        y = "Count",
+        fill = "Cluster"
+      ) +
+      theme_few()
+
+    # Add the plot to the PDF
+    print(p) # Ensure that this writes to the PDF device
+  } else {
+    message(paste("Variable", var, "does not exist in the dataframe."))
+  }
+}
+
+# Close the PDF device
+dev.off()
+```
+
+## Rand Forest
+
+```{r}
+library(ranger)
+response_vars <- c("Site", "avgDO.pctsat")
+predictor_vars <- c(
+  "PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d",
+  "dPercWet_1d", "dPercWet_7d", "dPercWet_14d", "dPercWet_30d", "dPercWet_60d",
+  "PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d", 
+  "Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d", "excProb",
+  "Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d"
+)
+
+
+rfDat <- dailyDat |>
+  ungroup() |> 
+  select(all_of(c(response_vars, predictor_vars))) 
+# Split data into training and testing sets
+set.seed(123)
+datSplit <- initial_split(rfDat, prop = 0.75)
+datTrain <- training(datSplit)
+datTest <- testing(datSplit)
+
+#Set up model
+rfMod <- 
+  rand_forest() |> 
+  set_engine("ranger",
+             num.threads = (parallel::detectCores() - 1),
+             importance = "permutation") |> 
+  set_mode("regression")
+
+#Preprocessing 
+clustRecipe <- datTrain |> 
+  recipe(avgDO.pctsat ~ .) |> #predict gpp based on all predictors
+  update_role(Site, new_role = "ID") |> #set ID vars and dont use in model
+  step_naomit(everything(), skip = TRUE) |> 
+  step_normalize(all_numeric_predictors()) |> 
+  step_corr(all_predictors(), threshold = 0.7, method = "spearman")
+
+#Make workflow
+rfWorkflow <- workflow() |> 
+  add_model(rfMod) |>
+  add_recipe(clustRecipe)
+
+#Fit model
+clustRfFit <- rfWorkflow |> 
+  fit(data = datTrain)
+
+# extract importance from model
+clustVarImp <- tibble(predictor = names(extract_fit_parsnip(clustRfFit)$fit$variable.importance),
+                  IncMSE = extract_fit_parsnip(clustRfFit)$fit$variable.importance,
+                  OOBmse = extract_fit_parsnip(clustRfFit)$fit$prediction.error,
+                  OOBr2 = extract_fit_parsnip(clustRfFit)$fit$r.squared) |> 
+  # order most to least importance (higher value = greater influence on predictors)
+  arrange(-IncMSE) |>  
+  # make a factor so they plot in order
+  mutate(predictor_factor = factor(predictor, levels = .$predictor))
+
+ggplot(clustVarImp, aes(x = predictor_factor, y = IncMSE)) +
+  geom_col() +
+  theme_few() +
+  labs(title = "DO % Sat Variable Importance")+
+  theme(axis.text = element_text(angle = 45, hjust = 1)) -> doVarImp
+doVarImp
+ggsave(filename = "doVarImp.png", plot = doVarImp, path = here("Figs/lmFigs/"), device = "png", width = 21, height = 15, units = "cm", dpi = "retina")
+
+#get predictions from model
+datTest$clustPred <- predict(clustRfFit, datTest)$.pred
+#Plot
+ggplot(datTest, aes(clustPred, avgDO.pctsat)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = T, color = "blue") +
+  labs(title = "RF Model") +
+  scale_x_continuous(name = "Predicted DO (% Sat)") +
+  scale_y_continuous(name = "Observed DO (% Sat)") +
+  stat_regline_equation(label.y = 2.5, aes(label = ..rr.label..))+
+  #coord_equal() +
+  theme_few() -> doRf
+doRf 
+ggsave(filename = "doRf.png", plot = doRf, path = here("Figs/lmFigs/"), device = "png", width = 21, height = 15, units = "cm", dpi = "retina")
+
+
+```
+
+```{r}
+response_vars <- c("Site", "avgDO.pctsat")
+predictor_vars <- c(
+  "PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d",
+  "dPercWet_1d", "dPercWet_7d", "dPercWet_14d", "dPercWet_30d", "dPercWet_60d",
+  "PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d", 
+  "Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d", "excProb",
+  "Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d"
+)
+
+rfDat <- dailyDat |>
+  ungroup() |> 
+  select(all_of(c(response_vars, predictor_vars)))
+
+# Split data into training and testing sets
+set.seed(123)
+datSplit <- initial_split(rfDat, prop = 0.75)
+datTrain <- training(datSplit)
+datTest <- testing(datSplit)
+
+# Define random forest model with tuning
+rfMod <- 
+  rand_forest(
+    mtry = tune(), # Number of predictors to consider at each split
+    trees = tune(), # Number of trees
+    min_n = tune()  # Minimum number of data points in a node
+  ) |> 
+  set_engine("ranger", 
+             num.threads = (parallel::detectCores() - 1),
+             importance = "permutation") |> 
+  set_mode("regression")
+
+# Preprocessing
+clustRecipe <- datTrain |> 
+  recipe(avgDO.pctsat ~ .) |> # Predict avgDO.pctsat based on all predictors
+  update_role(Site, new_role = "ID") |> # Set Site as an ID variable
+  step_naomit(everything(), skip = TRUE) |> 
+  step_normalize(all_numeric_predictors()) |> 
+  step_corr(all_predictors(), threshold = 0.7, method = "spearman")
+
+# Define workflow
+rfWorkflow <- workflow() |> 
+  add_model(rfMod) |>
+  add_recipe(clustRecipe)
+
+# Define tuning grid
+rfGrid <- grid_regular(
+  mtry(range = c(2, length(predictor_vars))), # Tune mtry from 2 to total predictors
+  trees(range = c(100, 1000)),               # Number of trees from 100 to 1000
+  min_n(range = c(5, 20)),                   # Minimum node size from 5 to 20
+  levels = 5                                 # Number of levels for each parameter
+)
+
+# Perform cross-validation
+set.seed(123)
+cv_folds <- vfold_cv(datTrain, v = 5) # 5-fold cross-validation
+
+# Tune the model
+set.seed(123)
+rfTuned <- rfWorkflow |>
+  tune_grid(
+    resamples = cv_folds,
+    grid = rfGrid,
+    metrics = metric_set(rmse, rsq) # Metrics to evaluate performance
+  )
+
+# Extract the best hyperparameters
+best_params <- rfTuned |> 
+  select_best(metric = "rmse")
+
+# Finalize the workflow with the best parameters
+finalRfWorkflow <- rfWorkflow |> 
+  finalize_workflow(best_params)
+
+# Fit the final model
+finalRfFit <- finalRfWorkflow |>
+  fit(data = datTrain)
+
+# Evaluate the final model on the test set
+finalRfResults <- finalRfFit |>
+  predict(new_data = datTest) |>
+  bind_cols(datTest) |>
+  metrics(truth = avgDO.pctsat, estimate = .pred)
+
+# Extract variable importance
+final_model <- finalRfFit |> extract_fit_parsnip() |> pluck("fit")
+variable_importance <- as.data.frame(final_model$variable.importance) |>
+  rownames_to_column(var = "Variable") |>
+  rename(Importance = `final_model$variable.importance`) |>
+  arrange(desc(Importance))
+
+# Plot variable importance
+ggplot(variable_importance, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Variable Importance",
+    x = "Predictor Variables",
+    y = "Importance"
+  ) +
+  theme_few()
+
+# Create predictions for the test set
+test_predictions <- finalRfFit |>
+  predict(new_data = datTest) |>
+  bind_cols(datTest)
+# Calculate R-squared
+library(broom)
+model_metrics <- test_predictions |>
+  metrics(truth = avgDO.pctsat, estimate = .pred)
+
+r_squared <- model_metrics |>
+  filter(.metric == "rsq") |>
+  pull(.estimate)
+
+# Plot observed vs predicted with R-squared
+ggplot(test_predictions, aes(x = avgDO.pctsat, y = .pred)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed", size = 1) +
+  geom_smooth(method = "lm", color = "blue", linetype = "solid", se = T) +
+  annotate("text", x = Inf, y = -Inf, label = paste0("R² = ", round(r_squared, 3)),
+           hjust = 1.1, vjust = -1.5, size = 5, color = "black") +
+  labs(
+    title = "Observed vs Predicted",
+    x = "Observed avgDO.pctsat",
+    y = "Predicted avgDO.pctsat"
+  ) +
+  theme_few()
+```
+
+## 
+
+```{r}
+# Load necessary libraries
+library(tidymodels)
+library(ranger)
+library(dplyr)
+library(caret)
+response_vars <- c("Site", "cluster")
+predictor_vars <- c(
+  "PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d",
+  "dPercWet_1d", "dPercWet_7d", "dPercWet_14d", "dPercWet_30d", "dPercWet_60d",
+  "PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d", 
+  "Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d", "excProb",
+  "Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d"
+)
+
+rfDat <- dailyDat |>
+  ungroup() |> 
+  select(all_of(c(response_vars, predictor_vars))) |> 
+  mutate(cluster = factor(cluster))
+
+# Split data into training and testing sets
+set.seed(123)
+datSplit <- initial_split(rfDat, prop = 0.75)
+datTrain <- training(datSplit)
+datTest <- testing(datSplit)
+
+# Define random forest model with tuning
+rfMod <- 
+  rand_forest(
+    mtry = tune(), # Number of predictors to consider at each split
+    trees = tune(), # Number of trees
+    min_n = tune()  # Minimum number of data points in a node
+  ) |> 
+  set_engine("ranger", 
+             num.threads = (parallel::detectCores() - 1),
+             importance = "permutation") |> 
+  set_mode("classification")
+
+# Preprocessing
+clustRecipe <- datTrain |> 
+  recipe(cluster ~ .) |> # Predict avgDO.pctsat based on all predictors
+  update_role(Site, new_role = "ID") |> # Set Site as an ID variable
+  step_naomit(everything(), skip = TRUE) |> 
+  step_normalize(all_numeric_predictors()) |> 
+  step_corr(all_predictors(), threshold = 0.7, method = "spearman")
+
+# Define workflow
+rfWorkflow <- workflow() |> 
+  add_model(rfMod) |>
+  add_recipe(clustRecipe)
+
+# Define tuning grid
+rfGrid <- grid_regular(
+  mtry(range = c(2, length(predictor_vars))), # Tune mtry from 2 to total predictors
+  trees(range = c(100, 1000)),               # Number of trees from 100 to 1000
+  min_n(range = c(5, 20)),                   # Minimum node size from 5 to 20
+  levels = 5                                 # Number of levels for each parameter
+)
+
+# Perform cross-validation
+set.seed(123)
+cv_folds <- vfold_cv(datTrain, v = 5) # 5-fold cross-validation
+
+# Tune the model
+set.seed(123)
+rfTuned <- rfWorkflow |>
+  tune_grid(
+    resamples = cv_folds,
+    grid = rfGrid,
+  )
+
+# Extract the best hyperparameters
+best_params <- rfTuned |> 
+  select_best(metric = "rmse")
+
+# Finalize the workflow with the best parameters
+finalRfWorkflow <- rfWorkflow |> 
+  finalize_workflow(best_params)
+
+# Fit the final model
+finalRfFit <- finalRfWorkflow |>
+  fit(data = datTrain)
+
+# Evaluate the final model on the test set
+finalRfResults <- finalRfFit |>
+  predict(new_data = datTest) |>
+  bind_cols(datTest) |>
+  metrics(truth = cluster, estimate = .pred)
+
+# Extract variable importance
+final_model <- finalRfFit |> extract_fit_parsnip() |> pluck("fit")
+variable_importance <- as.data.frame(final_model$variable.importance) |>
+  rownames_to_column(var = "Variable") |>
+  rename(Importance = `final_model$variable.importance`) |>
+  arrange(desc(Importance))
+
+# Plot variable importance
+ggplot(variable_importance, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Variable Importance",
+    x = "Predictor Variables",
+    y = "Importance"
+  ) +
+  theme_few()
+
+# Create predictions for the test set
+test_predictions <- finalRfFit |>
+  predict(new_data = datTest) |>
+  bind_cols(datTest)
+# Calculate R-squared
+library(broom)
+model_metrics <- test_predictions |>
+  metrics(truth = cluster, estimate = .pred)
+
+r_squared <- model_metrics |>
+  filter(.metric == "rsq") |>
+  pull(.estimate)
+
+# Plot observed vs predicted with R-squared
+ggplot(test_predictions, aes(x = cluster, y = .pred)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed", size = 1) +
+  geom_smooth(method = "lm", color = "blue", linetype = "solid", se = T) +
+  annotate("text", x = Inf, y = -Inf, label = paste0("R² = ", round(r_squared, 3)),
+           hjust = 1.1, vjust = -1.5, size = 5, color = "black") +
+  labs(
+    title = "Observed vs Predicted",
+    x = "Obs Cluster",
+    y = "Pred Cluster"
+  ) +
+  theme_few()
+```
+
+# rda
+
+```{r}
+predictor_vars <- c(
+  "PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d",
+  "PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d", 
+  "Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d", "excProb",
+  "Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d", "WaterYear"
+)
+response_vars <- c("minDO.pctsat", "maxDO.pctsat", "avgDO.pctsat", "DOpctsat.amp", "probHypSat", "cluster")
+
+predDat <- dailyDat |> 
+  drop_na() |> 
+  select(all_of(c(predictor_vars))) |> 
+  mutate(WaterYear = as.factor(WaterYear)) |> 
+  select(where(is.numeric)) |> 
+  decostand(method='standardize')
+
+respDat <- dailyDat |> 
+  drop_na() |> 
+  select(all_of(c(response_vars))) |> 
+  mutate(cluster = as.factor(cluster)) |> 
+  select(where(is.numeric)) |> 
+  decostand(method='standardize') |> 
+  as.matrix()
+dat.rda <- rda(respDat ~., data = predDat)
+summary(dat.rda)
+plot(dat.rda)
+anova(dat.rda, by='term', permutations=1000)
+
+fwd.sel<-ordiR2step(rda(respDat~1, data=predDat), #lower model limit
+  scope=formula(dat.rda), #this is the full model (above)
+  direction='forward',
+  R2scope=TRUE, #cannot surpass the full models R2
+  pstep=1000,
+  trace=TRUE)
+```
+
+# LM
+
+```{r}
+# Step 1: Define response and predictor variables
+response_vars <- c("minDO.pctsat", "maxDO.pctsat", "avgDO.pctsat", "DOpctsat.amp", "probHypSat", "PC1", "PC2", "cluster")
+predictor_vars <- c(
+  "PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d",
+  "PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d", 
+  "Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d", "excProb",
+  "Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d", "WaterYear"
+)
+
+# Step 2: Correct and define the grouping structure
+grouped_predictors <- list(
+  perc_wet = c("PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d"),
+  PPT = c("PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d"),
+  Q = c("Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d"),
+  excProb = c("excProb"),
+  #quantQ = c("quantQ", "quantileQ_7d", "quantileQ_14d", "quantileQ_30d"),
+  Depth = c("Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d")
+)
+
+# Step 3: Generate combinations efficiently
+generate_filtered_combos <- function() {
+  all_combos <- map(2:4, ~combn(predictor_vars, .x, simplify = FALSE)) |>
+    purrr::flatten()
+  
+  filtered_combos <- purrr::keep(all_combos, function(combo) {
+    # Check if no more than 1 variable is selected from each group
+    group_counts <- sapply(grouped_predictors, function(group) sum(combo %in% group))
+    valid_groups <- all(group_counts <= 1)
+    valid_groups   # Allow only valid combinations
+  })
+
+  return(filtered_combos)
+}
+
+# Step 4: Generate the valid predictor combinations
+predictor_combos <- generate_filtered_combos()
+
+# Step 5: Create functions to run models
+run_model <- function(response, predictors, train_data, test_data) {
+  # Ensure WaterYear is a factor in both datasets
+  train_data$WaterYear <- as.factor(train_data$WaterYear)
+  test_data$WaterYear <- as.factor(test_data$WaterYear)
+  
+  # Define the formula
+  lmForm <- as.formula(paste(response, "~", "(", paste(predictors, collapse = " + "), ")^2"))
+  
+  # Fit the model using lm()
+  model <- lm(lmForm, data = train_data)
+  
+  # Make predictions
+  predictions <- predict(model, newdata = test_data)
+  
+  # Calculate RMSE and R-squared
+  rmse <- sqrt(mean((predictions - test_data[[response]])^2))
+  r_squared <- summary(model)$r.squared
+
+  list(model = model, rmse = rmse, r_squared = r_squared, predictors = predictors, response = response)
+}
+
+# Step 6: Prepare data
+metDat_model <- dailyDat |>
+  ungroup() |> 
+  select(all_of(c(response_vars, predictor_vars))) |> 
+  drop_na() |>
+  mutate(WaterYear = as.factor(WaterYear)) |> 
+  mutate(across(where(is.numeric), ~ scale(.)[, 1]))
+
+set.seed(123)  # For reproducibility
+data_split <- initial_split(metDat_model, prop = 0.7)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# Step 7: Run models for each response and predictor combination
+results <- lapply(response_vars, function(response) {
+  lapply(predictor_combos, function(predictors) {
+    run_model(response, predictors, train_data, test_data)
+  })
+})
+
+
+# Step 8: Extract results into dataframes
+extract_results <- function(results_list) {
+  do.call(rbind, lapply(results_list, function(res) {
+    do.call(rbind, lapply(res, function(model_result) {
+      data.frame(
+        response = model_result$response,
+        predictors = paste(model_result$predictors, collapse = ", "),
+        rmse = model_result$rmse,
+        r_squared = model_result$r_squared
+      )
+    }))
+  }))
+}
+
+results <- extract_results(results) 
+
+
+# Step 10: Rank models and analyze
+bestLM <- results |>
+  group_by(response) |>
+  arrange(response, rmse, r_squared) |> 
+  slice_head(n = 5)
+```
+
+```{r}
+
+library(furrr)
+library(purrr)
+# Step 1: Define response and predictor variables
+response_vars <- c("minDO.pctsat", "maxDO.pctsat", "avgDO.pctsat", "DOpctsat.amp", "probHypSat", "PC1", "PC2", "cluster")
+predictor_vars <- c(
+  "PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d",
+  "PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d", 
+  "Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d", "excProb",
+  "Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d", "WaterYear"
+)
+
+# Step 2: Correct and define the grouping structure
+grouped_predictors <- list(
+  perc_wet = c("PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d"),
+  PPT = c("PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d"),
+  Q = c("Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d"),
+  excProb = c("excProb"),
+  #quantQ = c("quantQ", "quantileQ_7d", "quantileQ_14d", "quantileQ_30d"),
+  Depth = c("Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d")
+)
+
+# Step 3: Generate combinations efficiently
+generate_filtered_combos <- function() {
+  all_combos <- map(2:4, ~combn(predictor_vars, .x, simplify = FALSE)) |>
+    purrr::flatten()
+  
+  filtered_combos <- purrr::keep(all_combos, function(combo) {
+    # Check if no more than 1 variable is selected from each group
+    group_counts <- sapply(grouped_predictors, function(group) sum(combo %in% group))
+    valid_groups <- all(group_counts <= 1)
+    valid_groups   # Allow only valid combinations
+  })
+
+  return(filtered_combos)
+}
+
+# Step 4: Generate the valid predictor combinations
+predictor_combos <- generate_filtered_combos()
+# Step 5: Create functions to run models
+run_model <- function(response, predictors, train_data, test_data, model_type = "linear") {
+  # Ensure WaterYear is a factor in both datasets
+  train_data$WaterYear <- as.factor(train_data$WaterYear)
+  test_data$WaterYear <- as.factor(test_data$WaterYear)
+  
+  # Apply transformations based on model type
+  if (model_type == "log-log") {
+    train_data <- train_data |>
+      mutate(across(all_of(c(response, predictors)) & -WaterYear, ~ log(. + 1)))
+    test_data <- test_data |>
+      mutate(across(all_of(c(response, predictors)) & -WaterYear, ~ log(. + 1)))
+
+  } else if (model_type == "log-linear") {
+    train_data <- train_data |>
+      mutate(across(all_of(c(predictors)) & -WaterYear, ~ log(. + 1)))
+    test_data <- test_data |>
+      mutate(across(all_of(c(predictors)) & -WaterYear, ~ log(. + 1)))
+  } else if (model_type == "linear-log") {
+    train_data <- train_data |>
+      mutate(across(all_of(response), ~ log(. + 1)))
+    test_data <- test_data |>
+      mutate(across(all_of(response), ~ log(. + 1)))
+  }
+  
+  # Define the formula
+  lmForm <- as.formula(paste(response, "~", "(", paste(predictors, collapse = " + "), ")^2"))
+  
+  # Fit the model using lm()
+  model <- lm(lmForm, data = train_data)
+  
+  # Make predictions
+  predictions <- predict(model, newdata = test_data)
+  
+  # Back-transform predictions if necessary
+  if (model_type %in% c("log-log", "log-linear")) {
+    predictions <- exp(predictions) - 1
+  }
+  
+  # Calculate RMSE and R-squared
+  rmse <- sqrt(mean((predictions - test_data[[response]])^2))
+  r_squared <- summary(model)$r.squared
+
+  list(
+    model = model, rmse = rmse, r_squared = r_squared,
+    predictors = predictors, response = response, model_type = model_type
+  )
+}
+
+# Step 6: Prepare data
+metDat_model <- dailyDat |>
+  ungroup() |> 
+  select(all_of(c(response_vars, predictor_vars))) |> 
+  drop_na() |>
+  mutate(WaterYear = as.factor(WaterYear)) |> 
+  mutate(across(where(is.numeric), ~ scale(.)[, 1]))
+
+set.seed(123)  # For reproducibility
+data_split <- initial_split(metDat_model, prop = 0.7)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# Step 7: Run models for each response and predictor combination with different types (parallelized)
+plan(multisession, workers = 6)  # Set up parallel processing
+
+# Define a function for a single model run to be used with furrr
+run_all_models <- function(response, predictors, train_data, test_data, model_types) {
+  lapply(model_types, function(model_type) {
+    run_model(response, predictors, train_data, test_data, model_type)
+  })
+}
+
+# Define model_types globally before the parallel map
+model_types <- c("linear", "log-log", "log-linear", "linear-log")
+
+# Parallelized execution with furrr
+results <- future_map(
+  response_vars, 
+  function(response) {
+    future_map(
+      predictor_combos, 
+      function(predictors) {
+        run_all_models(response, predictors, train_data, test_data, model_types)
+      }
+    )
+  }
+)
+
+
+# Step 8: Extract results into dataframes (unchanged)
+extract_results <- function(results_list) {
+  do.call(rbind, lapply(results_list, function(res) {
+    do.call(rbind, lapply(res, function(model_res) {
+      do.call(rbind, lapply(model_res, function(model_result) {
+        data.frame(
+          response = model_result$response,
+          predictors = paste(model_result$predictors, collapse = ", "),
+          model_type = model_result$model_type,
+          rmse = model_result$rmse,
+          r_squared = model_result$r_squared
+        )
+      }))
+    }))
+  }))
+}
+
+results <- extract_results(results)
+
+# Step 10: Rank models and analyze
+bestLM <- results |>
+  group_by(response, model_type) |>
+  arrange(response, model_type, rmse, r_squared) |>
+  slice_head(n = 5)
+
+# Shut down the parallel backend when done
+plan(sequential)
+```
+
+## Log-linear
+
+```{r}
+# Step 1: Define response and predictor variables
+response_vars <- c("minDO.pctsat", "maxDO.pctsat", "avgDO.pctsat", "DOpctsat.amp", "probHypSat", "PC1", "PC2", "cluster")
+predictor_vars <- c(
+  "PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d",
+  "PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d", 
+  "Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d", "excProb",
+  "Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d", "WaterYear"
+)
+
+# Step 2: Correct and define the grouping structure
+grouped_predictors <- list(
+  perc_wet = c("PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d"),
+  PPT = c("PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d"),
+  Q = c("Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d"),
+  excProb = c("excProb"),
+  #quantQ = c("quantQ", "quantileQ_7d", "quantileQ_14d", "quantileQ_30d"),
+  Depth = c("Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d")
+)
+
+# Step 3: Generate combinations efficiently
+generate_filtered_combos <- function() {
+  all_combos <- map(2:4, ~combn(predictor_vars, .x, simplify = FALSE)) |>
+    purrr::flatten()
+  
+  filtered_combos <- purrr::keep(all_combos, function(combo) {
+    # Check if no more than 1 variable is selected from each group
+    group_counts <- sapply(grouped_predictors, function(group) sum(combo %in% group))
+    valid_groups <- all(group_counts <= 1)
+    valid_groups   # Allow only valid combinations
+  })
+
+  return(filtered_combos)
+}
+
+# Step 4: Generate the valid predictor combinations
+predictor_combos <- generate_filtered_combos()
+
+# Step 5: Create functions to run models
+run_model <- function(response, predictors, train_data, test_data) {
+  # Ensure WaterYear is a factor in both datasets
+  train_data$WaterYear <- as.factor(train_data$WaterYear)
+  test_data$WaterYear <- as.factor(test_data$WaterYear)
+  
+  # Define the formula
+  lmForm <- as.formula(paste(response, "~", "(", paste(predictors, collapse = " + "), ")^2"))
+  
+  # Fit the model using lm()
+  model <- lm(lmForm, data = train_data)
+  
+  # Make predictions
+  predictions <- predict(model, newdata = test_data)
+  
+  # Calculate RMSE and R-squared
+  rmse <- sqrt(mean((predictions - test_data[[response]])^2))
+  r_squared <- summary(model)$r.squared
+
+  list(model = model, rmse = rmse, r_squared = r_squared, predictors = predictors, response = response)
+}
+
+# Step 6: Prepare data with log-transformed responses
+metDat_model <- dailyDat |>
+  ungroup() |> 
+  select(all_of(c(response_vars, predictor_vars))) |> 
+  drop_na() |>
+  # Apply log transformation to the response variables
+  mutate(across(all_of(response_vars), ~ log(. + 0.01), .names = "log_{col}")) |>
+  mutate(WaterYear = as.factor(WaterYear)) |> 
+  mutate(across(all_of(predictor_vars[predictor_vars != "WaterYear"]), ~ scale(.)[, 1]))
+
+set.seed(123)  # For reproducibility
+data_split <- initial_split(metDat_model, prop = 0.7)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# Update response variables to use log-transformed versions
+log_response_vars <- paste0("log_", response_vars)
+
+# Step 7: Run models for each log-transformed response and predictor combination
+results <- lapply(log_response_vars, function(response) {
+  lapply(predictor_combos, function(predictors) {
+    run_model(response, predictors, train_data, test_data)
+  })
+})
+
+
+results <- extract_results(results)
+
+
+# Step 10: Rank models and analyze
+bestLogLin <- results |>
+  group_by(response) |>
+  arrange(response, rmse, r_squared) |> 
+  slice_head(n = 5)
+```
+
+## Linear-log
+
+```{r}
+# Step 1: Define response and predictor variables
+response_vars <- c("minDO.pctsat", "maxDO.pctsat", "avgDO.pctsat", "DOpctsat.amp", "probHypSat", "PC1", "PC2", "cluster")
+predictor_vars <- c(
+  "PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d",
+  "PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d", 
+  "Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d", "excProb",
+  "Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d", "WaterYear"
+)
+
+
+# Update predictor variables to use log-transformed versions
+log_predictor_vars <- paste0("log_", predictor_vars[predictor_vars != "WaterYear"])
+
+# Update grouped predictors to use log-transformed variable names
+grouped_predictors <- list(
+  perc_wet = paste0("log_", c("PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d")),
+  PPT = paste0("log_", c("PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d")),
+  Q = paste0("log_", c("Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d")),
+  excProb = paste0("log_", c("excProb")),
+  Depth = paste0("log_", c("Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d"))
+)
+
+
+# Step 3 (modified): Generate combinations efficiently with log-transformed predictors
+generate_filtered_combos <- function() {
+  all_combos <- map(2:5, ~combn(log_predictor_vars, .x, simplify = FALSE)) |>
+    purrr::flatten()
+  
+  filtered_combos <- purrr::keep(all_combos, function(combo) {
+    # Check if no more than 1 variable is selected from each group
+    group_counts <- sapply(grouped_predictors, function(group) sum(combo %in% group))
+    valid_groups <- all(group_counts <= 1)
+    
+    valid_groups  # Allow only valid combinations
+  })
+  
+  return(filtered_combos)
+}
+
+
+# Step 5: Create functions to run models with and without interaction terms
+run_model <- function(response, predictors, train_data, test_data) {
+  # Ensure WaterYear is a factor in both datasets
+  train_data$WaterYear <- as.factor(train_data$WaterYear)
+  test_data$WaterYear <- as.factor(test_data$WaterYear)
+  
+  # Define the formula
+  lmForm <- as.formula(paste(response, "~", "(", paste(predictors, collapse = " + "), ")^2"))
+  
+  # Fit the model using lm()
+  model <- lm(lmForm, data = train_data)
+  
+  # Make predictions
+  predictions <- predict(model, newdata = test_data)
+  
+  # Calculate RMSE and R-squared
+  rmse <- sqrt(mean((predictions - test_data[[response]])^2))
+  r_squared <- summary(model)$r.squared
+
+  list(model = model, rmse = rmse, r_squared = r_squared, predictors = predictors, response = response)
+}
+
+# Step 6: Prepare data with log-transformed predictors
+metDat_model <- dailyDat |>
+  ungroup() |> 
+  select(all_of(c(response_vars, predictor_vars))) |> 
+  drop_na() |>
+  # Apply log transformation to numeric predictor variables (excluding WaterYear)
+  mutate(across(all_of(predictor_vars[predictor_vars != "WaterYear"]), ~ log(. + 0.01), .names = "log_{col}")) |>
+  mutate(WaterYear = as.factor(WaterYear))
+
+set.seed(123)  # For reproducibility
+data_split <- initial_split(metDat_model, prop = 0.7)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# Step 8: Run models for each response and predictor combination
+results <- lapply(response_vars, function(response) {
+  lapply(predictor_combos, function(predictors) {
+    run_model(response, predictors, train_data, test_data)
+  })
+})
+
+# Step 9: Extract results into dataframes
+extract_results <- function(results_list) {
+  do.call(rbind, lapply(results_list, function(res) {
+    do.call(rbind, lapply(res, function(model_result) {
+      data.frame(
+        response = model_result$response,
+        predictors = paste(model_result$predictors, collapse = ", "),
+        rmse = model_result$rmse,
+        r_squared = model_result$r_squared
+      )
+    }))
+  }))
+}
+
+results <- extract_results(results)
+
+# Step 10: Rank models and analyze
+bestLinLog <- results |>
+  group_by(response) |>
+  arrange(response, rmse, r_squared) |> 
+  slice_head(n = 5)
+```
+
+## Log-Log
+
+```{r}
+# Step 1: Define response and predictor variables
+response_vars <- c("minDO.pctsat", "maxDO.pctsat", "avgDO.pctsat", "DOpctsat.amp", "probHypSat", "PC1", "PC2", "cluster")
+
+predictor_vars <- c(
+  "PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d",
+  "PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d", 
+  "Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d", "excProb",
+  "Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d", "WaterYear"
+)
+
+
+# Update predictor variables to use log-transformed versions
+log_predictor_vars <- paste0("log_", predictor_vars[predictor_vars != "WaterYear"])
+
+# Update grouped predictors to use log-transformed variable names
+grouped_predictors <- list(
+  perc_wet = paste0("log_", c("PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d")),
+  PPT = paste0("log_", c("PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d")),
+  Q = paste0("log_", c("Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d")),
+  excProb = paste0("log_", c("excProb")),
+  Depth = paste0("log_", c("Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d"))
+)
+
+# Step 3 (modified): Generate combinations efficiently with log-transformed predictors
+generate_filtered_combos <- function() {
+  all_combos <- map(2:5, ~combn(log_predictor_vars, .x, simplify = FALSE)) |>
+    purrr::flatten()
+  
+  filtered_combos <- purrr::keep(all_combos, function(combo) {
+    # Check if no more than 1 variable is selected from each group
+    group_counts <- sapply(grouped_predictors, function(group) sum(combo %in% group))
+    valid_groups <- all(group_counts <= 1)
+    
+  
+    
+    valid_groups   # Allow only valid combinations
+  })
+  
+  return(filtered_combos)
+}
+
+# Step 4: Generate valid predictor combinations
+predictor_combos <- generate_filtered_combos()
+
+
+# Step 5: Create functions to run models with and without interaction terms
+run_model <- function(response, predictors, train_data, test_data) {
+  # Ensure WaterYear is a factor in both datasets
+  train_data$WaterYear <- as.factor(train_data$WaterYear)
+  test_data$WaterYear <- as.factor(test_data$WaterYear)
+  
+  # Define the formula
+  lmForm <- as.formula(paste(response, "~", "(", paste(predictors, collapse = " + "), ")^2"))
+  
+  # Fit the model using lm()
+  model <- lm(lmForm, data = train_data)
+  
+  # Make predictions
+  predictions <- predict(model, newdata = test_data)
+  
+  # Calculate RMSE and R-squared
+  rmse <- sqrt(mean((predictions - test_data[[response]])^2))
+  r_squared <- summary(model)$r.squared
+
+  list(model = model, rmse = rmse, r_squared = r_squared, predictors = predictors, response = response)
+}
+
+# Step 6: Prepare data with log-transformed responses and predictors
+metDat_model <- dailyDat |>
+  ungroup() |> 
+  select(all_of(c(response_vars, predictor_vars))) |> 
+  drop_na() |>
+  # Apply log transformation to numeric variables (responses and predictors)
+  mutate(across(all_of(response_vars), ~ log(. + 0.01), .names = "log_{col}")) |>
+  mutate(across(all_of(predictor_vars[predictor_vars != "WaterYear"]), ~ log(. + 0.01), .names = "log_{col}")) |>
+  mutate(WaterYear = as.factor(WaterYear))
+
+set.seed(123)  # For reproducibility
+data_split <- initial_split(metDat_model, prop = 0.7)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# Step 8: Run models for each log-transformed response and predictor combination
+results <- lapply(log_response_vars, function(response) {
+  lapply(predictor_combos, function(predictors) {
+    run_model(response, predictors, train_data, test_data)
+  })
+})
+
+# Step 9: Extract results into dataframes
+extract_results <- function(results_list) {
+  do.call(rbind, lapply(results_list, function(res) {
+    do.call(rbind, lapply(res, function(model_result) {
+      data.frame(
+        response = model_result$response,
+        predictors = paste(model_result$predictors, collapse = ", "),
+        rmse = model_result$rmse,
+        r_squared = model_result$r_squared
+      )
+    }))
+  }))
+}
+
+results <- extract_results(results)
+
+# Step 10: Rank models and analyze
+bestLogLog <- results |>
+  group_by(response) |>
+  arrange(response, rmse, r_squared) |> 
+  slice_head(n = 5)
+```
+
+## LM w/ PC Scores
+
+```{r}
+# Step 1: Define response and predictor variables
+response_vars <- c("PC1", "PC2")
+predictor_vars <- c(
+  "PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d",
+  "PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d", 
+  "Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d", "excProb",
+  "Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d", "WaterYear"
+)
+
+# Step 2: Correct and define the grouping structure
+grouped_predictors <- list(
+  perc_wet = c("PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d"),
+  PPT = c("PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d"),
+  Q = c("Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d"),
+  excProb = c("excProb"),
+  #quantQ = c("quantQ", "quantileQ_7d", "quantileQ_14d", "quantileQ_30d"),
+  Depth = c("Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d")
+)
+
+# Step 3: Generate combinations efficiently
+generate_filtered_combos <- function() {
+  all_combos <- map(2:4, ~combn(predictor_vars, .x, simplify = FALSE)) |>
+    purrr::flatten()
+  
+  filtered_combos <- purrr::keep(all_combos, function(combo) {
+    # Check if no more than 1 variable is selected from each group
+    group_counts <- sapply(grouped_predictors, function(group) sum(combo %in% group))
+    valid_groups <- all(group_counts <= 1)
+    valid_groups   # Allow only valid combinations
+  })
+
+  return(filtered_combos)
+}
+
+# Step 4: Generate the valid predictor combinations
+predictor_combos <- generate_filtered_combos()
+
+# Step 5: Create functions to run models
+run_model <- function(response, predictors, train_data, test_data) {
+  # Ensure WaterYear is a factor in both datasets
+  train_data$WaterYear <- as.factor(train_data$WaterYear)
+  test_data$WaterYear <- as.factor(test_data$WaterYear)
+  
+  # Define the formula
+  lmForm <- as.formula(paste(response, "~", "(", paste(predictors, collapse = " + "), ")^2"))
+  
+  # Fit the model using lm()
+  model <- lm(lmForm, data = train_data)
+  
+  # Make predictions
+  predictions <- predict(model, newdata = test_data)
+  
+  # Calculate RMSE and R-squared
+  rmse <- sqrt(mean((predictions - test_data[[response]])^2))
+  r_squared <- summary(model)$r.squared
+
+  list(model = model, rmse = rmse, r_squared = r_squared, predictors = predictors, response = response)
+}
+
+# Step 6: Prepare data
+metDat_model <- dailyDat |>
+  ungroup() |> 
+  select(all_of(c(response_vars, predictor_vars))) |> 
+  drop_na() |>
+  mutate(WaterYear = as.factor(WaterYear)) |> 
+  mutate(across(where(is.numeric), ~ scale(.)[, 1]))
+
+set.seed(123)  # For reproducibility
+data_split <- initial_split(metDat_model, prop = 0.7)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# Step 7: Run models for each response and predictor combination
+results <- lapply(response_vars, function(response) {
+  lapply(predictor_combos, function(predictors) {
+    run_model(response, predictors, train_data, test_data)
+  })
+})
+
+
+# Step 8: Extract results into dataframes
+extract_results <- function(results_list) {
+  do.call(rbind, lapply(results_list, function(res) {
+    do.call(rbind, lapply(res, function(model_result) {
+      data.frame(
+        response = model_result$response,
+        predictors = paste(model_result$predictors, collapse = ", "),
+        rmse = model_result$rmse,
+        r_squared = model_result$r_squared
+      )
+    }))
+  }))
+}
+
+results <- extract_results(results) 
+
+
+# Step 10: Rank models and analyze
+bestLM_PC <- results |>
+  group_by(response) |>
+  arrange(response, rmse, r_squared) |> 
+  slice_head(n = 5)
+```
+
+```{r}
+# Step 1: Identify the best model for each response variable
+best_models <- results_wInteraction |>
+  full_join(results_woInteraction) |> 
+  group_by(response) |>
+  arrange(rmse, r_squared) |>
+  slice_head(n = 1)
+
+# Step 2: Extract the predictors for the best models and plot observed vs. predicted
+best_model_plots <- lapply(seq_len(nrow(best_models)), function(i) {
+  best_model <- best_models[i, ]
+  response <- best_model$response
+  predictors <- unlist(strsplit(best_model$predictors, ", "))
+  
+  # Generate the formula for the best model
+  formula_str <- paste(response, "~", paste(predictors, collapse = " + "))
+  model_formula <- as.formula(formula_str)
+  
+  # Fit the best model
+  best_model_fit <- lm(model_formula, data = train_data)
+  
+  # Get predictions for visualization
+  train_data$predicted <- predict(best_model_fit, newdata = train_data)
+  
+  # Annotate the model formula on the plot
+  formula_text <- paste("Model:", formula_str)
+  
+  # Plot observed vs. predicted for the best model
+  plot <- ggplot(train_data, aes_string(x = response, y = "predicted")) +
+    geom_point(alpha = 0.6) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+    annotate("text", x = max(train_data[[response]], na.rm = TRUE), 
+             y = max(train_data$predicted, na.rm = TRUE), 
+             label = formula_text, hjust = 1, vjust = 1, size = 3.5, color = "blue") +
+    labs(
+      title = paste("Observed vs Predicted:", response),
+      x = "Observed",
+      y = "Predicted"
+    ) +
+    theme_minimal()
+  
+  return(plot)
+})
+
+# Step 3: Display the plots
+for (plot in best_model_plots) {
+  print(plot)
+}
+
+
+# Step 4: Plot individual predictors for each response
+individual_predictor_plots <- lapply(seq_len(nrow(best_models)), function(i) {
+  best_model <- best_models[i, ]
+  response <- best_model$response
+  predictors <- unlist(strsplit(best_model$predictors, ", "))
+  
+  # Generate individual plots for each predictor
+  predictor_plots <- lapply(predictors, function(predictor) {
+    ggplot(train_data, aes_string(x = predictor, y = response)) +
+      geom_point(alpha = 0.6) +
+      geom_smooth(method = "lm", se = FALSE, color = "blue") +
+      stat_regline_equation(aes(label = ..rr.label..))+
+      labs(
+        title = paste("Response vs Predictor:", response, "vs", predictor),
+        x = predictor,
+        y = response
+      ) +
+      theme_minimal()
+  })
+  
+  return(predictor_plots)
+})
+
+# Step 5: Display individual predictor plots
+for (predictor_set in individual_predictor_plots) {
+  for (plot in predictor_set) {
+    print(plot)
+  }
+}
+```
+
+## Linear-Log w/ PC Scores
+
+```{r}
+# Step 1: Define response and predictor variables
+response_vars <- c("PC1", "PC2")
+predictor_vars <- c(
+  "PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d",
+  "PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d", 
+  "Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d", "excProb",
+  "Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d", "WaterYear"
+)
+# Update predictor variables to use log-transformed versions
+log_predictor_vars <- paste0("log_", predictor_vars[predictor_vars != "WaterYear"])
+
+# Update grouped predictors to use log-transformed variable names
+grouped_predictors <- list(
+  perc_wet = paste0("log_", c("PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d")),
+  PPT = paste0("log_", c("PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d")),
+  Q = paste0("log_", c("Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d")),
+  excProb = c("excProb"),
+  Depth = paste0("log_", c("Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d"))
+)
+
+# Step 3 (modified): Generate combinations efficiently with log-transformed predictors
+generate_filtered_combos <- function() {
+  all_combos <- map(2:4, ~combn(log_predictor_vars, .x, simplify = FALSE)) |>
+    purrr::flatten()
+  
+  filtered_combos <- purrr::keep(all_combos, function(combo) {
+    # Check if no more than 1 variable is selected from each group
+    group_counts <- sapply(grouped_predictors, function(group) sum(combo %in% group))
+    valid_groups <- all(group_counts <= 1)
+    
+    # Check for invalid combinations: 
+    # If both "Q" and "Depth" are present, or both "Depth" and "Q" are present, the combo is invalid
+    no_invalid_combinations <- !(
+        any(combo %in% c("WaterYear"))
+    )
+    
+    valid_groups && no_invalid_combinations  # Allow only valid combinations
+  })
+  
+  return(filtered_combos)
+}
+
+# Step 4: Generate the valid predictor combinations
+predictor_combos <- generate_filtered_combos()
+
+# Step 5: Create functions to run models with and without interaction terms
+run_model <- function(response, predictors, train_data, test_data, interaction = FALSE) {
+  # Ensure WaterYear is a factor in both datasets
+  train_data$WaterYear <- as.factor(train_data$WaterYear)
+  test_data$WaterYear <- as.factor(test_data$WaterYear)
+  
+  # Define the formula
+  interaction_term <- if (interaction) " * WaterYear" else ""
+  lmForm <- as.formula(paste(response, "~", paste(predictors, collapse = " + "), interaction_term))
+  
+  # Fit the model using lm()
+  model <- lm(lmForm, data = train_data)
+  
+  # Make predictions
+  predictions <- predict(model, newdata = test_data)
+  
+  # Calculate RMSE and R-squared
+  rmse <- sqrt(mean((predictions - test_data[[response]])^2))
+  r_squared <- summary(model)$r.squared
+
+  list(model = model, rmse = rmse, r_squared = r_squared, predictors = predictors, response = response, interaction_term = interaction_term)
+}
+
+# Step 6: Prepare data with log-transformed predictors
+metDat_model <- dailyDat |>
+  ungroup() |> 
+  select(all_of(c(response_vars, predictor_vars))) |> 
+  drop_na() |>
+  # Apply log transformation to numeric predictor variables (excluding WaterYear)
+  mutate(across(all_of(predictor_vars[predictor_vars != "WaterYear"]), ~ log(. + 0.01), .names = "log_{col}")) |>
+  mutate(WaterYear = as.factor(WaterYear))
+
+set.seed(123)  # For reproducibility
+data_split <- initial_split(metDat_model, prop = 0.7)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# Step 8: Run models for each response and predictor combination
+results_with_interaction <- lapply(response_vars, function(response) {
+  lapply(predictor_combos, function(predictors) {
+    run_model(response, predictors, train_data, test_data, interaction = TRUE)
+  })
+})
+
+results_without_interaction <- lapply(response_vars, function(response) {
+  lapply(predictor_combos, function(predictors) {
+    run_model(response, predictors, train_data, test_data, interaction = FALSE)
+  })
+})
+
+# Step 9: Extract results into dataframes
+extract_results <- function(results_list) {
+  do.call(rbind, lapply(results_list, function(res) {
+    do.call(rbind, lapply(res, function(model_result) {
+      data.frame(
+        response = model_result$response,
+        predictors = paste(model_result$predictors, collapse = ", "),
+        rmse = model_result$rmse,
+        r_squared = model_result$r_squared,
+        interaction_term = model_result$interaction_term
+      )
+    }))
+  }))
+}
+
+results_wInteraction <- extract_results(results_with_interaction)
+results_woInteraction <- extract_results(results_without_interaction)
+
+# Step 10: Rank models and analyze
+bestLinLogPC <- results_wInteraction |>
+  full_join(results_woInteraction) |> 
+  group_by(response) |>
+  arrange(response, rmse, r_squared) |> 
+  slice_head(n = 5)
+```
+
+```{r}
+# Step 1: Identify the best model for each response variable
+best_models <- results_wInteraction |>
+  full_join(results_woInteraction) |> 
+  group_by(response) |>
+  arrange(rmse, r_squared) |>
+  slice_head(n = 1)
+
+# Step 2: Extract the predictors for the best models and plot observed vs. predicted
+best_model_plots <- lapply(seq_len(nrow(best_models)), function(i) {
+  best_model <- best_models[i, ]
+  response <- best_model$response
+  predictors <- unlist(strsplit(best_model$predictors, ", "))
+  
+  # Generate the formula for the best model
+  formula_str <- paste(response, "~", paste(predictors, collapse = " + "))
+  model_formula <- as.formula(formula_str)
+  
+  # Fit the best model
+  best_model_fit <- lm(model_formula, data = train_data)
+  
+  # Get predictions for visualization
+  train_data$predicted <- predict(best_model_fit, newdata = train_data)
+  
+  # Annotate the model formula on the plot
+  formula_text <- paste("Model:", formula_str)
+  
+  # Plot observed vs. predicted for the best model
+  plot <- ggplot(train_data, aes_string(x = response, y = "predicted")) +
+    geom_point(alpha = 0.6) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+    annotate("text", x = max(train_data[[response]], na.rm = TRUE), 
+             y = max(train_data$predicted, na.rm = TRUE), 
+             label = formula_text, hjust = 1, vjust = 1, size = 3.5, color = "blue") +
+    labs(
+      title = paste("Observed vs Predicted:", response),
+      x = "Observed",
+      y = "Predicted"
+    ) +
+    theme_minimal()
+  
+  return(plot)
+})
+
+# Step 3: Display the plots
+for (plot in best_model_plots) {
+  print(plot)
+}
+
+
+# Step 4: Plot individual predictors for each response
+individual_predictor_plots <- lapply(seq_len(nrow(best_models)), function(i) {
+  best_model <- best_models[i, ]
+  response <- best_model$response
+  predictors <- unlist(strsplit(best_model$predictors, ", "))
+  
+  # Generate individual plots for each predictor
+  predictor_plots <- lapply(predictors, function(predictor) {
+    ggplot(train_data, aes_string(x = predictor, y = response)) +
+      geom_point(alpha = 0.6) +
+      geom_smooth(method = "lm", se = FALSE, color = "blue") +
+      stat_regline_equation(aes(label = ..rr.label..))+
+      labs(
+        title = paste("Response vs Predictor:", response, "vs", predictor),
+        x = predictor,
+        y = response
+      ) +
+      theme_minimal()
+  })
+  
+  return(predictor_plots)
+})
+
+# Step 5: Display individual predictor plots
+for (predictor_set in individual_predictor_plots) {
+  for (plot in predictor_set) {
+    print(plot)
+  }
+}
+```
+
+## Cluster LM
+
+```{r}
+# Step 1: Define response and predictor variables
+response_vars <- c("cluster")
+predictor_vars <- c(
+  "PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d",
+  "PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d", 
+  "Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d", "excProb",
+  "Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d", "WaterYear"
+)
+
+# Step 2: Correct and define the grouping structure
+grouped_predictors <- list(
+  perc_wet = c("PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d"),
+  PPT = c("PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d"),
+  Q = c("Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d"),
+  excProb = c("excProb"),
+  #quantQ = c("quantQ", "quantileQ_7d", "quantileQ_14d", "quantileQ_30d"),
+  Depth = c("Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d")
+)
+
+# Step 3: Generate combinations efficiently
+generate_filtered_combos <- function() {
+  all_combos <- map(1:5, ~combn(predictor_vars, .x, simplify = FALSE)) |>
+    purrr::flatten()
+  
+  filtered_combos <- purrr::keep(all_combos, function(combo) {
+    # Check if no more than 1 variable is selected from each group
+    group_counts <- sapply(grouped_predictors, function(group) sum(combo %in% group))
+    valid_groups <- all(group_counts <= 1)
+    
+    # Check for invalid combinations: 
+    # If both "Q" and "quantDepth" are present, or both "Depth" and "quantQ" are present, the combo is invalid
+    no_invalid_combinations <- !(
+    
+        any(combo %in% c("WaterYear"))
+    )
+    
+    valid_groups && no_invalid_combinations  # Allow only valid combinations
+  })
+  
+  return(filtered_combos)
+}
+
+# Step 4: Generate the valid predictor combinations
+predictor_combos <- generate_filtered_combos()
+
+# Step 5: Create functions to run models with and without interaction terms
+run_model <- function(response, predictors, train_data, test_data, interaction = FALSE) {
+  # Ensure WaterYear is a factor in both datasets
+  train_data$WaterYear <- as.factor(train_data$WaterYear)
+  test_data$WaterYear <- as.factor(test_data$WaterYear)
+  
+  # Define the formula
+  interaction_term <- if (interaction) " * WaterYear" else ""
+  lmForm <- as.formula(paste(response, "~", paste(predictors, collapse = " + "), interaction_term))
+  
+  # Fit the model using lm()
+  model <- lm(lmForm, data = train_data)
+  
+  # Make predictions
+  predictions <- predict(model, newdata = test_data)
+  
+  # Calculate RMSE and R-squared
+  rmse <- sqrt(mean((predictions - test_data[[response]])^2))
+  r_squared <- summary(model)$r.squared
+
+  list(model = model, rmse = rmse, r_squared = r_squared, predictors = predictors, response = response, interaction_term = interaction_term)
+}
+
+# Step 6: Prepare data
+metDat_model <- clustered_data |>
+  ungroup() |> 
+  select(all_of(c(response_vars, predictor_vars))) |> 
+  drop_na() |>
+  mutate(WaterYear = as.factor(WaterYear)) |> 
+  mutate(across(where(is.numeric), ~ scale(.)[, 1]))
+
+set.seed(123)  # For reproducibility
+data_split <- initial_split(metDat_model, prop = 0.7)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# Step 7: Run models for each response and predictor combination
+results_with_interaction <- lapply(response_vars, function(response) {
+  lapply(predictor_combos, function(predictors) {
+    run_model(response, predictors, train_data, test_data, interaction = TRUE)
+  })
+})
+
+results_without_interaction <- lapply(response_vars, function(response) {
+  lapply(predictor_combos, function(predictors) {
+    run_model(response, predictors, train_data, test_data, interaction = FALSE)
+  })
+})
+
+# Step 8: Extract results into dataframes
+extract_results <- function(results_list) {
+  do.call(rbind, lapply(results_list, function(res) {
+    do.call(rbind, lapply(res, function(model_result) {
+      data.frame(
+        response = model_result$response,
+        predictors = paste(model_result$predictors, collapse = ", "),
+        rmse = model_result$rmse,
+        r_squared = model_result$r_squared,
+        interaction_term = model_result$interaction_term
+      )
+    }))
+  }))
+}
+
+results_wInteraction <- extract_results(results_with_interaction) 
+results_woInteraction <- extract_results(results_without_interaction)
+
+
+# Step 10: Rank models and analyze
+bestLM <- results_wInteraction |>
+  full_join(results_woInteraction) |> 
+  group_by(response) |>
+  arrange(response, rmse, r_squared) |> 
+  slice_head(n = 1)
+```
+
+```{r}
+metDat_model <- clustered_data |>
+  ungroup() |> 
+  select(all_of(c(response_vars, predictor_vars))) |> 
+  drop_na() |>
+  mutate(WaterYear = as.factor(WaterYear)) |> 
+  mutate(across(where(is.numeric), ~ scale(.)[, 1]))
+
+set.seed(123)  # For reproducibility
+data_split <- initial_split(metDat_model, prop = 0.7)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+  # Fit the best model
+best_model_fit <- lm(cluster~(PercWet_1d+PPT_60d+excProb+Depth_60d+WaterYear)^2, data = train_data)
+  
+  # Get predictions for visualization
+  test_data$predicted <- predict(best_model_fit, newdata = test_data)
+  
+  # Plot observed vs. predicted for the best model
+ggplot(test_data, aes(x = cluster, y = "predicted")) +
+    geom_point(alpha = 0.6) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+    labs(
+      x = "Observed",
+      y = "Predicted"
+    ) +
+    theme_minimal()
+  
+  return(plot)
+```
+
+# MRLM
+
+```{r}
+library(glmnet)
+
+response_vars <- c("minDO.pctsat", "maxDO.pctsat", "avgDO.pctsat", "DOpctsat.amp", "probHypSat")
+predictor_vars <- c(
+  "PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d",
+  "PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d", 
+  "Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d", "excProb",
+  "Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d", "WaterYear"
+)
+
+grouped_predictors <- list(
+  perc_wet = c("PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d"),
+  PPT = c("PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d"),
+  Q = c("Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d"),
+  excProb = c("excProb"),
+  #quantQ = c("quantQ", "quantileQ_7d", "quantileQ_14d", "quantileQ_30d"),
+  Depth = c("Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d")
+)
+
+# Filter the dataset to include only the selected predictors and response variables
+  modelDat <- dailyDat |>
+    select(all_of(c(predictor_vars, response_vars))) |>
+    drop_na()  # Remove rows with missing values
+  
+set.seed(123)  # For reproducibility
+data_split <- initial_split(modelDat, prop = 0.7)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+
+# Generate all combinations of predictors
+predictor_combinations <- expand.grid(
+  perc_wet = grouped_predictors$perc_wet,
+  PPT = grouped_predictors$PPT,
+  Q = grouped_predictors$Q,
+  excProb = grouped_predictors$excProb,
+  stringsAsFactors = FALSE
+)
+
+# Prepare results storage
+# Initialize a data frame to store model performance
+# Initialize a data frame to store model performance
+# Initialize a data frame to store model performance
+model_performance <- data.frame(
+  Model_ID = character(),
+  Predictors = character(),
+  Mean_CV_Error = numeric(),
+  R2 = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Loop through each combination of predictors
+for (i in 1:nrow(predictor_combinations)) {
+  # Get current predictors
+  current_predictors <- predictor_combinations[i, ]
+  predictors <- c(
+    current_predictors$perc_wet,
+    current_predictors$PPT,
+    current_predictors$Q,
+    "WaterYear"
+  )
+  
+  # Filter the dataset to include only the selected predictors and response variables
+  data_subset <- dailyDatRoll |>
+    select(all_of(c(predictors, response_vars))) |>
+    drop_na()  # Remove rows with missing values
+  
+  # Prepare the design matrix (X) and response matrix (Y)
+  X <- model.matrix(~ . * WaterYear, data = data_subset[, predictors])[, -1]
+  Y <- as.matrix(data_subset[, response_vars])
+  
+  # Fit glmnet model with cross-validation
+  cv_model <- cv.glmnet(X, Y, family = "mgaussian", alpha = 1, nfolds = 10)  # 10-fold CV
+  
+  # Extract mean cross-validation error
+  mean_cv_error <- mean(cv_model$cvm)
+  
+  # Compute R² for the model
+  predictions_list <- predict(cv_model, newx = X, s = "lambda.min")  # Predictions for each response
+  residuals <- 0
+  ss_total <- 0
+  
+  # Calculate residuals and total sum of squares for each response variable
+  for (j in 1:length(response_vars)) {
+    pred <- predictions_list[[j]]  # Predictions for response j
+    actual <- Y[, j]               # Actual values for response j
+    residuals <- residuals + sum((actual - pred)^2)
+    ss_total <- ss_total + sum((actual - mean(actual))^2)
+  }
+  
+  # R² calculation
+  r2 <- 1 - (residuals / ss_total)
+  
+  # Save model performance
+  model_performance <- rbind(
+    model_performance,
+    data.frame(
+      Model_ID = paste0("Model_", i),
+      Predictors = paste(current_predictors, collapse = ", "),
+      Mean_CV_Error = mean_cv_error,
+      R2 = r2
+    )
+  )
+  
+  # Store the model, predictors, and R² in results
+  results[[paste0("Model_", i)]] <- list(
+    predictors = current_predictors,
+    model = cv_model,
+    mean_cv_error = mean_cv_error,
+    r2 = r2
+  )
+}
+
+# Sort results by Mean_CV_Error and R² to find the best models
+best_models <- model_performance |>
+  arrange(Mean_CV_Error, desc(R2)) |>
+  head(5)  # Adjust to show the top N models
+
+# View the best models
+print(best_models)
+
+```
+
+```{r}
+# Step 1: Define response and predictor variables
+response_vars <- c("minDO.pctsat", "maxDO.pctsat", "avgDO.pctsat", "DOSat.hyp", "DOpctsat.amp")
+predictor_vars <- c(
+  "percent_wet", "perc_wet7d", "perc_wet14d", "perc_wet30d", "perc_wet60d", "perc_wet_change",
+  "AvgPPT_7d", "AvgPPT_14d", "AvgPPT_30d", "totPPT_7d", 
+  "totPPT_14d", "totPPT_30d", "meanQ", "meanQ_7d", "meanQ_14d", "meanQ_30d",
+  "meanQ_ecdf", "WaterYear"
+)
+
+# Step 2: Prepare data
+metDat_model <- dailyDatRoll |>
+  ungroup() |> 
+  select(all_of(c(response_vars, predictor_vars))) |> 
+  drop_na() |>
+  mutate(WaterYear = as.factor(WaterYear)) |>
+  mutate(across(where(is.numeric), ~ scale(.)[, 1]))
+
+set.seed(123)  # For reproducibility
+data_split <- initial_split(metDat_model, prop = 0.7)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# Prepare matrices for glmnet
+x_train <- as.matrix(train_data[, predictor_vars])
+x_test <- as.matrix(test_data[, predictor_vars])
+y_train <- as.matrix(train_data[, response_vars])
+y_test <- as.matrix(test_data[, response_vars])
+
+# Step 3: Fit a multi-response linear model with glmnet
+fit_glmnet <- function(x_train, y_train, alpha = 1) {
+  # alpha = 1 (Lasso), alpha = 0 (Ridge), 0 < alpha < 1 (Elastic Net)
+  glmnet::glmnet(
+    x = x_train,
+    y = y_train,
+    family = "mgaussian", # Multivariate Gaussian family for multi-response
+    alpha = alpha
+  )
+}
+
+# Fit the model
+glmnet_model <- fit_glmnet(x_train, y_train, alpha = 0.5)  # Elastic Net
+
+# Step 4: Cross-validation to tune lambda
+cv_glmnet <- function(x_train, y_train, alpha = 1) {
+  glmnet::cv.glmnet(
+    x = x_train,
+    y = y_train,
+    family = "mgaussian",
+    alpha = alpha,
+    nfolds = 5
+  )
+}
+
+cv_model <- cv_glmnet(x_train, y_train, alpha = 0.5)
+
+# Optimal lambda
+lambda_opt <- cv_model$lambda.min
+
+# Step 5: Make predictions on test data
+predictions <- predict(glmnet_model, s = lambda_opt, newx = x_test)
+
+# Convert predictions to a dataframe
+predictions_df <- as.data.frame(predictions)
+
+# Step 6: Evaluate the model
+evaluate_model <- function(y_test, predictions) {
+  # `predictions` is a 3D array: rows (observations) x cols (responses) x s (lambda values)
+  # Select predictions for the chosen lambda (typically the first slice if not specified)
+  predictions_matrix <- predictions[, , 1] # Use the first lambda slice
+  
+  metrics <- lapply(seq_len(ncol(y_test)), function(i) {
+    actual <- y_test[, i]
+    predicted <- predictions_matrix[, i]
+    rmse <- sqrt(mean((actual - predicted)^2))
+    ss_total <- sum((actual - mean(actual))^2)
+    ss_res <- sum((actual - predicted)^2)
+    r_squared <- 1 - (ss_res / ss_total)
+    data.frame(response = colnames(y_test)[i], rmse = rmse, r_squared = r_squared)
+  })
+  do.call(rbind, metrics)
+}
+
+# Updated to work with glmnet predictions
+model_metrics <- evaluate_model(y_test, predictions)
+
+# Step 7: Analyze and visualize results
+print(model_metrics)
+
+# Visualize RMSE and R-squared
+library(ggplot2)
+ggplot(model_metrics, aes(x = response, y = rmse)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "RMSE for Each Response", x = "Response Variable", y = "RMSE") +
+  theme_minimal()
+
+ggplot(model_metrics, aes(x = response, y = r_squared)) +
+  geom_bar(stat = "identity", fill = "forestgreen") +
+  labs(title = "R-squared for Each Response", x = "Response Variable", y = "R-squared") +
+  theme_minimal()
+```
+
+```{r}
+library(dplyr)
+library(glmnet)
+library(rsample)
+library(ggplot2)
+
+# Step 1: Define response and predictor variables
+response_vars <- c("minDO.pctsat", "maxDO.pctsat", "avgDO.pctsat", "DOSat.hyp", "DOpctsat.amp")
+predictor_vars <- c(
+  "percent_wet", "perc_wet7d", "perc_wet14d", "perc_wet30d", "perc_wet60d", "perc_wet_change",
+  "AvgPPT_7d", "AvgPPT_14d", "AvgPPT_30d", "totPPT_7d", "totPPT_14d", "totPPT_30d",
+  "meanQ", "meanQ_7d", "meanQ_14d", "meanQ_30d",
+  "meanQ_ecdf", "WaterYear"
+)
+
+# Step 2: Prepare data
+metDat_model <- dailyDatRoll |>
+  ungroup() |> 
+  select(all_of(c(response_vars, predictor_vars))) |> 
+  drop_na() |>
+  mutate(WaterYear = as.factor(WaterYear)) |>
+  mutate(across(where(is.numeric), ~ scale(.)[, 1]))
+
+set.seed(123)  # For reproducibility
+data_split <- initial_split(metDat_model, prop = 0.7)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# Helper function to fit and evaluate model
+fit_and_evaluate <- function(predictor_subset) {
+  # Prepare matrices for glmnet
+  x_train <- as.matrix(train_data[, predictor_subset])
+  x_test <- as.matrix(test_data[, predictor_subset])
+  y_train <- as.matrix(train_data[, response_vars])
+  y_test <- as.matrix(test_data[, response_vars])
+  
+  # Fit the model
+  cv_model <- glmnet::cv.glmnet(
+    x = x_train,
+    y = y_train,
+    family = "mgaussian",
+    alpha = 0.5,  # Elastic Net
+    nfolds = 5
+  )
+  
+  # Optimal lambda
+  lambda_opt <- cv_model$lambda.min
+  
+  # Make predictions
+  predictions <- predict(cv_model, s = lambda_opt, newx = x_test)
+  
+  # Evaluate the model
+  predictions_matrix <- predictions[, , 1]  # Use the first lambda slice
+  metrics <- lapply(seq_len(ncol(y_test)), function(i) {
+    actual <- y_test[, i]
+    predicted <- predictions_matrix[, i]
+    rmse <- sqrt(mean((actual - predicted)^2))
+    ss_total <- sum((actual - mean(actual))^2)
+    ss_res <- sum((actual - predicted)^2)
+    r_squared <- 1 - (ss_res / ss_total)
+    data.frame(response = colnames(y_test)[i], rmse = rmse, r_squared = r_squared)
+  })
+  metrics_df <- do.call(rbind, metrics)
+  metrics_df$predictors <- paste(predictor_subset, collapse = ", ")
+  return(metrics_df)
+}
+
+# Step 3: Iterate over all combinations of predictor variables (with 2 or more predictors)
+predictor_combinations <- unlist(lapply(2:length(predictor_vars), function(k) {
+  combn(predictor_vars, k, simplify = FALSE)
+}), recursive = FALSE)
+
+# Fit and evaluate for each combination
+results <- lapply(predictor_combinations, fit_and_evaluate)
+
+# Combine results
+all_metrics <- do.call(rbind, results)
+
+# Step 4: Analyze and visualize results
+library(ace_tools)
+ace_tools.display_dataframe_to_user("All Model Metrics", all_metrics)
+
+# Visualize top results by RMSE
+top_models <- all_metrics |> arrange(rmse) |> head(10)
+
+ggplot(top_models, aes(x = reorder(predictors, -rmse), y = rmse)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Top 10 Models by RMSE", x = "Predictor Combination", y = "RMSE") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.background = element_blank())
+
+# Visualize top results by R-squared
+ggplot(top_models, aes(x = reorder(predictors, -r_squared), y = r_squared)) +
+  geom_bar(stat = "identity", fill = "forestgreen") +
+  labs(title = "Top 10 Models by R-squared", x = "Predictor Combination", y = "R-squared") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.background = element_blank())
+
+```
+
+```{r}
+library(dplyr)
+library(glmnet)
+library(rsample)
+library(ggplot2)
+library(tidyr)
+library(purrr)
+
+response_vars <- c("minDO.pctsat", "maxDO.pctsat", "avgDO.pctsat", "DOSat.hyp", "DOpctsat.amp")
+
+# Group predictors by type
+percent_wet_vars <- c("percent_wet", "perc_wet7d", "perc_wet14d", "perc_wet30d", "perc_wet60d", "perc_wet_change")
+ppt_vars <- c("AvgPPT_7d", "AvgPPT_14d", "AvgPPT_30d", "totPPT_7d", "totPPT_14d", "totPPT_30d")
+q_vars <- c("meanQ", "meanQ_7d", "meanQ_14d", "meanQ_30d", "meanQ_ecdf")
+fixed_vars <- c("WaterYear")  # Fixed variables included in all combinations
+
+# For each group, create a list of options: NULL (no selection), or each variable
+percent_wet_options <- c(list(NULL), as.list(percent_wet_vars))
+ppt_options <- c(list(NULL), as.list(ppt_vars))
+q_options <- c(list(NULL), as.list(q_vars))
+
+# Generate all combinations of zero or one variable from each group
+combos_df <- expand.grid(
+  PercentWet = percent_wet_options,
+  PPT = ppt_options,
+  Q = q_options,
+  stringsAsFactors = FALSE
+)
+
+# Collect selected predictors for each combination
+combos_df <- combos_df |>
+  rowwise() |>
+  mutate(
+    # Combine selected predictors, excluding NULLs
+    Predictors = list(purrr::compact(c(PercentWet, PPT, Q))),
+    # Count the number of predictors selected (excluding fixed variables)
+    NumPredictors = length(Predictors)
+  ) |>
+  ungroup()
+
+# Filter combinations to have 2 to 4 predictors (excluding fixed variables)
+combos_df <- combos_df |>
+  filter(NumPredictors >= 1, NumPredictors <= 4)
+
+# Add fixed variables to each combination
+combos_df <- combos_df |>
+  mutate(
+    Predictors = map(Predictors, ~ c(.x, fixed_vars))
+  )
+
+# Remove duplicate combinations
+# Sort predictors to ensure duplicates can be identified
+combos_df <- combos_df |>
+  mutate(
+    PredictorsSorted = map(Predictors, sort),
+    PredictorsStr = map_chr(PredictorsSorted, paste, collapse = ",")
+  ) |>
+  distinct(PredictorsStr, .keep_all = TRUE)
+
+# Extract the list of unique predictor combinations
+predictor_combinations <- combos_df$Predictors
+
+# Optionally, remove temporary columns if not needed
+combos_df <- combos_df |> select(-PredictorsSorted, -PredictorsStr)
+
+# Step 2: Prepare data
+metDat_model <- dailyDatRoll |>
+  ungroup() |> 
+  select(all_of(c(response_vars, percent_wet_vars, ppt_vars, q_vars, fixed_vars))) |> 
+  drop_na() |>
+  mutate(WaterYear = factor(WaterYear, levels = unique(WaterYear))) |>
+  mutate(across(where(is.numeric), ~ scale(.)[, 1]))
+
+set.seed(123)  # For reproducibility
+data_split <- initial_split(metDat_model, prop = 0.7)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# Helper function to fit and evaluate model
+fit_and_evaluate <- function(predictor_subset) {
+  # Prepare matrices for glmnet using model.matrix
+  x_train <- model.matrix(~ . -1, data = train_data[, predictor_subset])
+  x_test <- model.matrix(~ . -1, data = test_data[, predictor_subset])
+  y_train <- as.matrix(train_data[, response_vars])
+  y_test <- as.matrix(test_data[, response_vars])
+  
+  # Fit the model
+  cv_model <- glmnet::cv.glmnet(
+    x = x_train,
+    y = y_train,
+    family = "mgaussian",
+    alpha = 0.5,  # Elastic Net
+    nfolds = 5
+  )
+  
+  # Optimal lambda
+  lambda_opt <- cv_model$lambda.min
+  
+  # Make predictions
+  predictions <- predict(cv_model, s = lambda_opt, newx = x_test)
+  
+  # Evaluate the model
+  predictions_matrix <- predictions[, , 1]  # Use the first lambda slice
+  
+  metrics <- lapply(seq_len(ncol(y_test)), function(i) {
+    actual <- y_test[, i]
+    predicted <- predictions_matrix[, i]
+    # Check lengths before calculations
+    if(length(actual) != length(predicted)) {
+      stop("Mismatch in lengths of actual and predicted values.")
+    }
+    rmse <- sqrt(mean((actual - predicted)^2))
+    ss_total <- sum((actual - mean(actual))^2)
+    ss_res <- sum((actual - predicted)^2)
+    r_squared <- 1 - (ss_res / ss_total)
+    data.frame(response = colnames(y_test)[i], rmse = rmse, r_squared = r_squared)
+  })
+  metrics_df <- do.call(rbind, metrics)
+  metrics_df$predictors <- paste(predictor_subset, collapse = ", ")
+  return(metrics_df)
+}
+
+# Step 4: Fit and evaluate models
+results <- lapply(predictor_combinations, fit_and_evaluate)
+
+# Combine results
+all_metrics <- do.call(rbind, results)
+
+
+# Visualize top results by RMSE
+top_models <- all_metrics |> arrange(rmse) |> head(10)
+
+ggplot(top_models, aes(x = reorder(predictors, -rmse), y = rmse)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Top 10 Models by RMSE", x = "Predictor Combination", y = "RMSE") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.background = element_blank())
+
+# Visualize top results by R-squared
+ggplot(top_models, aes(x = reorder(predictors, -r_squared), y = r_squared)) +
+  geom_bar(stat = "identity", fill = "forestgreen") +
+  labs(title = "Top 10 Models by R-squared", x = "Predictor Combination", y = "R-squared") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.background = element_blank())
+
+```
+
+## Run This
+
+```{r}
+response_vars <- c("minDO.pctsat", "maxDO.pctsat", "avgDO.pctsat", "DOSat.hyp")
+
+# Group predictors by type
+percent_wet_vars <- c("percent_wet", "perc_wet7d", "perc_wet14d", "perc_wet30d", "perc_wet60d", "perc_wet_change")
+ppt_vars <- c("AvgPPT_7d", "AvgPPT_14d", "AvgPPT_30d", "totPPT_7d", "totPPT_14d", "totPPT_30d")
+q_vars <- c("meanQ", "meanQ_7d", "meanQ_14d", "meanQ_30d", "meanQ_ecdf")
+wateryear_vars <- c("WaterYear")  # WaterYear now treated as a regular predictor
+
+# For each group, create a list of options: NULL (no selection), or each variable
+percent_wet_options <- c(list(NULL), as.list(percent_wet_vars))
+ppt_options <- c(list(NULL), as.list(ppt_vars))
+q_options <- c(list(NULL), as.list(q_vars))
+wateryear_options <- c(list(NULL), as.list(wateryear_vars))
+
+# Generate all combinations of zero or one variable from each group
+combos_df <- expand.grid(
+  PercentWet = percent_wet_options,
+  PPT = ppt_options,
+  Q = q_options,
+  WaterYear = wateryear_options,
+  stringsAsFactors = FALSE
+)
+
+# Collect selected predictors for each combination
+combos_df <- combos_df |>
+  rowwise() |>
+  mutate(
+    # Combine selected predictors, excluding NULLs
+    Predictors = list(purrr::compact(c(PercentWet, PPT, Q, WaterYear))),
+    # Count the number of predictors selected
+    NumPredictors = length(Predictors)
+  ) |>
+  ungroup()
+
+# Filter combinations to have 1 to 4 predictors
+combos_df <- combos_df |>
+  filter(NumPredictors >= 2, NumPredictors <= 4)
+
+# Remove duplicate combinations
+# Sort predictors to ensure duplicates can be identified
+combos_df <- combos_df |>
+  mutate(
+    PredictorsSorted = map(Predictors, sort),
+    PredictorsStr = map_chr(PredictorsSorted, paste, collapse = ",")
+  ) |>
+  distinct(PredictorsStr, .keep_all = TRUE)
+
+# Extract the list of unique predictor combinations
+predictor_combinations <- combos_df$Predictors
+
+# Optionally, remove temporary columns if not needed
+combos_df <- combos_df |> select(-PredictorsSorted, -PredictorsStr)
+
+# Step 2: Prepare data
+all_predictor_vars <- c(percent_wet_vars, ppt_vars, q_vars, wateryear_vars)
+
+metDat_model <- dailyDatRoll |>
+  ungroup() |> 
+  select(all_of(c(response_vars, all_predictor_vars))) |> 
+  drop_na() |>
+  mutate(WaterYear = factor(WaterYear, levels = unique(WaterYear)))# |>
+ # mutate(across(where(is.numeric), ~ scale(.)[, 1]))
+
+set.seed(123)  # For reproducibility
+data_split <- initial_split(metDat_model, prop = 0.7)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# Helper function to fit and evaluate model
+fit_and_evaluate <- function(predictor_subset) {
+  # Prepare matrices for glmnet using model.matrix
+  x_train <- model.matrix(~ . -1, data = train_data[, predictor_subset])
+  x_test <- model.matrix(~ . -1, data = test_data[, predictor_subset])
+  y_train <- as.matrix(train_data[, response_vars])
+  y_test <- as.matrix(test_data[, response_vars])
+  alphas <- seq(0, 1, by = 0.1)
+  
+  # Initialize objects to store results
+cv_errors <- numeric(length(alphas))
+cv_models <- list()
+
+# Step 3: Cross-validation for each alpha
+for (i in seq_along(alphas)) {
+  set.seed(123)  # For reproducibility
+  cv_model <- cv.glmnet(
+    x = x_train,
+    y = y_train,
+    family = "mgaussian",  # Use "mgaussian" if y_train is multivariate
+    nfolds = 10,
+    alpha = alphas[i]
+  )
+  cv_models[[i]] <- cv_model
+  cv_errors[i] <- min(cv_model$cvm)
+}
+
+
+
+# Identify the alpha with the lowest cross-validated error
+best_alpha_index <- which.min(cv_errors)
+alpha_opt <- alphas[best_alpha_index]
+best_cv_model <- cv_models[[best_alpha_index]]
+
+# Optimal lambda
+lambda_opt <- best_cv_model$lambda.min
+  
+  # Refit the model with the best lambda
+  final_model <- glmnet::glmnet(
+    x = x_train,
+    y = y_train,
+    family = "mgaussian",
+    alpha = alpha_opt,  # Elastic Net
+    nfolds = 10,
+    lambda = lambda_opt
+  )
+  # Make predictions
+  predictions <- predict(final_model, s = lambda_opt, newx = x_test)
+  
+  # Evaluate the model
+  predictions_matrix <- predictions[, , 1]  # Use the first lambda slice
+  
+  metrics <- lapply(seq_len(ncol(y_test)), function(i) {
+    actual <- y_test[, i]
+    predicted <- predictions_matrix[, i]
+    # Check lengths before calculations
+    if(length(actual) != length(predicted)) {
+      stop("Mismatch in lengths of actual and predicted values.")
+    }
+    rmse <- sqrt(mean((actual - predicted)^2))
+    ss_total <- sum((actual - mean(actual))^2)
+    ss_res <- sum((actual - predicted)^2)
+    r_squared <- 1 - (ss_res / ss_total)
+    data.frame(response = colnames(y_test)[i], rmse = rmse, r_squared = r_squared)
+  })
+  metrics_df <- do.call(rbind, metrics)
+  metrics_df$predictors <- paste(predictor_subset, collapse = ", ")
+  return(metrics_df)
+}
+
+# Step 4: Fit and evaluate models
+results <- lapply(predictor_combinations, fit_and_evaluate)
+
+# Combine results
+all_metrics <- do.call(rbind, results)
+
+# Visualize top results by RMSE
+top_models <- all_metrics |> arrange(rmse) |> head(10)
+
+ggplot(top_models, aes(x = reorder(predictors, -rmse), y = rmse)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Top 10 Models by RMSE", x = "Predictor Combination", y = "RMSE") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.background = element_blank())
+
+# Visualize top results by R-squared
+ggplot(top_models, aes(x = reorder(predictors, -r_squared), y = r_squared)) +
+  geom_bar(stat = "identity", fill = "forestgreen") +
+  labs(title = "Top 10 Models by R-squared", x = "Predictor Combination", y = "R-squared") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.background = element_blank())
+
+```
+
+```{r}
+# Step 1: Combine the results into a single data frame
+results_df <- do.call(rbind, results)
+
+# Convert 'response' and 'predictors' columns to factors for better plotting
+results_df$response <- factor(results_df$response)
+results_df$predictors <- factor(results_df$predictors)
+
+# Add a column for the number of predictors used in each model
+results_df$num_predictors <- sapply(strsplit(as.character(results_df$predictors), ",\\s*"), length)
+
+results_df <- results_df |> arrange(rmse, r_squared)
+
+ggplot(results_df, aes(x = reorder(predictors, -r_squared), y = r_squared, fill = response)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Model R-squared Values by Predictor Combination",
+       x = "Predictor Combination",
+       y = "R-squared") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+ggplot(results_df, aes(x = rmse, y = r_squared, color = response)) +
+  geom_point(aes(shape = as.factor(num_predictors)), size = 3) +
+  labs(title = "RMSE vs. R-squared Across Models",
+       x = "RMSE",
+       y = "R-squared",
+       shape = "Number of Predictors") +
+  theme_minimal()
+
+```
+
+```{r}
+response_vars <- c("minDO.pctsat", "maxDO.pctsat", "avgDO.pctsat", "DOSat.hyp")
+
+# Group predictors by type
+percent_wet_vars <- c("percent_wet", "perc_wet7d", "perc_wet14d", "perc_wet30d", "perc_wet60d", "perc_wet_change")
+ppt_vars <- c("AvgPPT_7d", "AvgPPT_14d", "AvgPPT_30d", "totPPT_7d", "totPPT_14d", "totPPT_30d")
+q_vars <- c("meanQ", "meanQ_7d", "meanQ_14d", "meanQ_30d", "meanQ_ecdf")
+wateryear_vars <- c("WaterYear")  # WaterYear now treated as a regular predictor
+
+# For each group, create a list of options: NULL (no selection), or each variable
+percent_wet_options <- c(list(NULL), as.list(percent_wet_vars))
+ppt_options <- c(list(NULL), as.list(ppt_vars))
+q_options <- c(list(NULL), as.list(q_vars))
+wateryear_options <- c(list(NULL), as.list(wateryear_vars))
+
+# Generate all combinations of zero or one variable from each group
+combos_df <- expand.grid(
+  PercentWet = percent_wet_options,
+  PPT = ppt_options,
+  Q = q_options,
+  WaterYear = wateryear_options,
+  stringsAsFactors = FALSE
+)
+
+# Collect selected predictors for each combination
+combos_df <- combos_df |>
+  rowwise() |>
+  mutate(
+    # Combine selected predictors, excluding NULLs
+    Predictors = list(purrr::compact(c(PercentWet, PPT, Q, WaterYear))),
+    # Count the number of predictors selected
+    NumPredictors = length(Predictors)
+  ) |>
+  ungroup()
+
+# Filter combinations to have 1 to 4 predictors
+combos_df <- combos_df |>
+  filter(NumPredictors >= 2, NumPredictors <= 4)
+
+# Remove duplicate combinations
+# Sort predictors to ensure duplicates can be identified
+combos_df <- combos_df |>
+  mutate(
+    PredictorsSorted = map(Predictors, sort),
+    PredictorsStr = map_chr(PredictorsSorted, paste, collapse = ",")
+  ) |>
+  distinct(PredictorsStr, .keep_all = TRUE)
+
+# Extract the list of unique predictor combinations
+predictor_combinations <- combos_df$Predictors
+
+# Optionally, remove temporary columns if not needed
+combos_df <- combos_df |> select(-PredictorsSorted, -PredictorsStr)
+
+# Step 2: Prepare data
+all_predictor_vars <- c(percent_wet_vars, ppt_vars, q_vars, wateryear_vars)
+
+metDat_model <- dailyDatRoll |>
+  ungroup() |> 
+  select(all_of(c(response_vars, all_predictor_vars))) |> 
+  drop_na() |>
+  mutate(WaterYear = factor(WaterYear, levels = unique(WaterYear))) |>
+  mutate(across(where(is.numeric), ~ scale(.)[, 1]))
+
+set.seed(123)  # For reproducibility
+data_split <- initial_split(metDat_model, prop = 0.7)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# Helper function to fit and evaluate model
+fit_and_evaluate <- function(predictor_subset) {
+  # Prepare matrices for glmnet using model.matrix
+  x_train <- model.matrix(~ . -1, data = train_data[, predictor_subset])
+  x_test <- model.matrix(~ . -1, data = test_data[, predictor_subset])
+  y_train <- as.matrix(train_data[, response_vars])
+  y_test <- as.matrix(test_data[, response_vars])
+  
+  # Fit the model
+  cv_model <- glmnet::cv.glmnet(
+    x = x_train,
+    y = y_train,
+    family = "mgaussian",
+    alpha = 0.5,  # Elastic Net
+    nfolds = 5
+  )
+  
+  # Optimal lambda
+  lambda_opt <- cv_model$lambda.min
+  
+  # Make predictions
+  predictions <- predict(cv_model, s = lambda_opt, newx = x_test)
+  
+  # Evaluate the model
+  predictions_matrix <- predictions[, , 1]  # Use the first lambda slice
+  
+  metrics_list <- lapply(seq_len(ncol(y_test)), function(i) {
+    actual <- y_test[, i]
+    predicted <- predictions_matrix[, i]
+    # Check lengths before calculations
+    if(length(actual) != length(predicted)) {
+      stop("Mismatch in lengths of actual and predicted values.")
+    }
+    rmse <- sqrt(mean((actual - predicted)^2))
+    ss_total <- sum((actual - mean(actual))^2)
+    ss_res <- sum((actual - predicted)^2)
+    r_squared <- 1 - (ss_res / ss_total)
+    data.frame(
+      response = colnames(y_test)[i],
+      rmse = rmse,
+      r_squared = r_squared
+    )
+  })
+  metrics_df <- do.call(rbind, metrics_list)
+  metrics_df$predictors <- paste(predictor_subset, collapse = ", ")
+  
+  # Store actual and predicted values in a list
+  results_list <- list(
+    metrics = metrics_df,
+    actual = y_test,
+    predicted = predictions_matrix,
+    predictors = predictor_subset
+  )
+  return(results_list)
+}
+
+# Fit and evaluate models
+results <- lapply(predictor_combinations, fit_and_evaluate)
+
+# Combine metrics into a data frame, include index
+metrics_list <- lapply(seq_along(results), function(i) {
+  metrics_df <- results[[i]]$metrics
+  metrics_df$model_index <- i
+  return(metrics_df)
+})
+results_df <- do.call(rbind, metrics_list)
+
+results_df <- do.call(rbind, results)
+
+# Convert 'response' and 'predictors' columns to factors for better plotting
+results_df$response <- factor(results_df$response)
+results_df$predictors <- factor(results_df$predictors)
+
+# Add a column for the number of predictors used in each model
+results_df$num_predictors <- sapply(strsplit(as.character(results_df$predictors), ",\\s*"), length)
+
+results_df <- results_df |> arrange(rmse, r_squared) |> head(10)
+
+ggplot(results_df, aes(x = reorder(predictors, -r_squared), y = r_squared, fill = response)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Model R-squared Values by Predictor Combination",
+       x = "Predictor Combination",
+       y = "R-squared") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+ggplot(results_df, aes(x = rmse, y = r_squared, color = response)) +
+  geom_point(aes(shape = as.factor(num_predictors)), size = 3) +
+  labs(title = "RMSE vs. R-squared Across Models",
+       x = "RMSE",
+       y = "R-squared",
+       shape = "Number of Predictors") +
+  theme_minimal()
+
+
+# For models with the best R-squared
+best_models_r2 <- results_df |>
+  group_by(response) |>
+  filter(r_squared == max(r_squared)) |>
+  ungroup()
+
+# For models with the lowest RMSE
+best_models_rmse <- results_df |>
+  group_by(response) |>
+  filter(rmse == min(rmse)) |>
+  ungroup()
+library(ggplot2)
+library(cowplot)
+
+# Function to plot predicted vs observed
+plot_pred_vs_obs <- function(response_name, model_index, metric_df) {
+  # Get actual and predicted values
+  actual_values <- results[[model_index]]$actual[, response_name]
+  predicted_values <- results[[model_index]]$predicted[, response_name]
+  
+  # Get RMSE and R-squared
+  rmse_value <- metric_df |>
+    filter(response == response_name, model_index == model_index) |>
+    pull(rmse)
+  
+  r_squared_value <- metric_df |>
+    filter(response == response_name, model_index == model_index) |>
+    pull(r_squared)
+  
+  # Create data frame
+  plot_data <- data.frame(
+    actual = actual_values,
+    predicted = predicted_values
+  )
+  
+  # Create plot
+  p <- ggplot(plot_data, aes(x = actual, y = predicted)) +
+    geom_point(alpha = 0.6) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+    labs(
+      title = response_name,
+      subtitle = paste("RMSE =", round(rmse_value, 4), ", R² =", round(r_squared_value, 4)),
+      x = "Observed Values",
+      y = "Predicted Values"
+    ) +
+    theme_few()
+  
+  return(p)
+}
+
+# Generate plots for models with best R-squared
+plots_r2 <- list()
+
+best_models_r2_list <- best_models_r2 |>
+  group_by(response) |>
+  summarise(model_index = first(model_index)) |>
+  ungroup()
+
+for(i in seq_len(nrow(best_models_r2_list))) {
+  response_name <- best_models_r2_list$response[i]
+  model_index <- best_models_r2_list$model_index[i]
+  
+  p <- plot_pred_vs_obs(response_name, model_index, best_models_r2)
+  plots_r2[[response_name]] <- p
+}
+
+# Display plots
+plot_grid(plotlist = plots_r2, ncol = 2)
+
+# Generate plots for models with lowest RMSE
+plots_rmse <- list()
+
+best_models_rmse_list <- best_models_rmse |>
+  group_by(response) |>
+  summarise(model_index = first(model_index)) |>
+  ungroup()
+
+for(i in seq_len(nrow(best_models_rmse_list))) {
+  response_name <- best_models_rmse_list$response[i]
+  model_index <- best_models_rmse_list$model_index[i]
+  
+  p <- plot_pred_vs_obs(response_name, model_index, best_models_rmse)
+  plots_rmse[[response_name]] <- p
+}
+
+# Display plots
+plot_grid(plotlist = plots_rmse, ncol = 2)
+```

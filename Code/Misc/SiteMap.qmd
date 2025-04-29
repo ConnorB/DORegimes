@@ -1,0 +1,140 @@
+---
+title: "Site Map"
+author: "CLB"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+library(data.table)
+library(tidyverse, warn.conflicts = F)
+library(dataRetrieval)
+library(styler)
+library(scales)
+library(here)
+library(knitr)
+library(lubridate)
+library(dygraphs)
+library(cowplot)
+library(zoo)
+library(ggpubr)
+library(ggthemes)
+library(ggpmisc)
+library(ggforce)
+library(ggrepel)
+library(Gmisc)
+#library(patchwork)
+library(RColorBrewer)
+library(sf)
+library(sfheaders)
+library(terra)
+library(FedData)
+library(tidyterra)
+library(whitebox)
+library(stars)
+library(mapview) # needs to be dev version:    remotes::install_github("r-spatial/mapview")
+library(ggspatial)
+```
+
+```{r}
+aimsSites <- tibble(Site = c("KMZ", "SHN", "YMR", "OKA", "GBJ", "DRC", "JDR", "TAL", "WHR", "PRF"),
+                   Lat = c(39.082353, 39.115220, 37.56452, 34.437642, 42.78483889, 43.7184, 43.1226, 33.7621789, 32.98463, 34.968669),
+                   Long = c(-96.56, -96.550, -96.49102, -96.652997, -112.44484722, -116.137, -116.776, -85.595521, -88.012269, -86.165439))
+	
+
+aimsSites <- aimsSites %>% 
+  filter(Site %in% c("KMZ", "YMR"))
+
+usgsSites <- readNWISsite(c("06879650","07169800")) %>% 
+  select(site_no, station_nm, dec_lat_va, dec_long_va) %>% 
+  rename(ID = site_no, Lat = dec_lat_va, Long = dec_long_va)
+
+setDT(usgsSites)
+usgsSites[ID == "06879650", Site := "Kings Creek Gage" ] 
+usgsSites[ID == "07169800", Site := "Elk River Gage" ] 
+
+
+allSites <- aimsSites %>% 
+  full_join(usgsSites) %>% 
+  select(-station_nm) %>% 
+  st_as_sf(coords = c("Long", "Lat"), crs = st_crs(4326)) %>%
+  st_transform(3857)
+```
+
+```{r}
+usShape <- st_read(here("Data/USA_Shp/cb_2018_us_state_500k.shp")) %>% 
+  filter(!STUSPS %in% c("AK", "AS", "VI", "HI", "GU", "MP", "PR")) %>% 
+  st_transform(3857)
+
+ksShape <- usShape %>% 
+  filter(STUSPS %in% c("KS"))
+
+ksStreams <- st_read(here("Data/kansas_streams/kansas_streams_order3_9_webmerc.shp")) %>% 
+  st_transform(3857)
+
+ggplot() +
+  geom_sf(data = usShape, fill="#ffffff", color="black", linewidth=0.25) +
+  geom_sf(data = ksStreams, color = "#6c84a8")+
+  geom_sf(data = allSites, aes(color = Site), size = 5, shape = 20) +
+  scale_color_manual(values = c("KMZ" = "#345023", "Kings Creek Gage" = "#596C0B", "YMR" = "#3A1F46", "Elk River Gage" = "#7F4B89")) +
+  geom_label_repel(data = allSites, aes(label = Site, geometry = geometry),
+                   stat = "sf_coordinates", size = 5, fill = "white") +
+  ggspatial::annotation_scale(style = "ticks", line_width = 1.5, text_face = "bold")+
+  ggspatial::annotation_north_arrow(style = north_arrow_minimal(), pad_x = unit(-0.25, "cm"), pad_y = unit(0.5, "cm"))+
+  theme_few()+
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title.y = element_blank(),
+        legend.position = "none",
+        text = element_text(size = 20),       # Increase overall text size
+        axis.title = element_text(size = 20), # Increase axis titles size
+        axis.text = element_text(size = 20),  # Increase axis text size
+        strip.text = element_text(size = 20)  # Increase facet labels size) 
+        )-> siteMap
+#siteMap
+
+ggsave("siteMap.png", siteMap, here("Figs/"), device = "png",  width = 9, height = 6, units = "in", dpi = "retina")
+```
+
+```{r}
+# Create the inset map
+insetMap <-  ggplot() +
+  geom_sf(data = usShape, fill = "white", color = "black", linewidth = 0.25) +
+  geom_sf(data = ksShape, fill = NA, color = "red", linewidth = 1) +
+  labs(x = NULL, y = NULL) +
+  theme_void() + 
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.ticks.length = unit(0, "pt"),
+        axis.title=element_blank(),
+        panel.background = element_rect(fill = "white"))
+
+# Main map with inset
+siteMap <- ggplot() +
+  geom_sf(data = ksShape, fill="#ffffff", color="black", linewidth=0.25) +
+  geom_sf(data = ksStreams, color = "#6c84a8")+
+  geom_sf(data = allSites, aes(color = Site), size = 5, shape = 20) +
+  scale_color_manual(values = c("KMZ" = "#345023", "Kings Creek Gage" = "#596C0B", "YMR" = "#3A1F46", "Elk River Gage" = "#7F4B89")) +
+  geom_label_repel(data = allSites, aes(label = Site, geometry = geometry),
+                   stat = "sf_coordinates", size = 5, fill = "white") +
+  ggspatial::annotation_scale(style = "ticks", line_width = 1.5, text_face = "bold")+
+  ggspatial::annotation_north_arrow(style = north_arrow_minimal(), pad_x = unit(-0.25, "cm"), pad_y = unit(0.5, "cm"))+
+  theme_few()+
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title.y = element_blank(),
+        legend.position = "none",
+        text = element_text(size = 20),       # Increase overall text size
+        axis.title = element_text(size = 20), # Increase axis titles size
+        axis.text = element_text(size = 20),  # Increase axis text size
+        strip.text = element_text(size = 20)  # Increase facet labels size) 
+        )
+#siteMap
+siteMap2 <- ggdraw() +
+  draw_plot(siteMap) +
+  draw_plot(insetMap, x = 0.15, y = 0.62, width = 0.3, height = 0.3)
+
+ggsave("siteMap.png", siteMap2, here("Figs/"), device = "png",  width = 9, height = 6, units = "in", dpi = "retina")
+
+```

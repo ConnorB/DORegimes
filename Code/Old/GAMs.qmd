@@ -1,0 +1,444 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+library(tidyverse)
+options(readr.show_col_types = F)
+library(here)
+library(caret)
+library(glmnet)
+library(randomForest)
+library(Metrics)
+library(mgcv)
+library(future)
+library(furrr)
+library(progressr)
+```
+
+```{r}
+dailyDatRoll <- read_csv(here("Data/dailyDatRoll.csv"))
+```
+
+```{r}
+# Define predictor and response variables
+predictor_vars <- c(
+  "percent_wet", "perc_wet7d", "perc_wet14d", "perc_wet30d", "perc_wet60d", "perc_wet_change",
+  "AvgPPT_7d", "AvgPPT_14d", "AvgPPT_30d", "totPPT_7d", 
+  "totPPT_14d", "totPPT_30d", "meanQ", "meanQ_7d", "meanQ_14d", "meanQ_30d",
+  "meanQ_ecdf", "WaterYear"
+)
+response_vars <- c("minDO.pctsat", "maxDO.pctsat", "avgDO.pctsat", "probHypSat")
+
+# Generate all combinations of predictor variables
+all_combs <- unlist(
+  lapply(2:4, function(k) combn(predictor_vars, k, simplify = FALSE)),
+  recursive = FALSE
+)
+
+# Inspect the generated combinations
+comb_df <- data.frame(
+  Combination = seq_along(all_combs),
+  Predictors = sapply(all_combs, function(x) paste(x, collapse = ", "))
+)
+
+# Prepare data
+modelDat <- dailyDatRoll %>% 
+  select(-minDO.obs, -maxDO.obs, -avgDO.obs, -DO.hyp, -DO.amp, -probHyp) %>% 
+  drop_na() %>% 
+  mutate(WaterYear = factor(WaterYear, levels = unique(WaterYear)))
+
+# Reshape data to long format
+data_long <- modelDat %>%
+  pivot_longer(cols = all_of(response_vars), names_to = "Response", values_to = "Value")
+
+# Plan for parallel processing
+plan(multisession, workers = 4) # Use multiple R sessions; you can also use multicore for Unix-based systems
+
+# Enable progress tracking
+handlers("txtprogressbar") # Use a global progress handler (e.g., progress bar)
+
+# Function to process combinations in parallel with progress tracking
+parallel_fit_with_progress <- function(all_combs, data_long, response_interaction = "Response * WaterYear") {
+  # Function to fit the GAM for a given predictor set
+  fit_gam <- function(predictors) {
+    # Build the formula
+    formula <- as.formula(paste(
+      "Value ~", 
+      paste(paste0("s(", predictors, ")"), collapse = " + "), 
+      "+", response_interaction
+    ))
+    
+    # Try fitting the GAM, handle errors gracefully
+    result <- tryCatch({
+      gam_model <- gam(formula, data = data_long, method = "REML")
+      list(model = gam_model, AIC = AIC(gam_model))
+    }, error = function(e) {
+      list(model = NULL, AIC = NA) # Return NA for AIC in case of error
+    })
+    
+    return(result)
+  }
+
+  # Add a progress bar
+  p <- progressor(along = all_combs) # Initialize progress tracking
+  
+  # Fit GAMs in parallel with progress reporting
+  comb_results <- future_map(all_combs, ~ {
+    p(sprintf("Processing combination %s", paste(.x, collapse = ", "))) # Update progress
+    predictors <- .x
+    result <- fit_gam(predictors)
+    list(predictors = predictors, result = result)
+  }, .options = furrr_options(seed = TRUE)) # Ensures reproducibility
+  
+  return(comb_results)
+}
+
+# Track progress during execution
+with_progress({
+  comb_results <- parallel_fit_with_progress(all_combs, data_long)
+})
+
+# Summarize the results
+results_summary <- data.frame(
+  Predictors = sapply(comb_results, function(x) paste(x$predictors, collapse = ", ")),
+  AIC = sapply(comb_results, function(x) x$result$AIC)
+)
+
+# Sort by AIC
+results_summary <- results_summary %>% arrange(AIC)
+
+# Display the top models
+head(results_summary)
+
+```
+
+```{r}
+# Define predictor and response variables
+predictor_vars <- c(
+  "percent_wet", "perc_wet7d", "perc_wet14d", "perc_wet30d", "perc_wet60d", "perc_wet_change",
+  "AvgPPT_7d", "AvgPPT_14d", "AvgPPT_30d", "totPPT_7d", 
+  "totPPT_14d", "totPPT_30d", "meanQ", "meanQ_7d", "meanQ_14d", "meanQ_30d",
+  "meanQ_ecdf", "WaterYear"
+)
+response_vars <- c("minDO.pctsat", "maxDO.pctsat", "avgDO.pctsat", "probHypSat")
+
+# Define groups of variables
+percent_wet_vars <- c("percent_wet", "perc_wet7d", "perc_wet14d", "perc_wet30d", "perc_wet60d", "perc_wet_change")
+ppt_vars <- c("AvgPPT_7d", "AvgPPT_14d", "AvgPPT_30d", "totPPT_7d", "totPPT_14d", "totPPT_30d")
+q_vars <- c("meanQ", "meanQ_7d", "meanQ_14d", "meanQ_30d", "meanQ_ecdf")
+
+# Function to generate valid combinations
+generate_valid_combinations <- function(percent_wet_vars, ppt_vars, q_vars, other_vars, k_min = 2, k_max = 4) {
+  all_combs <- list()
+  
+  for (k in k_min:k_max) {
+    # Ensure k is large enough to include at least one variable from each group
+    if (k < 3) next
+    
+    # For each combination size, pick one from each group
+    percent_wet_combs <- combn(percent_wet_vars, 1, simplify = FALSE)
+    ppt_combs <- combn(ppt_vars, 1, simplify = FALSE)
+    q_combs <- combn(q_vars, 1, simplify = FALSE)
+    
+    # Remaining slots for "other" variables
+    other_slots <- k - 3
+    if (other_slots > 0 && length(other_vars) >= other_slots) {
+      other_combs <- combn(other_vars, other_slots, simplify = FALSE)
+    } else if (other_slots == 0) {
+      other_combs <- list(NULL) # No additional variables needed
+    } else {
+      next # Skip if there aren't enough variables to fill other_slots
+    }
+    
+    # Combine one from each group and all combinations of "other" variables
+    for (pw in percent_wet_combs) {
+      for (ppt in ppt_combs) {
+        for (q in q_combs) {
+          for (others in other_combs) {
+            all_combs <- append(all_combs, list(c(unlist(pw), unlist(ppt), unlist(q), unlist(others))))
+          }
+        }
+      }
+    }
+  }
+  
+  return(all_combs)
+}
+
+# Separate other variables
+other_vars <- setdiff(predictor_vars, c(percent_wet_vars, ppt_vars, q_vars))
+
+# Generate constrained combinations
+all_combs <- generate_valid_combinations(percent_wet_vars, ppt_vars, q_vars, other_vars)
+
+# Format combinations for inspection
+comb_df <- data.frame(
+  Combination = seq_along(all_combs),
+  Predictors = sapply(all_combs, function(x) paste(unlist(x), collapse = ", "))
+)
+
+
+# Prepare data
+modelDat <- dailyDatRoll %>% 
+  select(-minDO.obs, -maxDO.obs, -avgDO.obs, -DO.hyp, -DO.amp, -probHyp) %>% 
+  drop_na() %>% 
+  mutate(WaterYear = factor(WaterYear, levels = unique(WaterYear)))
+
+# Reshape data to long format
+data_long <- modelDat %>%
+  select(all_of(c(predictor_vars, response_vars))) %>%
+  pivot_longer(cols = all_of(response_vars), names_to = "Response", values_to = "Value")
+
+# Plan for parallel processing
+plan(multisession, workers = 4) # Use multiple R sessions; you can also use multicore for Unix-based systems
+
+# Enable progress tracking
+handlers("txtprogressbar") # Use a global progress handler (e.g., progress bar)
+
+# Function to process combinations in parallel with progress tracking
+parallel_fit_with_progress <- function(all_combs, data_long) {
+  # Function to fit the GAM for a given predictor set
+  fit_gam <- function(predictors) {
+    # Build the formula
+    formula <- as.formula(paste(
+      "Value ~", 
+      paste(paste0("s(", predictors, ")"), collapse = " + ")
+    ))
+    
+    # Try fitting the GAM, handle errors gracefully
+    result <- tryCatch({
+      gam_model <- gam(formula, data = data_long, method = "REML")
+      list(model = gam_model, AIC = AIC(gam_model))
+    }, error = function(e) {
+      list(model = NULL, AIC = NA) # Return NA for AIC in case of error
+    })
+    
+    return(result)
+  }
+
+  # Add a progress bar
+  p <- progressor(along = all_combs) # Initialize progress tracking
+  
+  # Fit GAMs in parallel with progress reporting
+  comb_results <- future_map(all_combs, ~ {
+    p(sprintf("Processing combination %s", paste(.x, collapse = ", "))) # Update progress
+    predictors <- .x
+    result <- fit_gam(predictors)
+    list(predictors = predictors, result = result)
+  }, .options = furrr_options(seed = TRUE)) # Ensures reproducibility
+  
+  return(comb_results)
+}
+
+# Track progress during execution
+with_progress({
+  comb_results <- parallel_fit_with_progress(all_combs, data_long)
+})
+
+# Summarize the results
+results_summary <- data.frame(
+  Predictors = sapply(comb_results, function(x) paste(x$predictors, collapse = ", ")),
+  AIC = sapply(comb_results, function(x) x$result$AIC)
+)
+
+# Sort by AIC
+results_summary <- results_summary %>% arrange(AIC)
+
+# Display the top models
+head(results_summary)
+```
+
+```{r}
+best_model <- comb_results[[1]]$result$model
+
+predictions <- predict(best_model, newdata = data_long)
+ggplot(data_long, aes(x = Value, y = predictions)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Observed vs. Predicted Values",
+    x = "Observed Value",
+    y = "Predicted Value"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+library(tidyverse)
+options(readr.show_col_types = F)
+library(here)
+library(rsample)
+library(furrr)
+options(parallelly.fork.enable = T)
+library(progressr)
+library(purrr)
+
+dailyDat <- read_csv("~/Desktop/dailyDat.csv")
+
+
+# Step 1: Define response and predictor variables
+response_vars <- c("minDO.pctsat", "maxDO.pctsat", "avgDO.pctsat", "DOpctsat.amp", "probHypSat", "PC1", "PC2", "cluster")
+predictor_vars <- c(
+  "PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d",
+  "PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d", 
+  "Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d", "exeProb",
+  "Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d", "WaterYear"
+)
+
+# Step 2: Correct and define the grouping structure
+grouped_predictors <- list(
+  perc_wet = c("PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d"),
+  PPT = c("PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d"),
+  Q = c("Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d"),
+  exeProb = c("exeProb"),
+  #quantQ = c("quantQ", "quantileQ_7d", "quantileQ_14d", "quantileQ_30d"),
+  Depth = c("Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d")
+)
+
+# Step 3: Generate combinations efficiently
+generate_filtered_combos <- function() {
+  all_combos <- map(2:4, ~combn(predictor_vars, .x, simplify = FALSE)) %>%
+    purrr::flatten()
+  
+  filtered_combos <- purrr::keep(all_combos, function(combo) {
+    # Check if no more than 1 variable is selected from each group
+    group_counts <- sapply(grouped_predictors, function(group) sum(combo %in% group))
+    valid_groups <- all(group_counts <= 1)
+    valid_groups   # Allow only valid combinations
+  })
+
+  return(filtered_combos)
+}
+
+# Step 4: Generate the valid predictor combinations
+predictor_combos <- generate_filtered_combos()
+# Step 5: Create functions to run models
+run_model <- function(response, predictors, train_data, test_data, model_type = "linear") {
+  # Ensure WaterYear is a factor in both datasets
+  train_data$WaterYear <- as.factor(train_data$WaterYear)
+  test_data$WaterYear <- as.factor(test_data$WaterYear)
+  
+  # Apply transformations based on model type
+  if (model_type == "log-log") {
+    train_data <- train_data %>%
+      mutate(across(all_of(c(response, predictors)) & -WaterYear, ~ log(. + 1)))
+    test_data <- test_data %>%
+      mutate(across(all_of(c(response, predictors)) & -WaterYear, ~ log(. + 1)))
+
+  } else if (model_type == "log-linear") {
+    train_data <- train_data %>%
+      mutate(across(all_of(c(predictors)) & -WaterYear, ~ log(. + 1)))
+    test_data <- test_data %>%
+      mutate(across(all_of(c(predictors)) & -WaterYear, ~ log(. + 1)))
+  } else if (model_type == "linear-log") {
+    train_data <- train_data %>%
+      mutate(across(all_of(response), ~ log(. + 1)))
+    test_data <- test_data %>%
+      mutate(across(all_of(response), ~ log(. + 1)))
+  }
+  
+  # Define the formula
+  lmForm <- as.formula(paste(response, "~", "(", paste(predictors, collapse = " + "), ")^2"))
+  
+  # Fit the model using lm()
+  model <- lm(lmForm, data = train_data)
+  
+  # Make predictions
+  predictions <- predict(model, newdata = test_data)
+  
+  # Back-transform predictions if necessary
+  if (model_type %in% c("log-log", "log-linear")) {
+    predictions <- exp(predictions) - 1
+  }
+  
+  # Calculate RMSE and R-squared
+  rmse <- sqrt(mean((predictions - test_data[[response]])^2))
+  r_squared <- summary(model)$r.squared
+
+  list(
+    model = model, rmse = rmse, r_squared = r_squared,
+    predictors = predictors, response = response, model_type = model_type
+  )
+}
+
+# Step 6: Prepare data
+metDat_model <- dailyDat %>%
+  ungroup() %>% 
+  select(all_of(c(response_vars, predictor_vars))) %>% 
+  drop_na() %>%
+  mutate(WaterYear = as.factor(WaterYear)) %>% 
+  mutate(across(where(is.numeric), ~ scale(.)[, 1]))
+
+set.seed(123)  # For reproducibility
+data_split <- initial_split(metDat_model, prop = 0.7)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# Step 7: Run models for each response and predictor combination with different types (parallelized)
+# Dynamically allocate cores, leaving 1 core free
+num_cores <- parallel::detectCores() - 1
+plan(multicore, workers = num_cores) # Enable progress reporting
+handlers("cli")         # Displays progress in the console
+
+# Define a function for a single model run to be used with furrr
+run_all_models <- function(response, predictors, train_data, test_data, model_types) {
+  lapply(model_types, function(model_type) {
+    run_model(response, predictors, train_data, test_data, model_type)
+  })
+}
+
+# Define model_types globally before the parallel map
+model_types <- c("linear", "log-log", "log-linear", "linear-log")
+
+# Wrap the execution in a progress tracking context
+with_progress({
+  p <- progressor(steps = length(response_vars) * length(predictor_combos))
+  
+  # Parallelized execution with furrr
+  results <- future_map(
+    response_vars, 
+    function(response) {
+      future_map(
+        predictor_combos, 
+        function(predictors) {
+          p()  # Increment progress
+          run_all_models(response, predictors, train_data, test_data, model_types)
+        }
+      )
+    }
+  )
+})
+
+
+# Step 8: Extract results into dataframes (unchanged)
+extract_results <- function(results_list) {
+  do.call(rbind, lapply(results_list, function(res) {
+    do.call(rbind, lapply(res, function(model_res) {
+      do.call(rbind, lapply(model_res, function(model_result) {
+        data.frame(
+          response = model_result$response,
+          predictors = paste(model_result$predictors, collapse = ", "),
+          model_type = model_result$model_type,
+          rmse = model_result$rmse,
+          r_squared = model_result$r_squared
+        )
+      }))
+    }))
+  }))
+}
+
+results <- extract_results(results)
+
+# Step 10: Rank models and analyze
+bestLM <- results %>%
+  group_by(response, model_type) %>%
+  arrange(response, model_type, rmse, r_squared) %>%
+  slice_head(n = 5)
+
+# Shut down the parallel backend when done
+plan(sequential)
+```

@@ -1,0 +1,198 @@
+---
+title: "Great Plains STICs"
+author: "CLB"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+library(data.table)
+library(tidyverse, warn.conflicts = F)
+options(readr.show_col_types = F)
+library(broom)
+library(googlesheets4)
+library(ggthemes)
+library(ggpmisc)
+library(ggpubr)
+library(patchwork)
+library(plotly)
+library(here)
+library(styler)
+library(streamMetabolizer)
+library(rstan)
+options(mc.cores = parallel::detectCores())
+library(dataRetrieval)
+library(scales)
+library(knitr)
+library(lubridate)
+library(zoo)
+library(parallel)
+library(doParallel)
+library(foreach)
+```
+
+# Functions
+
+```{r}
+# Define the function
+calcWaterYearDOY <- function(date) {
+  date <- as.Date(date)  # Ensure the input is a Date object
+  waterYear <- if_else(month(date) >= 10, year(date) + 1, year(date))
+  waterYearStart <- as.Date(paste0(waterYear - 1, "-10-01"))
+  doy <- as.numeric(difftime(date, waterYearStart, units = "days")) + 1
+  return(doy)
+}
+
+calcWaterYearMonthDay <- function(doy) {
+  waterYearStart <- as.Date(paste0(1991 - 1, "-10-01"))
+  date <- waterYearStart + days(doy - 1)
+  return(date)
+}
+```
+
+# Get QAQCd STIC Data
+
+```{r}
+sticPath <- here("Data/STICs/")
+sticPath <- list.files(sticPath, "*.csv", full.names = T, recursive = T)
+# Read data for each site and combine
+rawSTICs <-  rbindlist(sapply(sticPath, read_csv), fill = T) %>% 
+  select(dateTime = datetime, Site = siteID, SN, condUncal, tempC, SpC, wetdry, qual_rating, QAQC)
+```
+
+## KMZ and YMR Sites
+
+```{r}
+# Define the Site values for KMZ and YMR
+kmzSites <- c("04M10_2", "SFM01_2", "SFM05_2", "02M08_2", "SFT01_1", "04M12_2", "01M05_1", "04M06_2", "20M05_1", 
+                  "01M01_1", "01M03_2", "01M04_2", "02M10_2", "04M12_1", "04T01_2", "04T02_1", "04T02_2", "SFT02_2", 
+                  "04W03_1", "04W02_1", "02M11_1", "04M13_1", "01M02_1", "01M03_1", "01M06_1", "02M01_2", "02M02_1", 
+                  "02M03_1", "02M06_1", "02M07_1", "02M08_1", "02M09_1", "02M10_1", "02M11_2", "04M01_1", "04M01_2", 
+                  "04M02_1", "04M03_1", "04M04_1", "04M05_1", "04M06_1", "04M07_1", "04M08_1", "04M08_2", "04M09_1", 
+                  "04M09_2", "04M10_1", "04M11_1", "04T01_1", "04W01_1", "04W02_2", "04W04_1", "04W04_2", "20M01_1", 
+                  "20M02_1", "20M04_1", "20M04_2", "20M05_2", "SFM01_1", "SFM02_1", "SFM02_2", "SFM03_2", "SFM04_1", 
+                  "SFM05_1", "SFM07_1", "SFT02_1", "02M01_1", "SFM03_1", "SFM06_1", "02M04_1", "04M02_2", "02M06_2", 
+                  "20M03_1", "02M05_1", "02M04_2", "04W01_2", "01M02_2", "04W03_2")
+ymrSites <- c("EN304", "ENM13", "EN305", "EN204", "EN205", "EN302", "EN101", "EN202", "EN203", "EN206", "EN303", "EN401", "ENM01", "ENM02", "ENM03", "ENM05", "ENM10", "ENM12", "ENM07", "EN207")
+
+# Clean up and add Watershed column
+rawSTICs <- rawSTICs %>% 
+  mutate(WaterYear = calcWaterYear(dateTime),
+         Date = as_date(dateTime),
+         Watershed = case_when(
+           Site %in% kmzSites ~ "KMZ",
+           Site %in% ymrSites ~ "YMR",
+           TRUE ~ NA
+         ),
+         SubLoc = case_when(
+      grepl("_1$", Site) ~ "High STIC",
+      grepl("_2$", Site) ~ "Low STIC",
+      TRUE ~ NA_character_
+    ),
+    Site = sub("_[12]$", "", Site))
+```
+
+## Daily Site % Wet/Dry
+
+```{r}
+# Group by Watershed, Site, and Day to calculate wet/dry percentages
+sticSiteDayPerc <- rawSTICs %>%
+  group_by(Watershed, Site, Date, WaterYear) %>%
+  summarize(
+    total_time = n(),
+    wetTime = sum(wetdry == "wet", na.rm = TRUE),
+    dryTime = sum(wetdry == "dry", na.rm = TRUE),
+  ) %>%
+  mutate(
+    wetPerc = (wetTime / total_time) * 100,
+    dryPerc = (dryTime / total_time) * 100
+  ) %>%
+  ungroup()
+
+sticWatershedDayPerc <- sticSiteDayPerc %>%
+  group_by(Watershed, Date, WaterYear) %>%
+  summarize(
+    avgWetPerc = mean(wetPerc, na.rm = TRUE),
+    avgDryPerc = mean(dryPerc, na.rm = TRUE)
+  ) %>%
+  mutate(DOY = calcWaterYearDOY(Date),
+         DateWY = calcWaterYearMonthDay(DOY)) %>% 
+  ungroup()
+```
+
+```{r}
+sticWatershedDayPerc %>%
+  filter(WaterYear < 2023) %>% 
+  ggplot(aes(DateWY, avgWetPerc, color = factor(WaterYear))) +
+  geom_line() + 
+  ylab("% Network Wet") +
+  scale_color_manual(values = c("2021" = "#1B9E77", "2022" = "#D95F02", "2023" = "#7570B3", "2024" = "#E7298A")) +
+  theme_few() +
+  scale_x_date(date_labels = "%b", date_breaks = "1 month")+
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        text = element_text(size = 14),       # Increase overall text size
+    axis.title = element_text(size = 16), # Increase axis titles size
+    axis.text = element_text(size = 14),  # Increase axis text size
+    strip.text = element_text(size = 16)  # Increase facet labels size
+    )+
+  facet_wrap(~Watershed, ncol = 2, scales = "free") -> netWet2022
+netWet2022
+ggsave("netWet2022.png", netWet2022, here("Figs/"), device = "png", width = 25.4, height = 14.29, units = "cm", dpi = "retina")
+```
+
+```{r}
+excProb <- sticWatershedDayPerc %>% 
+  mutate(Period = case_when(WaterYear == 2021 ~ "2021",
+                            WaterYear == 2022 ~ "2022",
+                            WaterYear == 2023 ~ "2023")) %>% 
+  group_by(Period, Watershed) %>%
+  arrange(desc(avgWetPerc)) %>%
+  mutate(ExceedanceProbability = (row_number() / (n() + 1)) * 100)
+
+excProb %>% 
+  ggplot(aes(x = ExceedanceProbability, y = avgWetPerc, color = Period)) +
+  geom_line() +
+  #scale_y_log10(labels = label_number()) +
+  scale_color_manual(values = c("2021" = "#1B9E77", "2022" = "#D95F02", "2023" = "#7570B3")) +
+  labs(title = "",
+       x = "Exceedance Probability (%)",
+       y = "% Network Wet") +
+  theme_few() +
+  theme(legend.position = "bottom", legend.title = element_blank(),
+        text = element_text(size = 14),       # Increase overall text size
+    axis.title = element_text(size = 16), # Increase axis titles size
+    axis.text = element_text(size = 14),  # Increase axis text size
+    strip.text = element_text(size = 16)  # Increase facet labels size
+    ) +
+  facet_wrap(~Watershed)
+```
+
+## % Wet/Dry
+
+```{r}
+
+
+# Calculate unique days across all siteIDs for each Site and WaterYear
+uniqueDays <- rawSTICs %>%
+  group_by(Site, WaterYear) %>%
+  summarize(numDays = n_distinct(as.Date(dateTime))) %>%
+  ungroup()
+
+# Calculate network-level wet/dry percentages by Site and WaterYear
+sticNetPerc <- sticDayPerc %>%
+  group_by(Site, WaterYear) %>%
+  summarize(
+    netWetPerc = mean(wetPerc, na.rm = TRUE),
+    netDryPerc = mean(dryPerc, na.rm = TRUE),
+  )%>%
+  left_join(uniqueDays, by = c("Site", "WaterYear")) %>%
+  ungroup()
+```
+
+```{r}
+
+```

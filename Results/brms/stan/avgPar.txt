@@ -1,0 +1,146 @@
+// generated with brms 2.22.11
+functions {
+  /* compute a latent Gaussian process with squared exponential kernel
+   * Args:
+   *   x: array of continuous predictor values
+   *   sdgp: marginal SD parameter
+   *   lscale: length-scale parameter
+   *   zgp: vector of independent standard normal variables
+   * Returns:
+   *   a vector to be added to the linear predictor
+   */
+  vector gp_exp_quad(data array[] vector x, real sdgp, vector lscale, vector zgp) {
+    int Dls = rows(lscale);
+    int N = size(x);
+    matrix[N, N] cov;
+    if (Dls == 1) {
+      // one dimensional or isotropic GP
+      cov = gp_exp_quad_cov(x, sdgp, lscale[1]);
+    } else {
+      // multi-dimensional non-isotropic GP
+      cov = gp_exp_quad_cov(x[, 1], sdgp, lscale[1]);
+      for (d in 2:Dls) {
+        cov = cov .* gp_exp_quad_cov(x[, d], 1, lscale[d]);
+      }
+    }
+    for (n in 1:N) {
+      // deal with numerical non-positive-definiteness
+      cov[n, n] += 1e-12;
+    }
+    return cholesky_decompose(cov) * zgp;
+  }
+}
+data {
+  int<lower=1> N;  // total number of observations
+  vector[N] Y;  // response variable
+  int<lower=1> K;  // number of population-level effects
+  matrix[N, K] X;  // population-level design matrix
+  int<lower=1> Kc;  // number of population-level effects after centering
+  // data related to GPs
+  int<lower=1> Kgp_1;  // number of sub-GPs (equal to 1 unless 'by' was used)
+  int<lower=1> Dgp_1;  // GP dimension
+  // number of observations relevant for a certain sub-GP
+  array[Kgp_1] int<lower=1> Ngp_1;
+  // indices and contrasts of sub-GPs per observation
+  array[Ngp_1[1]] int<lower=1> Igp_1_1;
+  vector[Ngp_1[1]] Cgp_1_1;
+  array[Ngp_1[2]] int<lower=1> Igp_1_2;
+  vector[Ngp_1[2]] Cgp_1_2;
+  array[Ngp_1[3]] int<lower=1> Igp_1_3;
+  vector[Ngp_1[3]] Cgp_1_3;
+  array[Ngp_1[4]] int<lower=1> Igp_1_4;
+  vector[Ngp_1[4]] Cgp_1_4;
+  // number of latent GP groups
+  array[Kgp_1] int<lower=1> Nsubgp_1;
+  // indices of latent GP groups per observation
+  array[Ngp_1[1]] int<lower=1> Jgp_1_1;
+  // indices of latent GP groups per observation
+  array[Ngp_1[2]] int<lower=1> Jgp_1_2;
+  // indices of latent GP groups per observation
+  array[Ngp_1[3]] int<lower=1> Jgp_1_3;
+  // indices of latent GP groups per observation
+  array[Ngp_1[4]] int<lower=1> Jgp_1_4;
+  // covariates of the GP
+  array[Nsubgp_1[1]] vector[Dgp_1] Xgp_1_1;
+  array[Nsubgp_1[2]] vector[Dgp_1] Xgp_1_2;
+  array[Nsubgp_1[3]] vector[Dgp_1] Xgp_1_3;
+  array[Nsubgp_1[4]] vector[Dgp_1] Xgp_1_4;
+  // data for group-level effects of ID 1
+  int<lower=1> N_1;  // number of grouping levels
+  int<lower=1> M_1;  // number of coefficients per level
+  array[N] int<lower=1> J_1;  // grouping indicator per observation
+  // group-level predictor values
+  vector[N] Z_1_1;
+  int prior_only;  // should the likelihood be ignored?
+}
+transformed data {
+  matrix[N, Kc] Xc;  // centered version of X without an intercept
+  vector[Kc] means_X;  // column means of X before centering
+  for (i in 2:K) {
+    means_X[i - 1] = mean(X[, i]);
+    Xc[, i - 1] = X[, i] - means_X[i - 1];
+  }
+}
+parameters {
+  vector[Kc] b;  // regression coefficients
+  real Intercept;  // temporary intercept for centered predictors
+  vector<lower=0>[Kgp_1] sdgp_1;  // GP standard deviation parameters
+  array[Kgp_1] vector<lower=0>[1] lscale_1;  // GP length-scale parameters
+  // latent variables of the GP
+  vector[Nsubgp_1[1]] zgp_1_1;
+  vector[Nsubgp_1[2]] zgp_1_2;
+  vector[Nsubgp_1[3]] zgp_1_3;
+  vector[Nsubgp_1[4]] zgp_1_4;
+  real<lower=0> sigma;  // dispersion parameter
+  vector<lower=0>[M_1] sd_1;  // group-level standard deviations
+  array[M_1] vector[N_1] z_1;  // standardized group-level effects
+}
+transformed parameters {
+  vector[N_1] r_1_1;  // actual group-level effects
+  // prior contributions to the log posterior
+  real lprior = 0;
+  r_1_1 = (sd_1[1] * (z_1[1]));
+  lprior += student_t_lpdf(Intercept | 3, 0.2, 2.5);
+  lprior += student_t_lpdf(sdgp_1 | 3, 0, 2.5)
+    - 4 * student_t_lccdf(0 | 3, 0, 2.5);
+  lprior += inv_gamma_lpdf(lscale_1[1][1] | 1.494197, 0.056607);
+  lprior += inv_gamma_lpdf(lscale_1[2][1] | 1.494197, 0.056607);
+  lprior += inv_gamma_lpdf(lscale_1[3][1] | 1.494197, 0.056607);
+  lprior += inv_gamma_lpdf(lscale_1[4][1] | 1.494197, 0.056607);
+  lprior += student_t_lpdf(sigma | 3, 0, 2.5)
+    - 1 * student_t_lccdf(0 | 3, 0, 2.5);
+  lprior += student_t_lpdf(sd_1 | 3, 0, 2.5)
+    - 1 * student_t_lccdf(0 | 3, 0, 2.5);
+}
+model {
+  // likelihood including constants
+  if (!prior_only) {
+    vector[Nsubgp_1[1]] gp_pred_1_1 = gp_exp_quad(Xgp_1_1, sdgp_1[1], lscale_1[1], zgp_1_1);
+    vector[Nsubgp_1[2]] gp_pred_1_2 = gp_exp_quad(Xgp_1_2, sdgp_1[2], lscale_1[2], zgp_1_2);
+    vector[Nsubgp_1[3]] gp_pred_1_3 = gp_exp_quad(Xgp_1_3, sdgp_1[3], lscale_1[3], zgp_1_3);
+    vector[Nsubgp_1[4]] gp_pred_1_4 = gp_exp_quad(Xgp_1_4, sdgp_1[4], lscale_1[4], zgp_1_4);
+    // initialize linear predictor term
+    vector[N] mu = rep_vector(0.0, N);
+    mu[Igp_1_1] += Cgp_1_1 .* gp_pred_1_1[Jgp_1_1];
+    mu[Igp_1_2] += Cgp_1_2 .* gp_pred_1_2[Jgp_1_2];
+    mu[Igp_1_3] += Cgp_1_3 .* gp_pred_1_3[Jgp_1_3];
+    mu[Igp_1_4] += Cgp_1_4 .* gp_pred_1_4[Jgp_1_4];
+    mu += Intercept;
+    for (n in 1:N) {
+      // add more terms to the linear predictor
+      mu[n] += r_1_1[J_1[n]] * Z_1_1[n];
+    }
+    target += normal_id_glm_lpdf(Y | Xc, mu, b, sigma);
+  }
+  // priors including constants
+  target += lprior;
+  target += std_normal_lpdf(zgp_1_1);
+  target += std_normal_lpdf(zgp_1_2);
+  target += std_normal_lpdf(zgp_1_3);
+  target += std_normal_lpdf(zgp_1_4);
+  target += std_normal_lpdf(z_1[1]);
+}
+generated quantities {
+  // actual population-level intercept
+  real b_Intercept = Intercept - dot_product(means_X, b);
+}

@@ -1,0 +1,224 @@
+---
+title: "Connectivity Paper"
+author: "CLB"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+library(here)
+source(here("Code/paths+packages.R"))
+library(sf)
+library(PerformanceAnalytics)
+library(corrr)
+library(cluster)
+library(factoextra)
+library(beepr)
+library(glue)
+library(cowplot)
+library(ggExtra)
+library(piecewiseSEM)
+library(easystats)
+set.seed(4) # For reproducibility
+gpSites <- c("#1b9e77", "#d95f02", "#7570b3")
+```
+
+```{r}
+sheet_id <- "1uQquFaVpRFs5y4UDBrqKtq1Oo3dW7zXLwFoIv-gle6g"
+sheet_names <- c("Talladega", "Paint Rock", "Weyerhaeuser")
+
+all_sheets <- map(sheet_names, \(name) {
+  read_sheet(sheet_id, sheet = name, col_types = "c") |>
+    mutate(Site = name)
+})
+
+seMaint <- bind_rows(all_sheets) |> 
+    janitor::clean_names() |> 
+  mutate(
+    temp_c = coalesce(temp_c, temperature_c),
+    stage_m = coalesce(staff_gauge_height_m, staff_gauge_height),
+    # Safely combine date + time
+    Date = mdy(date)
+  ) |> 
+  dplyr::select(Site = site, Date, connected = connected_and_flowing, upstream = upstream_tribs_flowing, site_notes, do_mg_l, stage_m, temp_c) |> 
+  mutate(
+    connected = str_to_lower(connected),
+    upstream = str_to_lower(upstream),
+    flow_state = case_when(
+      connected == "yes" ~ "Flowing",
+      connected == "no" & upstream == "yes" ~ "Pooled",
+      connected == "no" & upstream == "no" ~ "Dry",
+      TRUE ~ NA_character_
+    )
+  ) |> 
+  mutate(
+    flow_state = case_when(
+      (flow_state %in% c("Dry", NA)) &
+        str_detect(str_to_lower(site_notes), "\\b(flow|flowing|pool|pooled|isolated|low)\\b") ~ "Pooled",
+      TRUE ~ flow_state
+    )
+  ) |> 
+  dplyr::select(Site, Date, wetQf = flow_state) |> 
+  mutate(
+    Site = case_when(
+      str_starts(Site, "T") ~ "TAL",
+      str_starts(Site, "W") ~ "WHR",
+      str_starts(Site, "P") ~ "PRF",
+      TRUE ~ NA_character_
+    ))
+```
+
+```{r}
+
+# Load GP
+gpDat <- fread(here("Data/GP_dailyData.csv")) |>
+  dplyr::select(
+    -minDO.obs, -maxDO.obs, -avgDO.obs, -DO.hyp, -DO.amp,
+    -probHyp, -dayProbConc, -nightProbConc, -NHR_obs,
+    -dPercCon, -wetdry_SW
+  ) |>
+  mutate(Date = as_date(Date))
+
+# Load SE
+seDat <- fread(here("Data/SE_dailyData.csv")) |>
+  dplyr::select(
+    -minDO.obs, -maxDO.obs, -avgDO.obs, -DO.hyp, -DO.amp,
+    -probHyp, -dayProbConc, -nightProbConc, -NHR_obs, -maxPar, -avgPar
+  ) |>
+  mutate(Date = as_date(Date)) |>
+  full_join(seMaint)
+
+# Combine 
+allDat <- gpDat |>
+  full_join(seDat) |>
+  dplyr::select(-excProb, -DOSat.exc) |>
+  mutate(
+    waterYear = as.factor(calcWaterYear(Date)),
+    Season = as.factor(get_season(Date)),
+    Date = as.Date(Date),
+    DOY = as.numeric(format(Date, "%j")),
+         DOY_sin = sin(2 * pi * DOY / (365 + leap_year(Date))),
+         DOY_cos = cos(2 * pi * DOY / (365 + leap_year(Date)))
+  ) |>
+  dplyr::select(-totalDO, -DOSat.hyp, -cvDO.pctsat, -sdDO.pctsat, -DOSat.slope) |>
+  group_by(Site) |>
+  mutate(
+    excProb = calc_exceedance_prob(Q_1d, rm.Zero = TRUE),
+    DOSat.exc = calc_exceedance_prob(avgDO.pctsat, rm.Zero = TRUE)
+  ) |>
+  ungroup() |> 
+  filter(Date > as_date("2021-06-01"))
+
+conDat <- allDat |> 
+  select(Site, Date, minDO.pctsat, maxDO.pctsat, avgDO.pctsat,  PercWet_1d, Q_1d, percentConnected, upstream_length, AlphaCentrality, IntactStreamLength, ICSL, Harary) |> 
+  filter(Site %in% c("TAL", "WHR", "PRF", "KNZ")) |> 
+  write_csv(here("Data/ConnectivityPaper_Data.csv"))
+```
+
+## Plots
+
+```{r}
+# Filter and reshape data
+longDat <- conDat |>
+  group_by(Site) |>
+  complete(Date = seq(min(Date), max(Date), by = "1 days")) |>
+  arrange(Date) |>
+  ungroup() |>
+  pivot_longer(
+    cols = c(minDO.pctsat, maxDO.pctsat, avgDO.pctsat, AlphaCentrality, PercWet_1d),
+    names_to = "Metric",
+    values_to = "Value"
+  )
+
+# Custom labels
+metric_labels <- c(
+  "AlphaCentrality" = "Alpha Centrality",
+  "minDO.pctsat" = "Daily Min. DO Sat. (%)"
+)
+
+# Plot
+longDat |> 
+  filter(Site %in% c("TAL", "WHR", "PRF")) |> 
+  filter(Metric %in% c("AlphaCentrality", "minDO.pctsat")) |>
+  ggplot(aes(x = Date, y = Value)) +
+  geom_line(
+    data = \(df) df |> filter(Metric == "AlphaCentrality"),
+    color = "red"
+  ) +
+  geom_point(
+    data = \(df) df |> filter(Metric == "minDO.pctsat"),
+    color = "blue",
+    size = 1.5
+  ) +
+  labs(
+    title = "South East",
+    y = "Value",
+    x = "Date"
+  ) +
+  theme_few() +
+  facet_grid(Metric ~ Site, scales = "free_y",
+             labeller = labeller(Metric = as_labeller(metric_labels),
+                                 Site = label_value)
+             ) -> p
+p
+ggsave(filename = "SE_Connectivity.png", plot = p, path = here("Figs/"), device = "png", width = 25.4, height = 14.2875, units = "cm", dpi = "retina")
+
+```
+
+```{r}
+# Plot
+longDat |> 
+  filter(Site %in% c("KNZ", "SHN", "YMR")) |> 
+  filter(Metric %in% c("AlphaCentrality", "minDO.pctsat")) |>
+  ggplot(aes(x = Date, y = Value)) +
+  geom_line(
+    data = \(df) df |> filter(Metric == "AlphaCentrality"),
+    color = "red"
+  ) +
+  geom_point(
+    data = \(df) df |> filter(Metric == "minDO.pctsat"),
+    color = "blue",
+    size = 1.5
+  ) +
+  labs(
+    title = "Great Plains",
+    y = "Value",
+    x = "Date"
+  ) +
+  theme_few() +
+  facet_grid(Metric ~ Site, scales = "free_y",
+             labeller = labeller(Metric = as_labeller(metric_labels),
+                                 Site = label_value)
+             ) -> p
+p
+ggsave(filename = "GP_Connectivity.png", plot = p, path = here("Figs/"), device = "png", width = 25.4, height = 14.2875, units = "cm", dpi = "retina")
+
+```
+
+```{r}
+# Plot
+longDat |> 
+  filter(Metric %in% c("AlphaCentrality", "minDO.pctsat")) |>
+  ggplot(aes(x = Date, y = Value)) +
+  geom_line(
+    data = \(df) df |> filter(Metric == "AlphaCentrality"),
+    color = "red"
+  ) +
+  geom_point(
+    data = \(df) df |> filter(Metric == "minDO.pctsat"),
+    color = "blue",
+    size = 1.5
+  ) +
+  labs(
+    title = "",
+    y = "Value",
+    x = "Date"
+  ) +
+  theme_few() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_grid(Metric ~ Site, scales = "free_y",
+             labeller = labeller(Metric = as_labeller(metric_labels),
+                                 Site = label_value)
+             )
+```

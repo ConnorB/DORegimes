@@ -1,0 +1,346 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+#| echo: false
+library(tidyverse)
+library(googlesheets4)
+library(here)
+library(ggthemes)
+library(sf)
+library(tidygraph)
+library(igraph)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(units)
+library(tmap)
+library(osmdata)
+library(link2GI)
+library(nabor)
+library(mapview)
+library(riverdist)
+Sys.setenv(PATH = paste(file.path("/Applications/GRASS-8.4.app/Contents/Resources", "bin"), Sys.getenv("PATH"), sep = ":"))
+Sys.setenv(PATH = paste(Sys.getenv("PATH"),
+                        "/Applications/GRASS-8.4.app/Contents/Resources/scripts",
+                        sep = ":"))
+library(rgrass)
+initGRASS(
+  gisBase = "/Applications/GRASS-8.4.app/Contents/Resources",
+  gisDbase = "/Users/connor/grassdata",
+  location = "AIMS",  # Use the new location
+  mapset = "PERMANENT",
+  override = TRUE
+)
+tmp <- normalizePath(tempdir())
+```
+
+# Shape Files
+
+```{r}
+kmzStream <- st_read("~/Dropbox/AIMS/Konza/ShapeFiles/KMZ_Streams.shp")
+kmzNet <- st_read("~/Dropbox/AIMS/GISData/StreamNet/KMZNet.shp")
+
+shnStream <- st_read("~/Dropbox/AIMS/Shane/Results/ShapeFiles/SHN_Streams.shp")
+ymrStream <- st_read("~/Dropbox/AIMS/YMR/ShapeFiles/Youngmeyer_StreamNetwork.shp")
+```
+
+# Site Coords
+
+```{r}
+#| include: false
+
+# Load and transform points
+shnSites <- read_csv(here("Data/STICs/SHN_Coords.csv")) |> 
+  rename(siteId = siteID) |> 
+  st_as_sf(coords = c("long", "lat"), crs = 4326, remove = FALSE) |> 
+  st_transform(crs = st_crs(26914)) 
+shnSites |> 
+  st_write(file.path(tmp, "shnSites.shp"), delete_dsn = T)
+
+kmzSites <- read_csv(here("Metadata/ENVI_GP_approach3_20210603_20210812_V1.0.csv")) |> 
+  drop_na(siteId) |>
+  distinct(siteId, stic_sublocation, lat, long) |> 
+  #filter(stic_sublocation == "HS" | stic_sublocation == "LS") |> 
+  distinct(siteId, lat, long, .keep_all = T) |> 
+  st_as_sf(coords = c("long", "lat"), crs = 4326, remove = FALSE) |> 
+  st_transform(crs = st_crs(26914)) |> 
+  #filter(!siteId == "04M13") |> 
+  st_write(file.path(tmp, "kmzSites.shp"), delete_dsn = T)
+
+kmzSprings <- read_sheet("18p_obK7CgEkBvnOq2A91A9F-jVjY21dTJHhQsiLv7Ec") |>
+  select(siteId = Spring, lat = Lat, long = Long, ds_STIC = `Downstream STIC`) |>
+  drop_na(ds_STIC) |>
+  st_as_sf(coords = c("long", "lat"), crs = 4326, remove = FALSE) |>
+  st_transform(crs = st_crs(26914))
+
+kmzSites <- kmzSites |>
+  bind_rows(kmzSprings) |>
+    mutate(siteId = case_when(siteId == "04WS2" ~ "04SW2", T ~ siteId)) |>
+  st_write(file.path(tmp, "kmzSites.shp"), delete_dsn = T)
+
+kmzSnapped <- st_read("~/Dropbox/AIMS/GISData/Konza/kmzSTICsSnapped.shp")
+
+ymrSites <- read_csv(here("Metadata/AIMS_Site_Meta.csv")) |> 
+  filter(Watershed == "YMR") |> 
+  rename(lat = Lat, long = Long) |> 
+  select(siteId, lat, long) |> 
+   st_as_sf(coords = c("long", "lat"), crs = 4326, remove = FALSE) |> 
+  st_transform(st_crs(26914)) |> 
+  st_write(file.path(tmp, "ymrSites.shp"), delete_dsn = T)
+
+# Write spatial data to GRASS
+execGRASS("v.import", 
+          parameters = list(input = file.path(tmp, "shnSites.shp"),
+                            output = "shnSites"),
+          flags = "overwrite")
+
+execGRASS("v.import",
+          parameters = list(input = file.path(tmp, "kmzSites.shp"),
+                            output = "kmzSites"),
+          flags = "overwrite")
+
+execGRASS("v.import",
+          parameters = list(input = file.path(tmp, "ymrSites.shp"),
+                            output = "ymrSites"),
+          flags = "overwrite")
+
+```
+
+```{r}
+#| include: false
+
+# Add data to GRASS spatial database  
+execGRASS("v.import",
+          parameters = list(input = "/Users/connor/Library/CloudStorage/Dropbox/AIMS/YMR/ShapeFiles/Youngmeyer_StreamNetwork.shp",
+                            output = "ymrStreamNetwork"),
+          flags = "overwrite")
+
+execGRASS("v.import",
+          parameters = list(input = "/Users/connor/Library/CloudStorage/Dropbox/AIMS/Shane/Results/ShapeFiles/SHN_Streams.shp",
+                            output = "shnStreamNetwork"),
+          flags = "overwrite")
+
+execGRASS("v.import",
+          parameters = list(input = "/Users/connor/Library/CloudStorage/Dropbox/AIMS/Konza/ShapeFiles/KMZ_Streams.shp",
+                            output = "kmzStreamNetwork"),
+          flags = "overwrite")
+
+# Clean the stream networks
+execGRASS("v.clean",
+          parameters = list(input = "ymrStreamNetwork",
+                            output = "ymrStreamNetwork_clean",
+                            tool = "break"),  # Thresholds for the tools
+          flags = "overwrite")
+
+execGRASS("v.clean",
+          parameters = list(input = "shnStreamNetwork",
+                            output = "shnStreamNetwork_clean",
+                            tool = "break"), 
+          flags = "overwrite")
+
+
+execGRASS("v.clean",
+          parameters = list(input = "kmzStreamNetwork",
+                            output = "kmzStreamNetwork_clean",
+                            tool = "break"  ),
+          flags = "overwrite")
+```
+
+```{r}
+#| include: false
+
+ymrSites <- read_VECT("ymrSites") |> 
+  st_as_sf() |> 
+  select(-cat)
+kmzSites <- read_VECT("kmzSites") |> 
+  st_as_sf() |> 
+  select(-cat)
+shnSites <- read_VECT("shnSites") |> 
+  st_as_sf() |> 
+  select(-cat)
+
+ymrStream <- read_VECT("ymrStreamNetwork") |> 
+  st_as_sf() |> 
+  select(-cat)
+kmzStream <- read_VECT("kmzStreamNetwork") |> 
+  st_as_sf() |> 
+  select(-cat)
+shnStream <- read_VECT("shnStreamNetwork") |> 
+  st_as_sf() |> 
+  select(-cat)
+```
+
+```{r}
+kmz <- mapview(kmzStream, alpha.regions=0.02, color = "#0084a8", col.regions = "#0084a8", label = F, map.types = "Esri.WorldImagery") +
+  mapview(kmzSites, color = "red") 
+kmz
+shn <- mapview(shnStream, alpha.regions=0.02, color = "#0084a8", col.regions = "#0084a8", label = F, map.types = "Esri.WorldImagery") +
+  mapview(shnSites, color = "red") 
+shn
+ymr <- mapview(ymrStream, alpha.regions=0.02, color = "#0084a8", label = F, map.types = "Esri.WorldImagery") +
+  mapview(ymrSites, color = "red") 
+ymr
+```
+
+```{r}
+kmzRNet <- line2network(sf = kmzStream)
+shnRNet <- line2network(sf = shnStream)
+ymrRNet <- line2network(sf = ymrStream)
+
+plot(kmzRNet)
+plot(shnRNet)
+plot(ymrRNet)
+```
+
+```{r}
+# Use st_intersects to find which points intersect with the stream
+intersects <- st_intersects(kmzSnapped, kmzStream)
+
+# Convert the result to a logical vector (TRUE if the point intersects with any stream)
+intersects <- lengths(intersects) > 0
+
+# Filter the points to keep only those that intersect with the stream
+kmzSnapped <- kmzSnapped[intersects, ]
+
+kmz <- mapview(kmzStream, alpha.regions=0.02, color = "#0084a8", col.regions = "#0084a8", label = F, map.types = "Esri.WorldImagery") +
+  mapview(kmzSnapped, color = "red", col.regions = "red") 
+kmz
+```
+
+```{r}
+kmzPaths <- graph_from_literal(
+  "04M13" --+ "04M12",
+  "04M12" --+ "04M11",
+  "04M11" --+ "04M10",
+  "04M10" --+ "04M09",
+  "04M09" --+ "04M08",
+  "04T02" --+ "04M08",
+  "04M08" --+ "04M07",
+  "04M07" --+ "04M06",
+  "04T01" --+ "04M06",
+  "04M06" --+ "04M05",
+  "04M05" --+ "04M04",
+  "04M04" --+ "04M03",
+  "04M03" --+ "04M02",
+  "04M02" --+ "04M01",
+  "04M01" --+ "SFM02",
+  "04W04" --+ "04W03",
+  "04W03" --+ "04W02",
+  "04W02" --+ "04W01",
+  "04W01" --+ "04M01",
+  "02M11" --+ "02M10",
+  "02M10" --+ "02M09",
+  "02M09" --+ "02M08",
+  "02M08" --+ "02M07",
+  "02M07" --+ "02M06",
+  "02M06" --+ "02M05",
+  "02M05" --+ "02M04",
+  "02M04" --+ "02M03",
+  "02M03" --+ "02M02",
+  "02M02" --+ "02M01",
+  "02M01" --+ "SFM01",
+  "20M05" --+ "20M04",
+  "20M04" --+ "20M03",
+  "20M03" --+ "20M02",
+  "20M02" --+ "20M01",
+  "20M01" --+ "SFM07",
+  "01M06" --+ "01M05",
+  "01M05" --+ "01M04",
+  "01M04" --+ "01M03",
+  "01M03" --+ "01M02",
+  "01M02" --+ "01M01",
+  "01M01" --+ "SFM07",
+  "SFM07" --+ "SFM06",
+  "SFM06" --+ "SFM05",
+  "SFT02" --+ "SFM05",
+  "SFM05" --+ "SFM04",
+  "SFM04" --+ "SFM03",
+  "SFT01" --+ "SFM03",
+  "SFM03" --+ "SFM02",
+  "SFM02" --+ "SFM01",
+  
+  ## SPRINGS ##
+  "04S02" --+ "04M05",
+  "04S04" --+ "04M08",
+  "04SW2" --+ "04W03",
+  "04WS3" --+ "04W04",
+  "02S06" --+ "02M11",
+  "01S01" --+ "01M05"
+)
+# Convert sitePaths (igraph object) to a data frame with correct types
+kmzPaths <- as_data_frame(kmzPaths, what = "edges")
+
+```
+
+```{r}
+
+library(sfnetworks)
+plot(kmzNet)
+library(tidygraph)
+kmzSfNet <- as_sfnetwork(kmzNet)
+kmzSfNet
+plot(kmzSfNet)
+kmzSfNet <- kmzSfNet |>
+  st_network_blend(kmzSites)
+kmzSfNet
+plot(kmzSfNet)
+# 
+# kmzSfNet <- kmzSfNet |> 
+#   activate("edges") |>
+#   arrange(edge_length()) |>
+#   filter(!edge_is_multiple()) |>
+#   filter(!edge_is_loop())
+
+plot(kmzSfNet)
+kmzSfNet <- kmzSfNet |>
+  to_spatial_subdivision()
+kmzSfNet
+
+# Ensure site IDs are in kmzSfNet nodes
+t <- kmzSfNet |> 
+  activate("nodes") |> 
+  filter(!is.na(siteId)) 
+
+plot(t)
+```
+
+```{r}
+library(sf)
+library(dplyr)
+
+# Read the geometry from the sf object
+start_points <- st_geometry(kmzStream) |>
+  lapply(function(line) st_point(st_coordinates(line)[1, 1:2])) |>
+  st_sfc(crs = st_crs(kmzStream))
+
+# Convert to an sf object
+upstream_points <- st_sf(geometry = start_points, kmzStream)
+
+# Identify which points intersect with kmzSnapped
+intersections <- st_intersects(upstream_points, kmzSnapped)
+intersecting <- which(lengths(intersections) > 0)
+
+# Filter out the intersecting points
+upstream_points <- upstream_points[-intersecting, ]
+
+# Identify the most exterior upstream points
+# Create a matrix to store which points are downstream of others
+downstream_matrix <- st_intersects(upstream_points, upstream_points)
+
+# Identify points that are not downstream of any other points
+most_exterior <- sapply(downstream_matrix, function(x) length(x) == 1)
+
+# Filter to keep only the most exterior upstream points
+most_exterior_points <- upstream_points[most_exterior, ]
+
+
+# Plot to visualize
+plot(st_geometry(kmzStream), col = "grey", main = "Clipped Streamlines")
+plot(st_geometry(most_exterior_points), col = "blue", add = TRUE)
+plot(st_geometry(kmzSnapped), col = "red", pch = 20, add = TRUE)
+```
