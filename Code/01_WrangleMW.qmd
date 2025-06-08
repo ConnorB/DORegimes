@@ -25,8 +25,44 @@ API_Key <- "0ef96af1-5c5d-49a8-9868-8312ee0c703b"
 #| include: false
 siteInfo <- read_csv(here("Metadata/AIMS_Site_Meta.csv")) |> 
   filter(siteId %in% c("SFM01", "SHM01", "ENM01", "TLM01", "WHM01", "PRM01", "JSS01", "DSS01", "GSS01"))
-gbjShed <- st_read("~/Dropbox/AIMS/GISData/GibsonJack/GibsonJack.shp")
-gbjNet <- st_read("~/Dropbox/AIMS/GISData/GibsonJack/Gibson_network.shp")
+#gbjShed <- st_read("~/Dropbox/AIMS/GISData/GibsonJack/GibsonJack.shp")
+#gbjNet <- st_read("~/Dropbox/AIMS/GISData/GibsonJack/Gibson_network.shp")
+```
+
+# Q Data from SG
+
+```{r}
+mwQ_sg <- read_csv(here("Data/MW/Q_SG/Qstage_21to24_all.csv")) |> 
+  mutate(dateTime = as.POSIXct(DateTime, format = "%d%b%Y %I:%M:%S %p", tz = "US/Mountain"))
+
+
+
+mwQ_sg |> 
+  ggplot(aes(x = dateTime, y = Q)) +
+  see::geom_point2(alpha = 0.2, size = 1.5) +
+  theme_few() +
+  facet_wrap(~site, scales = "free_y", ncol = 1) +
+  labs(
+    title = "",
+    x = "",
+    y = "Discharge",
+  ) -> p
+p
+ggsave(filename = "mwQ.png", plot = p, path = "~/Desktop/", device = "png", width = 25.4, height = 14.2875, units = "cm", dpi = "retina")
+
+mwQ_sg |> 
+  ggplot(aes(x = dateTime, y = FS_stage)) +
+  see::geom_point2(alpha = 0.2, size = 1.5) +
+  theme_few() +
+  facet_wrap(~site, scales = "free_y", ncol = 1) +
+  labs(
+    title = "",
+    x = "",
+    y = "Stage",
+  ) -> p
+p
+ggsave(filename = "mwStage.png", plot = p, path = "~/Desktop/", device = "png", width = 25.4, height = 14.2875, units = "cm", dpi = "retina")
+
 ```
 
 # Field Sheets

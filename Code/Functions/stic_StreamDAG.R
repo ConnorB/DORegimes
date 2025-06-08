@@ -1,218 +1,112 @@
-st_snap_points <- function(x, y, namevar, max_dist = 1000) {
-  
-  # this evaluates the length of the data
-  if (inherits(x, "sf")) n = nrow(x)
-  if (inherits(x, "sfc")) n = length(x)
-  
-  # this part: 
-  # 1. loops through every piece of data (every point)
-  # 2. snaps a point to the nearest line geometries
-  # 3. calculates the distance from point to line geometries
-  # 4. retains only the shortest distances and generates a point at that intersection
-  out = do.call(c,
-                lapply(seq(n), function(i) {
-                  nrst = st_nearest_points(st_geometry(x)[i], y)
-                  nrst_len = st_length(nrst)
-                  nrst_mn = which.min(nrst_len)
-                  if (as.vector(nrst_len[nrst_mn]) > max_dist) return(st_geometry(x)[i])
-                  return(st_cast(nrst[nrst_mn], "POINT")[2])
-                })
-  )
-  # this part converts the data to a dataframe and adds a named column of your choice
-  out_xy <- st_coordinates(out) %>% as.data.frame()
-  out_xy <- out_xy %>% 
-    mutate({{namevar}} := x[[namevar]]) %>% 
-    st_as_sf(coords=c("X","Y"), crs=st_crs(x), remove=FALSE)
-  
-  return(out_xy)
-}
-
-
-
-load_and_preprocess_stics <- function(data_dir, site_id_col = "siteID", datetime_col = "datetime", wetdry_col = "wetdry") {
-  stics_data <- list.files(data_dir, pattern = "\\.csv$", full.names = TRUE, recursive = TRUE) |>
-    future_map(fread) |>
-    bind_rows() |>
-    select(siteId = !!sym(site_id_col), datetime = !!sym(datetime_col), wetdry = !!sym(wetdry_col)) |>
-    unique() |>
-    rename(dateTime = datetime) |>
-    group_by(siteId) |>
-    complete(dateTime = seq(min(dateTime), max(dateTime), by = "15 min")) |>
-    arrange(siteId, dateTime) |>
-    mutate(wetdry = zoo::na.locf(wetdry, na.rm = FALSE, maxgap = 8)) |>
-    ungroup() |>
-    filter(minute(dateTime) %% 15 == 0)
-  
-  return(stics_data)
-}
-
-
-stics_not_na <- function(presAbs) {
+# Function to remove STICs that record for less than some % of the total time
+stics_not_na <- function(presAbs, percThresh = 0.5, watershed = NULL) {
   presAbs <- as.data.frame(presAbs)
-  # Identify site columns (everything except 'date')
-  site_cols <- setdiff(colnames(presAbs), "date")
-  # Keep only site columns with at least 50% non-NA
-  valid_sites <- site_cols[colSums(!is.na(presAbs[site_cols])) >= 0.5 * nrow(presAbs)]
-  # Figure out what was dropped
+  # Identify site columns (everything except 'date' and 'watershed')
+  site_cols <- setdiff(colnames(presAbs), c("date", "watershed"))
+  total_stics <- length(site_cols)
+  # Calculate percentage recorded for each STIC
+  perc_recorded <- colSums(!is.na(presAbs[site_cols])) / nrow(presAbs)
+  # Keep only site columns with at least percThresh% non-NA
+  valid_sites <- site_cols[perc_recorded >= percThresh]
   lostSTICs <- setdiff(site_cols, valid_sites)
-  # Subset the dataframe
-  presAbs <- presAbs[, c("date", valid_sites)]
-  # Message for dropped sites
-  if (length(lostSTICs) > 0) {
-    message(
-      "STICs ",
-      paste(lostSTICs, collapse = ", "),
-      " measured less than 50% of the time and were removed."
-    )
+  # Always keep date and watershed columns if they exist
+  keep_cols <- c("date", valid_sites)
+  if ("watershed" %in% colnames(presAbs)) {
+    keep_cols <- c(keep_cols, "watershed")
   }
+  # Subset the dataframe
+  presAbs <- presAbs[, keep_cols, drop = FALSE]
+  # Generate summary messages using cli
+  if (!is.null(watershed)) {
+    cli::cli_h3("Watershed: {.val {watershed}}")
+  }
+  cli::cli_alert_info("Summary: {.val {total_stics}} total STICs, {.val {length(valid_sites)}} retained, {.val {length(lostSTICs)}} removed")
+  if (length(lostSTICs) > 0) {
+    cli::cli_alert_warning("Removed STICs (with % recorded):")
+    for (stic in lostSTICs) {
+      cli::cli_li("{.field {stic}} ({.val {round(perc_recorded[stic] * 100, 1)}}%)")
+    }
+  }
+  # Add blank line for better readability
+  cli::cli_text("")
+  # Return the cleaned data
   return(presAbs)
 }
 
+# Function to remove rows before stics were deployed and after stics were pulled
+trim_na_rows <- function(df) {
+  # Check which rows have all NAs (excluding 'date')
+  all_na_rows <- apply(select(df, -date), 1, function(x) all(is.na(x)))
+  # If all rows are NA, return an empty tibble (or keep 1 row if needed)
+  if (all(all_na_rows)) {
+    return(slice(df, 0))  # Returns 0 rows (or `slice(df, 1)` to keep 1 row)
+  }
+  # Find first and last non-NA row
+  first_non_na <- which.min(all_na_rows)  # First FALSE (non-NA)
+  last_non_na <- which.max(cumsum(!all_na_rows))  # Last non-NA
+  # Slice the tibble to remove leading/trailing NA rows
+  df |> 
+    slice(first_non_na:last_non_na)
+}
 
 
 # Function to do the gap filling, using the missForest package
 # From Rob
-STIC.RFimpute_parallel <- function(p.a, ...) {
+# STIC.RFimpute_parallel <- function(p.a, ...) {
+#   # Ensure input is a dataframe
+#   df <- as.data.frame(p.a, check.names = FALSE)
+#   # Identify datetime columns to preserve
+#   datetime_cols <- sapply(df, inherits, what = "Date") | sapply(df, inherits, what = "POSIXt")
+#   df_datetime <- df[, datetime_cols, drop = FALSE]
+#   df_to_impute <- df[, !datetime_cols, drop = FALSE]
+#   # Convert presence-absence columns to factors with levels 0 and 1
+#   df_to_impute[] <- lapply(df_to_impute, factor, levels = c(0, 1))
+#   # Run imputation
+#   progressr::with_progress({
+#     p <- progressr::progressor(steps = 1)
+#     mf <- missForest::missForest(xmis = df_to_impute, parallelize = "forests", ...)
+#     p()
+#   })
+#   # Reattach datetime columns
+#   result <- cbind(df_datetime, mf$ximp)
+#   # Ensure the column order is consistent with the original data
+#   result <- result[, colnames(df)]
+#   return(result)
+# }
+
+STIC.RFimpute_parallel <- function(p.a, nCores = parallel::detectCores() - 1, ...) {
+  # Register parallel backend (works cross-platform)
+  cl <- parallel::makeCluster(nCores)
+  doParallel::registerDoParallel(cl)
+  on.exit(parallel::stopCluster(cl))  # Ensure cluster stops
+  
   # Ensure input is a dataframe
   df <- as.data.frame(p.a, check.names = FALSE)
-  # Identify datetime columns to preserve
-  datetime_cols <- sapply(df, inherits, what = "Date") | sapply(df, inherits, what = "POSIXt")
+  
+  # Identify and preserve datetime columns
+  datetime_cols <- sapply(df, inherits, what = c("Date", "POSIXt"))
   df_datetime <- df[, datetime_cols, drop = FALSE]
   df_to_impute <- df[, !datetime_cols, drop = FALSE]
-  # Convert presence-absence columns to factors with levels 0 and 1
+  
+  # Convert to factors
   df_to_impute[] <- lapply(df_to_impute, factor, levels = c(0, 1))
-  # Run imputation
+  
+  # Run imputation with progress
   progressr::with_progress({
     p <- progressr::progressor(steps = 1)
-    mf <- missForest::missForest(xmis = df_to_impute, parallelize = "forests", ...)
+    mf <- missForest::missForest(
+      xmis = df_to_impute,
+      parallelize = "forests",
+      ...
+    )
     p()
   })
-  # Reattach datetime columns
+  
+  # Recombine results
   result <- cbind(df_datetime, mf$ximp)
-  # Ensure the column order is consistent with the original data
-  result <- result[, colnames(df)]
-  return(result)
+  result[, colnames(df)]  # Maintain original column order
 }
 
-calc_arc_prob <- function(network, daily_pres_abs) {
-  arc_daily_pres_abs <- arc.pa.from.nodes(network, daily_pres_abs[, -1])
-  marg_prob <- colMeans(arc_daily_pres_abs, na.rm = TRUE)
-  arc_prob <- cor(arc_daily_pres_abs, use = "pairwise.complete.obs")
-  arc_cor_prob <- R.bounds(marg_prob, arc_prob)
-  prob <- apply(arc_cor_prob, 2, mean)
-  
-  return(list(arc_daily_pres_abs = arc_daily_pres_abs, prob = prob))
-}
-
-calc_stream_dist <- function(stream_network, coords, tolerance = 1) {
-  stream_network |>
-    st_combine() |>
-    st_distance(coords, along = _) |>
-    `rownames<-`(coords$siteId) |>
-    `colnames<-`(coords$siteId) |>
-    as_tibble(rownames = "From") |>
-    pivot_longer(-From, names_to = "To", values_to = "dist_m") |>
-    mutate(Arcs = paste(From, "->", To),
-           dist_m = as.numeric(dist_m))
-}
-
-calc_arc_prob <- function(network, presAbs) {
-  arc_pres_abs <- arc.pa.from.nodes(network, presAbs)
-  marg_prob <- colMeans(arc_pres_abs, na.rm = TRUE)
-  arc_prob <- cor(arc_pres_abs, use = "pairwise.complete.obs")
-  arc_cor_prob <- R.bounds(marg_prob, arc_prob)
-  prob <- apply(arc_cor_prob, 2, mean)
-  
-  return(list(arc_pres_abs = arc_pres_abs, marg_prob = marg_prob))
-}
-
-
-# Function to calculate daily metrics:
-# upstream_length: sum of edge lengths upstream of the target site.
-# wet_nodes: number of nodes in the upstream subcomponent.
-# present_nodes: count of nodes (from the network) that are not NA.
-# total_nodes: total count of network nodes (even if NA).
-calculate_network_metrics <- function(network, lengths_data, pres_abs_data, site_id) {
-  # Extract node names from the network
-  node_names <- as_tbl_graph(network) |>
-    activate(nodes) |>
-    as_tibble() |>
-    pull(name)
-  
-  # Build the tidygraph with length attributes
-  graph <- as_tbl_graph(network) |>
-    activate(edges) |>
-    mutate(arc = paste0(node_names[from], " -> ", node_names[to])) |>
-    left_join(lengths_data, by = c("arc" = "Arcs"))
-  
-  # Reshape daily presence data to long format
-  daily_long <- pres_abs_data |>
-    pivot_longer(-date, names_to = "site", values_to = "present")
-  
-  # Function to calculate daily metrics
-  calculate_day_metrics <- function(day_data, graph_tbl, target_site) {
-    # Get network node names from the graph
-    nodes_in_graph <- graph_tbl |>
-      activate(nodes) |>
-      as_tibble() |>
-      pull(name)
-    
-    # Restrict day_data to nodes that are in the network
-    day_data_net <- day_data |>
-      filter(site %in% nodes_in_graph)
-    
-    total_nodes <- nrow(day_data_net)
-    present_nodes <- sum(!is.na(day_data_net$present))
-    
-    # Define active nodes as those with present == 1
-    active_sites <- day_data_net |>
-      filter(present == 1) |>
-      pull(site)
-    
-    # If target site is not active, return NA for upstream metrics
-    if (!(target_site %in% active_sites)) {
-      return(list(
-        upstream_length = -Inf,
-        wet_nodes = 0,
-        present_nodes = present_nodes,
-        total_nodes = total_nodes
-      ))
-    }
-    
-    # Create subgraph of active sites
-    subgraph <- graph_tbl |>
-      activate(nodes) |>
-      filter(name %in% active_sites)
-    
-    subgraph_igraph <- as.igraph(subgraph)
-    
-    # Identify all nodes upstream of target (including target itself)
-    upstream_nodes <- subcomponent(subgraph_igraph, target_site, mode = "in")
-    induced_subgraph <- induced_subgraph(subgraph_igraph, upstream_nodes)
-    
-    wet_nodes <- vcount(induced_subgraph)
-    upstream_length <- if (ecount(induced_subgraph) == 0) 0 else sum(E(induced_subgraph)$Lengths, na.rm = TRUE)
-    # Convert kilometers to meters
-    upstream_length <- upstream_length * 1000
-    
-    list(
-      upstream_length = upstream_length,
-      wet_nodes = wet_nodes,
-      present_nodes = present_nodes,
-      total_nodes = total_nodes
-    )
-  }
-  
-  # Calculate metrics for each day
-  result <- daily_long |>
-    group_by(date) |>
-    nest() |>
-    mutate(metrics = map(data, ~ calculate_day_metrics(.x, graph, site_id))) |>
-    unnest_wider(metrics) |> 
-    mutate(percentConnected = (wet_nodes/present_nodes)*100)
-  
-  return(result)
-}
 
 
 plot_sf_stics <- function(net, x, y, names, shapefile = NULL,  
@@ -262,33 +156,6 @@ plot_sf_stics <- function(net, x, y, names, shapefile = NULL,
     ggplot2::xlab("") + ggplot2::ylab("")
   
   return(g)
-}
-
-snap_points_to_lines <- function(points, lines) {
-  # Find the nearest line index for each point
-  nearest_line_idx <- st_nearest_feature(points, lines)
-  
-  # Snap each point to its nearest line
-  snapped_points <- vector("list", length = nrow(points))
-  
-  for (i in seq_len(nrow(points))) {
-    pt <- points[i, ]
-    nearest_line <- lines[nearest_line_idx[i], ]
-    
-    # Line from point to its projection on the line
-    nearest_line_seg <- st_nearest_points(pt, nearest_line)
-    
-    # Extract the projected point on the line
-    snapped_points[[i]] <- st_cast(nearest_line_seg, "POINT")[2]
-  }
-  snapped_points <- do.call(rbind, snapped_points)
-  # Combine into a single geometry column
-  snapped_sfc <- st_sfc(snapped_points, crs = st_crs(points))
-  
-  # Replace geometry in the input points object
-  snapped_sf <- st_set_geometry(points, snapped_sfc)
-  
-  return(snapped_sf)
 }
 
 

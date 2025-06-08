@@ -9,11 +9,11 @@ editor: visual
 #| include: false
 library(here)
 source(here("Code/paths+packages.R"))
-library(sf)
+
 library(PerformanceAnalytics)
 library(corrr)
+library(corrplot)
 library(cluster)
-library(factoextra)
 library(beepr)
 library(glue)
 library(cowplot)
@@ -27,11 +27,9 @@ gpSites <- c("#1b9e77", "#d95f02", "#7570b3")
 # Load Data
 
 ```{r}
-sheet_id <- "1uQquFaVpRFs5y4UDBrqKtq1Oo3dW7zXLwFoIv-gle6g"
-sheet_names <- c("Talladega", "Paint Rock", "Weyerhaeuser")
-
-all_sheets <- map(sheet_names, \(name) {
-  read_sheet(sheet_id, sheet = name, col_types = "c") |>
+sheet_id <- 
+all_sheets <- map(c("Talladega", "Paint Rock", "Weyerhaeuser"), \(name) {
+  read_sheet("1uQquFaVpRFs5y4UDBrqKtq1Oo3dW7zXLwFoIv-gle6g", sheet = name, col_types = "c") |>
     mutate(Site = name)
 })
 
@@ -72,9 +70,6 @@ seMaint <- bind_rows(all_sheets) |>
 ```
 
 ```{r}
-sites <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Sites")
-streams <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Streams")
-
 flowObs <- read_csv(here("Metadata/FlowObs.csv"))
 
 streamLight <- read_csv(here("Data/streamLight/predLight/all_sites_results.csv")) |> 
@@ -92,6 +87,7 @@ streamLight <- read_csv(here("Data/streamLight/predLight/all_sites_results.csv")
             avgPar = mean(PAR_surface, na.rm = TRUE),
             .groups = "drop")
 
+nasaET <- read_csv(here("Data/nasaET.csv"))
 # Load GP
 gpDat <- fread(here("Data/GP_dailyData.csv")) |>
   dplyr::select(
@@ -114,6 +110,7 @@ seDat <- fread(here("Data/SE_dailyData.csv")) |>
 # Combine 
 allDat <- gpDat |>
   full_join(seDat) |>
+  left_join(nasaET) |> 
   dplyr::select(-excProb, -DOSat.exc) |>
   mutate(
     waterYear = as.factor(calcWaterYear(Date)),
@@ -126,8 +123,8 @@ allDat <- gpDat |>
   dplyr::select(-totalDO) |>
   group_by(Site) |>
   mutate(
-    excProb = calc_exceedance_prob(Q_1d, rm.Zero = TRUE),
-    DOSat.exc = calc_exceedance_prob(avgDO.pctsat, rm.Zero = TRUE)
+    excProb = calc_exceedance_prob(Q_1d, rm.zero = TRUE),
+    DOSat.exc = calc_exceedance_prob(avgDO.pctsat, rm.zero = TRUE)
   ) |>
   ungroup()
 
@@ -147,53 +144,112 @@ flowThresh <- allDat |>
 # Assign flowState based on threshold
 allDat <- allDat |>
   left_join(flowThresh, by = "Site") |>
+  mutate(across(
+    .cols = matches("Depth_|maxDepth|minDepth"),
+    .fns = \(x) ifelse(x < 0, 0, x)
+  )) |> 
   mutate(
+    percentConnected = percentConnected/100,
     flowState = case_when(
       is.na(thresh) ~ NA_character_,
       Depth_1d > thresh ~ "Flowing",
       TRUE ~ "Pooled"
     )
-  )
+  ) |> 
+  select(-c(ICSL, AlphaCentrality, Harary, IntactStreamLength, upstream_length, percentConnected, PercWet_1d, PercWet_7d, PercWet_14d, PercWet_30d))
 
 rm(streamLight, gpDat, seDat, flowThresh, flowObs)
 
-allDat |> 
-  #filter(Site == "KNZ") |> 
-  ggplot(aes(x = DOY, y = water.temp)) +
-  geom_point(size = 3, alpha = 0.8) +
-  labs(
-    x = "DOY",
-    y = "Water Temp (\u00B0C)") +
-  theme_few() +
-  theme(
-    legend.position = "bottom",
-    legend.title = element_blank(),
-    strip.text = element_text(face = "bold")
-  ) +
-  facet_wrap(~Site, ncol = 2)
+## New Alpha centrality
+sticAC <- read_csv(here("Data/STICs/streamDAG_metrics.csv")) |> 
+  rename(Date = date, Site = watershed) |> 
+  filter(Site %in% c("KNZ", "SHN", "YMR", "TAL", "WHR", "PRF")) |> 
+  select(Site, Date, PercWet_1d = percent_network_wet, upstream_length = active_upstream_length, a_cent_weighted) |> 
+  mutate(upstream_length = ifelse(is.na(upstream_length), 0, upstream_length))
 
-allDat |> 
-  #filter(Site == "KNZ") |> 
-  ggplot(aes(x = DOY, y = avgPar)) +
-  geom_point(size = 3, alpha = 0.8, color = "darkgoldenrod1") +
-  labs(
-    x = "DOY",
-    y = expression(PAR~(mu*"mol m"^-2*"s"^-1))) +
-  theme_few() +
-  theme(
-    legend.position = "bottom",
-    legend.title = element_blank(),
-    strip.text = element_text(face = "bold")
-  ) +
-  facet_wrap(~Site, ncol = 2)
+
+allDat <- allDat |> 
+  left_join(sticAC) |> 
+  mutate(Q_1d = ifelse(is.na(Q_1d), 0, Q_1d))
+
 ```
 
-## 
+```{r}
+#| include: false
 
-## Check  autocorr
+numeric_vars <- allDat |>
+  dplyr::select(where(is.numeric)) |>
+  names() |>
+  setdiff("DOY")
+
+# Open a single PDF file
+pdf(here("Figs/allDat_plots_scaled.pdf"),
+    width = 8,
+    height = 6)
+
+# Generate and save plots to the PDF
+suppressMessages(lapply(numeric_vars, \(var) {
+  allDat |>
+    group_by(Site) |>
+    dplyr::mutate(across(where(is.numeric), ~ (. - mean(., na.rm = TRUE)) / sd(., na.rm = TRUE), .names = "{.col}")) |>
+    ungroup() |>
+    ggplot(aes(
+      x = Date,
+      y = !!sym(var),
+      color = Site
+    )) +
+    geom_line() +
+    labs(x = "", y = var) +
+    theme_few() +
+    scale_color_manual(values = okabeIto) +
+    scale_x_date() +
+    theme(
+      legend.position = "bottom",
+      legend.title = element_blank(),
+      strip.text = element_text(face = "bold")
+    ) |>
+    print()
+}))
+
+# Close the PDF
+dev.off()
+
+
+# Open a single PDF file
+pdf(here("Figs/allDat_plots.pdf"),
+    width = 8,
+    height = 6)
+
+# Generate and save plots to the PDF
+suppressMessages(lapply(numeric_vars, \(var) {
+  allDat |>
+    ggplot(aes(
+      x = Date,
+      y = !!sym(var),
+      color = Site
+    )) +
+    geom_line() +
+    labs(x = "", y = var) +
+    theme_few() +
+    scale_color_manual(values = okabeIto) +
+    scale_x_date() +
+    theme(
+      legend.position = "bottom",
+      legend.title = element_blank(),
+      strip.text = element_text(face = "bold")
+    ) |>
+    print()
+}))
+
+# Close the PDF
+dev.off()
+
+```
+
+## Autocorrelation
 
 ```{r}
-vars <- c("PPT_tot", "avgPar", "water.temp", "avgDO.pctsat", "headGradient", "DOpctsat.amp", "DOSat.exc", "PercWet", "AlphaCentrality", "upstream_length", "percentConnected","Depth", "Q", "excProb")
+vars <- c("ET_mm_day", "PPT_tot", "avgPar", "water.temp", "avgDO.pctsat", "headGradient", "DOpctsat.amp", "DOSat.exc", "PercWet", "a_cent_weighted", "upstream_length","Depth", "Q", "excProb")
  
 
 
@@ -280,18 +336,10 @@ p
 #ggsave(filename = "PACF.png", plot = p, path = here("Figs/"), device = "png", width = 25.4, height = 14.2875, units = "cm", dpi = "retina")
 ```
 
-# SEM
-
-```{r}
-source(here("Code/Functions/prune_sem.R"))
-```
-
 ## Correlation
 
 ```{r}
-library(corrplot)
-
-vars <- c("PPT_tot", "avgPar", "water.temp", "avgDO.pctsat", "headGradient", "flowState", "DOpctsat.amp", "DOSat.exc", "PercWet", "AlphaCentrality", "upstream_length", "percentConnected","Depth", "Q", "excProb")
+vars <- c("ET_mm_day", "PPT_tot", "avgPar", "water.temp", "avgDO.pctsat", "headGradient", "flowState", "DOpctsat.amp", "DOSat.exc", "PercWet", "a_cent_weighted", "upstream_length","Depth", "Q", "excProb", "DOY", "waterYear")
 
 
 semDat <- allDat |>
@@ -302,7 +350,7 @@ semDat <- allDat |>
   group_by(Site) |> 
   dplyr::mutate(
     across(
-      where(is.numeric) & !matches("PercWet|dPerc|DOY"), 
+      where(is.numeric), 
       ~ (. - mean(., na.rm = TRUE)) / sd(., na.rm = TRUE), 
       .names = "{.col}"
     )
@@ -361,7 +409,19 @@ dev.off()
 
 ```
 
+# Piecewise SEM
+
 ```{r}
+semDat <- allDat |>
+  rename_with(~ str_remove(.x, "_1d")) |> 
+  rename(PPT_tot = PPT) |> 
+  dplyr::select(Site, Date, avgDO.pctsat, all_of(vars), PPT_14d, ET_mm_day) |> 
+  filter(Site %in% c("KNZ", "SHN", "YMR")) |>
+  drop_na(DOSat.exc, avgDO.pctsat) 
+```
+
+```{r}
+source(here("Code/Functions/prune_sem.R"))
 # semDat <- semDat |>
 #   group_by(Site) |> 
 #   mutate(across(where(is.numeric), ~ scale(.)[, 1])) |>
@@ -376,221 +436,775 @@ domain_colors <- c(
 
 # Assign each variable to a domain
 var_domains <- c(
+  ET_mm_day = "Biology",
   avgPar = "Biology",
   PPT_14d = "Biology",
   water.temp = "Biology",
   upstream_length = "Hydrology",
   PercWet = "Hydrology",
+  alpha_cent = "Hydrology",
   Depth = "Hydrology",
+  excProb = "Hydrology",
   Q = "Hydrology",
   headGradient = "Hydrology",
   DOSat.exc = "DO",
-  DOpctsat.amp = "DO"
+  DOpctsat.amp = "DO",
+  avgDO.pctsat = "DO"
 )
+
+# Assign each variable to a domain
+var_labels <- c(
+  ET_mm_day = "ET",
+  avgPar = "PAR",
+  PPT_14d = "14 Day PPT",
+  water.temp = "Water Temp",
+  upstream_length = "Upstream Length",
+  PercWet = "% Network Wet",
+  alpha_cent = "Alpha Centrality",
+  Depth = "Depth",
+  excProb = "Exceedance Probability",
+  Q = "Discharge",
+  headGradient = "Head Gradient",
+  DOSat.exc = "DO Exceedance",
+  DOpctsat.amp = "DO Amplitude",
+  avgDO.pctsat = "Mean DO"
+)
+suppressWarnings(rm(acf_results, all_sheets, dat_long, p, pacf_results, seMaint, gpSites, okabeIto))
 ```
 
-### Global Model
+```{r}
+numeric_vars <- semDat |>
+  dplyr::select(where(is.numeric)) |>
+  names() |>
+  setdiff("DOY")
+
+# Generate one ggplot per numeric variable
+plots <- lapply(numeric_vars, \(var) {
+  semDat |>
+    ggplot(aes(x = DOY, y = !!sym(var), color = waterYear)) +
+    geom_point(size = 3, alpha = 0.8, na.rm = T) +
+    labs(
+      x = "DOY",
+      y = var
+    ) +
+    theme_few() +
+    theme(
+      legend.position = "bottom",
+      legend.title = element_blank(),
+      strip.text = element_text(face = "bold")
+    ) +
+    facet_wrap(~Site, ncol = 1)
+})
+
+# Optional: name plots list for easier reference
+names(plots) <- numeric_vars
+
+plots
+
+semDat |>
+  ggplot(aes(x = DOY, y = log(water.temp), color = waterYear)) +
+  geom_point(size = 3, alpha = 0.8, na.rm = T) +
+  labs(
+    x = "DOY",
+    y = "log(water.temp)"
+  ) +
+  theme_few() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    strip.text = element_text(face = "bold")
+  ) +
+  facet_wrap(~Site, ncol = 1)
+
+semDat |>
+  ggplot(aes(x = DOY, y = log(avgPar), color = waterYear)) +
+  geom_point(size = 3, alpha = 0.8, na.rm = T) +
+  labs(
+    x = "DOY",
+    y = "log(avgPar)"
+  ) +
+  theme_few() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    strip.text = element_text(face = "bold")
+  ) +
+  facet_wrap(~Site, ncol = 1)
+
+sem_vars <- c(
+  "ET_mm_day",
+  "avgPar", "PPT_14d",
+  "water.temp",
+  "upstream_length",
+  "PercWet",
+  "excProb",
+  "Depth",
+  "headGradient",
+  "DOSat.exc",
+  "DOpctsat.amp",
+  "avgDO.pctsat"
+)
+
+
+semDat |>
+  ggplot(aes(x = DOY, y = Depth, color = Site)) +
+  geom_point(size = 3, alpha = 0.8, na.rm = T) +
+  labs(
+    x = "DOY",
+    y = "log(water.temp)"
+  ) +
+  theme_few() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    strip.text = element_text(face = "bold")
+  ) +
+  facet_wrap(~waterYear, ncol = 1)
+```
 
 ```{r}
-library(piecewiseSEM)
+semDat <- allDat |>
+  rename_with(~ str_remove(.x, "_1d")) |> 
+  rename(PPT_tot = PPT) |> 
+  dplyr::select(Site, Date, avgDO.pctsat, all_of(vars), PPT_14d, ET_mm_day) |> 
+  filter(Site %in% c("KNZ", "SHN", "YMR")) |>
+  drop_na(DOSat.exc, avgDO.pctsat)
+
+semStd <- semDat |>
+  datawizard::standardize(select = -c(DOpctsat.amp, DOSat.exc))
+
+semDat |>
+  select(all_of(sem_vars)) |>
+  mutate(log_upstream_length = log1p(upstream_length)) |> 
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value") |>
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  facet_wrap(~ variable, scales = "free", ncol = 3) +
+  theme_minimal() +
+  labs(title = "Distributions of SEM Variables", x = NULL, y = "Count")
+
+
+semStd |>
+  select(all_of(sem_vars)) |>
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value") |>
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  facet_wrap(~ variable, scales = "free", ncol = 3) +
+  theme_modern() +
+  labs(title = "Distributions of SEM Variables", x = NULL, y = "Count")
+
+semDat |>
+  ggplot(aes(x = upstream_length)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  theme_modern() +
+  labs(title = "Distributions of Upstream Length", x = NULL, y = "Count")
+semStd |>
+  ggplot(aes(x = upstream_length)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  theme_modern() +
+  labs(title = "Distributions of Scaled Upstream Length", x = NULL, y = "Count")
+```
+
+# glmmTMB
+
+```{r}
+library(glmmTMB)
+semStd <- semStd |>
+  drop_na()
+
 # Biology
-avgPar <- lm(avgPar ~ PPT_14d, 
-             data = semDat)
-water.temp <- lm(water.temp ~ avgPar + PPT_14d, 
-                 data = semDat)
+ET_mm_day <- glmmTMB(
+  ET_mm_day ~ PPT_14d + avgPar + (1| Site) + (1 | Date),
+  data = semStd,
+  family = gaussian(link = "identity"),
+  control = glmmTMBControl(parallel = nCores)
+)
+
+water.temp <- glmmTMB(
+  water.temp ~ avgPar + PPT_14d + ET_mm_day + (1| Site) + (1 | Date),
+  data = semStd,
+  family = gaussian(),  # Approximately normal
+  control = glmmTMBControl(parallel = nCores)
+)
+
 # Network Connectivity
-upstream_length <- lm(upstream_length ~ water.temp + avgPar + PPT_14d, 
-                      data = semDat)
-PercWet <- lm(PercWet ~ water.temp + avgPar + PPT_14d, 
-              data = semDat)
+upstream_length <- glmmTMB(
+  upstream_length ~ water.temp + avgPar + PPT_14d + ET_mm_day +  (1|Site),
+  data = semStd,
+  family = gaussian(),
+  ziformula = ~1,
+  #family = gaussian(link = "identity"),  # Heavy right-skew
+  control = glmmTMBControl(parallel = nCores)
+)
+
+PercWet <- glmmTMB(
+  PercWet ~ water.temp + avgPar + PPT_14d + ET_mm_day + (1 | Site) + (1|Date),
+  data = semStd,
+  family = gaussian(link = "identity"),#beta_family(link = "logit"),  # (0, 1) bounded, multimodal
+  control = glmmTMBControl(parallel = nCores)
+)
 
 # Depth/Q
-Depth <-  lm(Depth ~ avgPar + water.temp + PPT_14d + upstream_length + PercWet, 
-             data = semDat)
-Q <-  lm(Q ~ Depth + avgPar + water.temp + PPT_14d + upstream_length + PercWet, 
-         data = semDat)
+excProb <- glmmTMB(
+  excProb ~ avgPar + water.temp + PPT_14d + upstream_length + PercWet + ET_mm_day + (1 | Site),
+  data = semStd,
+  family = gaussian(link = "identity"),#beta_family(link = "logit"),  # (0, 1) bounded
+  control = glmmTMBControl(parallel = nCores))
 
-headGradient <-  lm(headGradient ~ Depth + avgPar + water.temp + Q +  PPT_14d + upstream_length + PercWet, 
-                    data = semDat)
+headGradient <- glmmTMB(
+  headGradient ~ avgPar + water.temp + excProb + PPT_14d + PercWet + ET_mm_day + (1 | Site),
+  data = semStd,
+  family = gaussian(), # Bell-shaped with slight skew
+  control = glmmTMBControl(parallel = nCores))
 
-DOSat.exc <- lm(DOSat.exc ~ Depth + Q + water.temp + avgPar + upstream_length + PercWet + headGradient,
-                 data = semDat)
-                 
-DOpctsat.amp <- lm(DOpctsat.amp ~ Depth + Q + water.temp + avgPar + upstream_length + PercWet + headGradient + PPT_14d,
-                    data = semDat)
-# Fit the piecewise SEM
-all_fit <- psem(
-  # Biology
-  avgPar = avgPar,
+avgDO.pctsat <- glmmTMB(
+  avgDO.pctsat ~ water.temp + avgPar + excProb + headGradient + upstream_length + PercWet + PPT_14d + ET_mm_day + (1 | Site) + (1 | Date),
+  data = semStd,
+  family = gaussian(),#beta_family(link = "logit"),  # Uniform [0,1]
+  control = glmmTMBControl(parallel = nCores))
+
+DOpctsat.amp <- glmmTMB(
+  DOpctsat.amp ~ water.temp + avgPar + excProb + headGradient + upstream_length + PercWet + PPT_14d + ET_mm_day + (1 | Site),
+  data = semStd,
+  family = Gamma(link = "log"),
+  control = glmmTMBControl(parallel = nCores)
+)
+
+# Create a list of model objects
+model_list <- list(
+  ET_mm_day = ET_mm_day,
   water.temp = water.temp,
-  # Network Connectivity
   upstream_length = upstream_length,
   PercWet = PercWet,
-  # Depth/Q
-  Depth = Depth,
-  Q = Q,
+  excProb = excProb,
   headGradient = headGradient,
-  # DO
-  DOSat.exc = DOSat.exc,
-  DOpctsat.amp = DOpctsat.amp,
-  data = semDat
+  avgDO.pctsat = avgDO.pctsat,
+  DOpctsat.amp = DOpctsat.amp
 )
-all_fit |> summary()
 
-all_pruned <- prune_sem(sem_model =  all_fit, data = semDat)
-all_pruned |> summary()
+is_singular <- model_list |> lapply(check_singularity) |> bind_rows()
+convergence_issues <- model_list |> lapply(function(m) m$fit$convergence) |> bind_rows()
+inclass <- model_list |> lapply(icc) |> bind_rows()
+
+plots <- Map(function(name, model) {
+  model_parameters(model) |>
+    plot() +
+    ggtitle(name)
+}, names(model_list), model_list)
+
+# Display all plots
+plots
 
 
-plot_sem_graph(all_fit |> summary())
-plot_sem_graph(all_pruned |> summary())
-plot_psem_chord(all_fit, var_domains, domain_colors)
-plot_psem_chord(all_pruned, var_domains, domain_colors)
+# drop1_results <- lapply(model_list, function(mod) {
+#   tryCatch(
+#     drop1(mod, test = "Chisq"),
+#     error = function(e) e  # catch models where drop1 fails (e.g., zero-inflated)
+#   )
+# })
+#single_sem <- model_list |> lapply(function(m) summary(psem(m)))
+
+#Generate and store the check_model plots in a list
+plot_list <- model_list |> lapply(check_model)
+#plot_list |> lapply(print)
+pdf(here("Figs/sem_model_diagnostics.pdf"), width = 11, height = 8.5)
+invisible(plot_list |> lapply(print))
+dev.off()
+
+```
+
+```{r}
+
+all_mod <- psem(
+  ET_mm_day = ET_mm_day,
+  water.temp = water.temp,
+  upstream_length = upstream_length,
+  PercWet = PercWet,
+  excProb = excProb,
+  headGradient = headGradient,
+  avgDO.pctsat = avgDO.pctsat,
+  DOpctsat.amp = DOpctsat.amp,
+  avgDO.pctsat %~~% DOpctsat.amp,
+  PercWet %~~% upstream_length
+)
+all_summary <- summary(all_mod, standardize = "none") 
+
+pruned_mod <- remove_weak_paths(sem_model =  all_mod)
+
+pruned_summary <-  summary(pruned_mod, standardize = "none")  
+
+plot_sem_graph(all_summary, file = here("Figs/SEM/all_fit_sem.png"))
+plot_psem_chord(all_mod, var_domains, domain_colors, var_labels, file = here("Figs/SEM/all_fit_sem_chord.png"))
+
+plot_sem_graph(pruned_summary, file = here("Figs/SEM/pruned_fit_sem.png"))
+plot_psem_chord(pruned_mod, var_domains, domain_colors, var_labels, file = here("Figs/SEM/pruned_fit_sem_chord.png"))
+
+
+```
+
+## W/ Depth
+
+```{r}
+library(cowplot) # For arranging plots
+
+# Function to create biplots
+create_biplot <- function(response_var, predictors, data, title) {
+  # Create a long format dataframe for plotting
+  plot_data <- data.frame(
+    Response = data[[response_var]],
+    data[, predictors]
+  )
+  
+  # Convert to long format
+  plot_data_long <- tidyr::gather(plot_data, key = "Predictor", value = "Value", -Response)
+  
+  # Create the plot
+  ggplot(plot_data_long, aes(x = Value, y = Response)) +
+    geom_point2(alpha = 0.3, na.rm = T) +
+    geom_smooth(method = "lm", se = FALSE, color = "blue") +
+    facet_wrap(~ Predictor, scales = "free_x") +
+    labs(title = title, 
+         x = "Predictor Value", 
+         y = response_var) +
+    theme_modern() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+# Define predictors
+predictors <- c("water.temp", "avgPar", "excProb", "headGradient", 
+                "upstream_length", "PercWet", "PPT_14d", "ET_mm_day")
+
+# Create plots for DOSat.exc
+p1 <- create_biplot("DOSat.exc", predictors, semDat, "Unstandardized Data - DOSat.exc")
+p2 <- create_biplot("DOSat.exc", predictors, semStd, "Standardized Data - DOSat.exc")
+
+# Create plots for DOpctsat.amp
+p3 <- create_biplot("DOpctsat.amp", predictors, semDat, "Unstandardized Data - DOpctsat.amp")
+p4 <- create_biplot("DOpctsat.amp", predictors, semStd, "Standardized Data - DOpctsat.amp")
+
+# Arrange and display plots
+plot_grid(p1, p2)
+plot_grid(p3, p4)
+
+```
+
+```{r}
+semDat <- allDat |>
+  rename_with(~ str_remove(.x, "_1d")) |> 
+  rename(PPT_tot = PPT) |> 
+  dplyr::select(Site, Date, avgDO.pctsat, all_of(vars), PPT_14d, ET_mm_day) |> 
+  filter(Site %in% c("KNZ", "SHN", "YMR")) |>
+  drop_na(DOSat.exc, avgDO.pctsat)
+
+semStd <- semDat# |>
+  #datawizard::standardize(select = -c(DOpctsat.amp, DOSat.exc))
+
+semDat |>
+  select(all_of(sem_vars)) |>
+  mutate(log_upstream_length = log1p(upstream_length)) |> 
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value") |>
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  facet_wrap(~ variable, scales = "free", ncol = 3) +
+  theme_minimal() +
+  labs(title = "Distributions of SEM Variables", x = NULL, y = "Count")
+
+
+semStd |>
+  select(all_of(sem_vars)) |>
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value") |>
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  facet_wrap(~ variable, scales = "free", ncol = 3) +
+  theme_modern() +
+  labs(title = "Distributions of SEM Variables", x = NULL, y = "Count")
+
+semDat |>
+  ggplot(aes(x = upstream_length)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  theme_modern() +
+  labs(title = "Distributions of Upstream Length", x = NULL, y = "Count")
+semStd |>
+  ggplot(aes(x = upstream_length)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  theme_modern() +
+  labs(title = "Distributions of Scaled Upstream Length", x = NULL, y = "Count")
+```
+
+```{r}
+library(glmmTMB)
+semStd <- semStd |>
+  drop_na() |>
+  dplyr::mutate(
+    upstream_length = upstream_length + 0.001,
+    ET_mm_day = ET_mm_day + 0.001,
+    excProb = (excProb + 0.001) / 1.002,
+    PercWet = (PercWet + 0.001) / 100.002
+  )
+
+# Biology
+ET_mm_day <- glmmTMB(
+  ET_mm_day ~ PPT_14d + avgPar + (1| Site) + (1 | Date),
+  data = semStd,
+  family = Gamma(link = "log"),
+  control = glmmTMBControl(parallel = nCores)
+)
+
+water.temp <- glmmTMB(
+  water.temp ~ avgPar + PPT_14d + ET_mm_day + (1| Site) + (1 | Date),
+  data = semStd,
+  family = gaussian(),  # Approximately normal
+  control = glmmTMBControl(parallel = nCores)
+)
+
+# Network Connectivity
+upstream_length <- glmmTMB(
+  upstream_length ~ water.temp + avgPar + PPT_14d + ET_mm_day +  (1|Site),
+  data = semStd,
+  family = Gamma(link = "log"), ziformula = ~1,
+  #family = gaussian(link = "identity"),  # Heavy right-skew
+  control = glmmTMBControl(parallel = nCores)
+)
+
+PercWet <- glmmTMB(
+  PercWet ~ water.temp + avgPar + PPT_14d + ET_mm_day + (1 | Site) + (1|Date),
+  data = semStd,
+  family = beta_family(link = "logit"),
+  control = glmmTMBControl(parallel = nCores,
+                           optimizer = optim,
+                           optArgs = list(method="BFGS"))
+)
+
+# Depth/Q
+excProb <- glmmTMB(
+  excProb ~ avgPar + water.temp + PPT_14d + upstream_length + PercWet + ET_mm_day + (1 | Site),
+  data = semStd,
+  family = beta_family(link = "logit"),  # (0, 1) bounded
+  control = glmmTMBControl(parallel = nCores,
+                           optimizer = optim,
+                           optArgs = list(method="BFGS")))
+
+headGradient <- glmmTMB(
+  headGradient ~ avgPar + water.temp + excProb + PPT_14d + PercWet + ET_mm_day + (1 | Site),
+  data = semStd,
+  family = gaussian(), # Bell-shaped with slight skew
+  control = glmmTMBControl(parallel = nCores))
+
+avgDO.pctsat <- glmmTMB(
+  avgDO.pctsat ~ water.temp + avgPar + excProb + headGradient + upstream_length + PercWet + PPT_14d + ET_mm_day + (1 | Site),
+  data = semStd,
+  family = Gamma(link = "log"),#beta_family(link = "logit"),  # Uniform [0,1]
+  control = glmmTMBControl(parallel = nCores, 
+                           optimizer = optim,
+                           optArgs = list(method="BFGS")))
+
+DOpctsat.amp <- glmmTMB(
+  DOpctsat.amp ~ water.temp + avgPar + excProb + headGradient + upstream_length + PercWet + PPT_14d + ET_mm_day + (1 | Site),
+  data = semStd,
+  family = Gamma(link = "log"),
+  control = glmmTMBControl(parallel = nCores)
+)
+
+# Create a list of model objects
+model_list <- list(
+  ET_mm_day = ET_mm_day,
+  water.temp = water.temp,
+  upstream_length = upstream_length,
+  PercWet = PercWet,
+  excProb = excProb,
+  headGradient = headGradient,
+  avgDO.pctsat = avgDO.pctsat,
+  DOpctsat.amp = DOpctsat.amp
+)
+
+
+is_singular <- model_list |> lapply(check_singularity) |> bind_rows()
+convergence_issues <- model_list |> lapply(function(m) m$fit$convergence) |> bind_rows()
+inclass <- model_list |> lapply(icc) |> bind_rows()
+
+plots <- Map(function(name, model) {
+  model_parameters(model) |>
+    plot() +
+    ggtitle(name)
+}, names(model_list), model_list)
+
+# Display all plots
+plots
+
+
+# drop1_results <- lapply(model_list, function(mod) {
+#   tryCatch(
+#     drop1(mod, test = "Chisq"),
+#     error = function(e) e  # catch models where drop1 fails (e.g., zero-inflated)
+#   )
+# })
+#single_sem <- model_list |> lapply(function(m) summary(psem(m)))
+
+#Generate and store the check_model plots in a list
+plot_list <- model_list |> lapply(check_model)
+#plot_list |> lapply(print)
+pdf(here("Figs/sem_model_diagnostics.pdf"), width = 11, height = 8.5)
+invisible(plot_list |> lapply(print))
+dev.off()
+
+```
+
+# 
+
+```{r}
+
+all_mod <- psem(
+  ET_mm_day = ET_mm_day,
+  water.temp = water.temp,
+  upstream_length = upstream_length,
+  PercWet = PercWet,
+  excProb = excProb,
+  headGradient = headGradient,
+  avgDO.pctsat = avgDO.pctsat,
+  DOpctsat.amp = DOpctsat.amp,
+  avgDO.pctsat %~~% DOpctsat.amp,
+  PercWet %~~% upstream_length
+)
+all_summary <- summary(all_mod) 
+
+pruned_mod <- remove_weak_paths(sem_model =  all_mod)
+
+pruned_summary <-  summary(pruned_mod, standardize = "none")  
+
+plot_sem_graph(all_summary, file = here("Figs/SEM/all_fit_sem.png"))
+plot_psem_chord(all_mod, var_domains, domain_colors, var_labels, file = here("Figs/SEM/all_fit_sem_chord.png"))
+
+plot_sem_graph(pruned_summary, file = here("Figs/SEM/pruned_fit_sem.png"))
+plot_psem_chord(pruned_mod, var_domains, domain_colors, var_labels, file = here("Figs/SEM/pruned_fit_sem_chord.png"))
+
+
+```
+
+```{r}
+
+```
+
+### 
+
+```{r}
+
 ```
 
 ### Pooled Model
 
 ```{r}
-pooledDat <- semDat |> 
-  filter(flowState == "Pooled")
 
-# Biology
-avgPar <- lm(avgPar ~ PPT_14d, 
-             data = pooledDat)
-water.temp <- lm(water.temp ~ avgPar + PPT_14d, 
-                 data = pooledDat)
-# Network Connectivity
-upstream_length <- lm(upstream_length ~ water.temp + avgPar + PPT_14d, 
-                      data = pooledDat)
-PercWet <- lm(PercWet ~ water.temp + avgPar + PPT_14d, 
-              data = pooledDat)
-
-# Depth/Q
-Depth <-  lm(Depth ~ PPT_14d + upstream_length + PercWet, 
-             data = pooledDat)
-Q <-  lm(Q ~ Depth + PPT_14d + upstream_length + PercWet, 
-         data = pooledDat)
-
-headGradient <-  lm(headGradient ~ Depth + Q +  PPT_14d + upstream_length + PercWet, 
-                    data = pooledDat)
-
-DOSat.exc <- lm(DOSat.exc ~ Depth + Q + water.temp + avgPar + upstream_length + PercWet + headGradient,
-                 data = pooledDat)
-                 
-DOpctsat.amp <- lm(DOpctsat.amp ~ Depth + Q + water.temp + avgPar + upstream_length + PercWet + headGradient,
-                    data = pooledDat)
-# Fit the piecewise SEM
-pooled_fit <- psem(
-  # Biology
-  avgPar = avgPar,
-  water.temp = water.temp,
-  # Network Connectivity
-  upstream_length = upstream_length,
-  PercWet = PercWet,
-  # Depth/Q
-  Depth = Depth,
-  Q = Q,
-  headGradient = headGradient,
-  # DO
-  DOSat.exc = DOSat.exc,
-  DOpctsat.amp = DOpctsat.amp,
-  data = pooledDat
-)
-# To summarize results
-pooled_fit |>
-  summary()
-
-pooled_pruned <- prune_sem(sem_model =  pooled_fit, data = pooledDat)
-pooled_pruned |>
-  summary()
-plot_sem_graph(pooled_fit |> summary())
-plot_sem_graph(pooled_pruned |> summary())
-plot_psem_chord(pooled_fit, var_domains, domain_colors)
-plot_psem_chord(pooled_pruned, var_domains, domain_colors)
 ```
 
 ### Flowing Model
 
 ```{r}
-flowingDat <- semDat |> 
-  filter(flowState == "Flowing")
 
-# Biology
-avgPar <- lm(avgPar ~ PPT_14d, 
-             data = flowingDat)
-water.temp <- lm(water.temp ~ avgPar + PPT_14d, 
-                 data = flowingDat)
-# Network Connectivity
-upstream_length <- lm(upstream_length ~ water.temp + avgPar + PPT_14d, 
-                      data = flowingDat)
-PercWet <- lm(PercWet ~ water.temp + avgPar + PPT_14d, 
-              data = flowingDat)
-
-# Depth/Q
-Depth <-  lm(Depth ~ PPT_14d + upstream_length + PercWet, 
-             data = flowingDat)
-Q <-  lm(Q ~ Depth + PPT_14d + upstream_length + PercWet, 
-         data = flowingDat)
-
-headGradient <-  lm(headGradient ~ Depth + Q +  PPT_14d + upstream_length + PercWet, 
-                    data = flowingDat)
-
-DOSat.exc <- lm(DOSat.exc ~ Depth + Q + water.temp + avgPar + upstream_length + PercWet + headGradient,
-                 data = flowingDat)
-                 
-DOpctsat.amp <- lm(DOpctsat.amp ~ Depth + Q + water.temp + avgPar + upstream_length + PercWet + headGradient,
-                    data = flowingDat)
-# Fit the piecewise SEM
-flowing_fit <- psem(
-  # Biology
-  avgPar = avgPar,
-  water.temp = water.temp,
-  # Network Connectivity
-  upstream_length = upstream_length,
-  PercWet = PercWet,
-  # Depth/Q
-  Depth = Depth,
-  Q = Q,
-  headGradient = headGradient,
-  # DO
-  DOSat.exc = DOSat.exc,
-  DOpctsat.amp = DOpctsat.amp,
-  data = flowingDat
-)
-# To summarize results
-flowing_fit |>
-  summary()
-flowing_pruned <- prune_sem(sem_model =  flowing_fit, data = flowingDat)
-flowing_pruned |>
-  summary()
-
-plot_sem_graph(flowing_fit |> summary())
-plot_sem_graph(flowing_pruned |> summary())
-plot_psem_chord(flowing_fit, var_domains, domain_colors)
-plot_psem_chord(flowing_pruned, var_domains, domain_colors)
 ```
 
 ```{r}
+relabel_path <- function(path, labels) {
+  # Replace variable names in "response ~ predictor" format
+  for (old in names(labels)) {
+    new <- labels[[old]]
+    path <- gsub(paste0("\\b", old, "\\b"), new, path)
+  }
+  path
+}
 
 ## Flowing and Pooled Model Fit
-all_fit |>
-  summary()
-all_pruned |>
-  summary()
-lapply(all_fit, residuals) |> 
-  purrr::imap(~plot(.x, main = paste("Residuals:", .y)))
-## Pooled Model Fit
-pooled_fit |>
-  summary()
-lapply(pooled_fit, residuals) |> 
-  purrr::imap(~plot(.x, main = paste("Residuals:", .y)))
-pooled_pruned |>
-  summary()
+pruned_summary
+pooled_pruned_summary
+flowing_pruned_summary
 
-## Flowing Model Fit
-flowing_fit |>
-  summary()
-lapply(flowing_fit, residuals) |> 
-  purrr::imap(~plot(.x, main = paste("Residuals:", .y)))
-flowing_pruned |>
-  summary()
+# List your SEM model summaries
+sem_models <- list(
+  Both = pruned_summary,
+  Pooled = pooled_pruned_summary,
+  Flowing = flowing_pruned_summary
+)
+
+# Extract all unique paths across models
+extract_paths <- function(sem_summary) {
+  coefs <- sem_summary$coefficients
+  paste(coefs$Response, "˿", coefs$Predictor)
+}
+
+# Collect all paths from all models
+all_paths <- sem_models |>
+  lapply(extract_paths) |>
+  unlist() |>
+  unique() |>
+  sort()
+
+# Build a presence matrix
+path_matrix <- sapply(sem_models, function(sem_summary) {
+  model_paths <- extract_paths(sem_summary)
+  all_paths %in% model_paths
+})
+
+# Convert to a data frame for better readability
+path_table <- data.frame(
+  Path = all_paths,
+  as.data.frame(path_matrix)
+)
+
+# Optionally, convert logicals to checkmarks for display
+path_table_formatted <- path_table |>
+  dplyr::mutate(across(-Path, ~ ifelse(.x, "✅", "❌")))
+
+# Keep only rows where pooled and flowing differ
+diff_paths <- path_table[path_table$Pooled != path_table$Flowing, ]
+diff_paths <- diff_paths |> 
+  dplyr::mutate(across(-Path, ~ ifelse(.x, "✅", "❌")))
+
+# Use HTML subscript formatting
+var_labels <- c(
+  "DOpctsat.amp" = "DO<sub>% Sat</sub> Amplitude",
+  "DOSat.exc" = "DO<sub>% Sat</sub> Exceedance",
+  "PPT_14d" = "2 Week Precip",
+  "upstream_length" = "Upstream Length",
+  "water.temp" = "Temp",
+  "headGradient" = "Head Gradient",
+  "excProb" = "Exceedance Probability",
+  "PercWet" = "% Network Wet"
+)
+
+# Relabel paths
+diff_paths <- diff_paths |>
+  mutate(Path = relabel_path(Path, var_labels))
+
+# Create HTML table and preview
+path_kable <- diff_paths |>
+  kable(format = "html", escape = FALSE,  # <- allow HTML tags
+        align = "lccc", col.names = c("Path", "Both", "Pooled", "Flowing")) |>
+  kable_styling("striped", full_width = FALSE)
+
+# Save as temporary HTML
+html_file <- tempfile(fileext = ".html")
+save_kable(path_kable, file = html_file)
+
+# High-resolution screenshot using zoom (2x or 3x usually looks great)
+webshot2::webshot(
+  url = html_file,
+  file = here("Figs/PathTable.png"),
+  zoom = 6      # Try 2 or 3 for better resolution
+)
+
+
+
+# View the table
+diff_paths |>
+  tibble::as_tibble() |>
+  print(n = Inf)
+library(kableExtra)
+path_kable <- diff_paths |>
+  tibble::as_tibble() |>
+  kable(format = "html", align = "lccc", col.names = c("Path", "Both", "Pooled", "Flowing")) |> 
+  kable_styling("striped", full_width = F)
+
+# Save as temporary HTML
+html_file <- tempfile(fileext = ".html")
+save_kable(path_kable, file = html_file)
+
+# High-resolution screenshot using zoom (2x or 3x usually looks great)
+webshot2::webshot(
+  url = html_file,
+  file = here("Figs/PathTable.png"),
+  zoom = 6      # Try 2 or 3 for better resolution
+)
+
+coef_pooled <- pooled_pruned_summary$coefficients
+coef_flowing <- flowing_pruned_summary$coefficients
+merged_coefs <- full_join(
+  coef_pooled |> select(1:8) |> mutate(model = "pooled") |> select(Response, Predictor, Estimate, Std.Estimate, model),
+  coef_flowing |> select(1:8)  |> mutate(model = "flowing") |> select(Response, Predictor, Estimate, Std.Estimate, model),
+  by = c("Response", "Predictor"),
+  suffix = c("_pooled", "_flowing")
+)
+
+changed_paths <- merged_coefs |>
+  filter(
+    sign(Std.Estimate_pooled) != sign(Std.Estimate_flowing) |
+      abs(Std.Estimate_pooled - Std.Estimate_flowing) > 0.25
+  ) |> 
+  mutate(
+    direction_changed = sign(Std.Estimate_pooled) != sign(Std.Estimate_flowing),
+    abs_diff = abs(Std.Estimate_pooled - Std.Estimate_flowing),
+    mean_abs = (abs(Std.Estimate_pooled) + abs(Std.Estimate_flowing)) / 2,
+    percent_diff = ifelse(mean_abs == 0, NA, 100 * abs_diff / mean_abs)
+  ) |> 
+  select(-model_pooled, -model_flowing)
+```
+
+```{r}
+# Select numeric predictors (excluding response variables)
+sem_vars <- c(
+  "avgPar", "PPT_14d",
+  "water.temp",
+  "upstream_length",
+  "PercWet",
+  "excProb",
+  "headGradient",
+  "DOSat.exc",
+  "DOpctsat.amp"
+)
+
+semDat |>
+  select(all_of(sem_vars)) |>
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value") |>
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  facet_wrap(~ variable, scales = "free", ncol = 3) +
+  theme_minimal() +
+  labs(title = "Distributions of SEM Variables", x = NULL, y = "Count")
+
+sem_plot_data <- semDat |>
+  select(flowState, all_of(sem_vars), Site) |> 
+  group_by(Site) |>
+  dplyr::mutate(
+    across(
+      where(is.numeric),
+      ~ (. - mean(., na.rm = TRUE)) / sd(., na.rm = TRUE),
+      .names = "{.col}"
+    )
+  ) |>
+  ungroup()
+# Define response variables
+response_vars <- c("DOpctsat.amp", "DOSat.exc")
+
+# Get predictor vars (everything else in sem_vars)
+predictor_vars <- setdiff(sem_vars, response_vars)
+
+# Pivot to long format
+long_sem_data <- sem_plot_data |>
+  pivot_longer(cols = all_of(predictor_vars), names_to = "Predictor", values_to = "x") |>
+  pivot_longer(cols = all_of(response_vars), names_to = "Response", values_to = "y")
+
+# Example Plot: DOpctsat.amp faceted by Predictor and flowState
+plot_amp <- long_sem_data |>
+  filter(Response == "DOpctsat.amp") |>
+  ggplot(aes(x = x, y = y)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  facet_grid(flowState ~ Predictor, scales = "free") +
+  labs(x = "", y = "DOpctsat.amp") +
+  theme_few(base_size = 20)
+
+# Example Plot: DOSat.exc faceted by Predictor and flowState
+plot_exc <- long_sem_data |>
+  filter(Response == "DOSat.exc") |>
+  ggplot(aes(x = x, y = y)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  facet_grid(flowState ~ Predictor, scales = "free") +
+  labs(x = "", y = "DOSat.exc") +
+  theme_few(base_size = 20)
+
+# Display plots
+plot_amp
+plot_exc
+
+ggsave(filename = "doAmpLM.png", plot = plot_amp, path = here("Figs/"), device = "png", width = 25.4, height = 14.2875, units = "in", dpi = 600)
+ggsave(filename = "doExcLM.png", plot = plot_exc, path = here("Figs/"), device = "png", width = 25.4, height = 14.2875, units = "in", dpi = 600)
 ```

@@ -54,22 +54,10 @@ okabeIto <- c("#0072B2", "#E69F00", "#CC79A7", "#009E73", "#56B4E9", "#D55E00", 
 # Project Specific
 
 #### Functions ----------------------------------------------------------
-function_files <- list.files(c("~/Dropbox/R/Functions"),
-                             full.names = T)
-lapply(function_files, source)
-
-# mode
-get_mode <- function(x) {
-  x <- x[!is.na(x)]
-  if (length(x) == 0) return(NA)
-  ux <- unique(x)
-  counts <- tabulate(match(x, ux))
-  modes <- ux[counts == max(counts)]
-  sample(modes, 1)  # break ties randomly
-}
-
-
+# function_files <- list.files(c("~/Dropbox/R/Functions"),
+#                              full.names = T)
+# lapply(function_files, source)
 
 #### Clean Up -----------------------------------------------------------
-rm(function_files)
+#rm(function_files)
 

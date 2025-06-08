@@ -1,0 +1,212 @@
+---
+title: "Site Map"
+author: "CLB"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+library(data.table)
+library(tidyverse, warn.conflicts = F)
+library(dataRetrieval)
+library(styler)
+library(scales)
+library(here)
+library(knitr)
+library(lubridate)
+library(dygraphs)
+library(cowplot)
+library(zoo)
+library(ggpubr)
+library(ggthemes)
+library(ggpmisc)
+library(ggforce)
+library(ggrepel)
+library(Gmisc)
+#library(patchwork)
+library(RColorBrewer)
+library(sf)
+library(sfheaders)
+library(terra)
+library(FedData)
+library(tidyterra)
+library(whitebox)
+library(stars)
+library(mapview) # needs to be dev version:    remotes::install_github("r-spatial/mapview")
+library(ggspatial)
+```
+
+```{r}
+sites <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Sites") |> 
+  filter(siteId %in% c("SFM01", "SHM01", "ENM01"))
+```
+
+```{r}
+# Read and transform USA shapefile
+usShape <- st_read(here("Data/USA_Shp/cb_2018_us_state_500k.shp")) |>
+  filter(!STUSPS %in% c("AK", "AS", "VI", "HI", "GU", "MP", "PR")) |>
+  st_transform("ESRI:102003")
+
+# Extract Kansas
+ksShape <- usShape |> filter(STUSPS == "KS")
+
+# Read in site data
+sites <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Sites") |>
+  filter(siteId %in% c("SFM01", "SHM01", "ENM01") & watershed != "KNG") |> 
+  st_transform("ESRI:102003")
+
+stics <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Sites") |>
+  filter(watershed %in% c("KNZ", "SHN", "YMR")) 
+
+streams <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Streams") |>
+  filter(watershed != "KNG") 
+watersheds <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Watersheds") |>
+  filter(watershed != "KNG")
+
+site_colors <- c("KNZ" = "#0072B2", "SHN" = "#E69F00", "YMR" = "#CC79A7")
+
+ksStreams <- st_read(here("Data/kansas_streams/kansas_streams_order3_9_webmerc.shp")) %>% 
+  st_transform("ESRI:102003")
+
+
+
+library(tmap)
+
+# Set tmap to plotting mode (not interactive)
+tmap_mode("plot")
+
+# Define custom colors
+site_colors <- c("KNZ" = "#0072B2", "SHN" = "#E69F00", "YMR" = "#CC79A7")
+ks <- tm_shape(ksShape) +
+  tm_polygons(fill = "white", 
+              col = "black", 
+              lwd = 8) +
+  tm_shape(ksStreams) + 
+  tm_lines(col = "#6c84a8", 
+           lwd = "STRAHLER",
+           lwd.scale = tm_scale_categorical(values = c(0.5, 1, 1.5, 2, 2.5, 3, 3.5)*1.5),  # Remove breaks argument
+           lwd.legend = tm_legend(show = FALSE)) +  # Hide line width legend
+  tm_shape(sites) +
+  tm_symbols(fill = "watershed",                                          
+             size = 2, shape = 21,
+             fill.scale = tm_scale_categorical(values = site_colors),      
+             col = "black") +
+  tm_labels("watershed",  
+            size = 5,
+            options = opt_tm_labels(
+              point.label = TRUE,
+              remove_overlap = FALSE,
+              point.label.method = "GA"
+            )) +
+tm_layout(
+  legend.show = FALSE,
+  frame = FALSE,
+  bg.color = NA,               
+  outer.bg.color = NA          
+)
+
+# Save with transparent background
+tmap_save(ks, here("Figs/SFS_25/KS_Map.png"), 
+          height = 25.4, width = 25.4, units = "in",
+          bg = "transparent")
+```
+
+```{r}
+
+knzElev  <- terra::rast("~/Dropbox/AIMS/GIS/Results/KNZ_DEM.tif")
+shnElev  <- terra::rast("~/Dropbox/AIMS/GIS/Results/SHN_DEM.tif")
+ymrElev  <- terra::rast("~/Dropbox/AIMS/GIS/Results/YMR_DEM.tif")
+
+# Create separate maps manually
+library(gridExtra)
+# Create separate maps for each watershed with elevation
+create_watershed_map <- function(watershed_name, elev_raster, watershed_poly, streams_data, sites_data, stic_data) {
+  
+  # Crop and mask elevation to watershed boundary
+  elev_cropped <- crop(elev_raster$original_dem, watershed_poly)
+  elev_masked <- mask(elev_cropped, watershed_poly)
+  
+  # Filter data for this watershed
+  watershed_streams <- streams_data[streams_data$watershed == watershed_name, ]
+  watershed_sites <- sites_data[sites_data$watershed == watershed_name, ]
+  watershed_stics <- stic_data[stic_data$watershed == watershed_name, ]
+  watershed_colors <- site_colors[watershed_name]
+  
+  # Create map with valid palette but no legend
+  tm_shape(elev_masked) +
+    tm_raster(col_alpha = 0.8,
+              col.scale = tm_scale_continuous(values = terrain.colors(10)),
+              col.legend = tm_legend(show = FALSE)) +  # Hide elevation legend
+  tm_shape(watershed_poly) +
+    tm_borders(col = "black", lwd = 2) +
+  tm_shape(watershed_streams) +
+    tm_lines(col = "#6c84a8", lwd = 4) +
+  tm_shape(watershed_sites) +
+    tm_symbols(col = watershed_colors, size = 3, shape = 21, border.col = "black",
+               col.legend = tm_legend(show = FALSE)) +  # Hide symbols legend
+    tm_shape(watershed_stics) +
+    tm_symbols(col = "red", size = 1, shape = 21, border.col = "black",
+               col.legend = tm_legend(show = FALSE)) +
+  tm_title(watershed_name, size = 5) +
+  tm_layout(
+    frame = FALSE
+  )
+}
+
+# Create maps for each watershed
+knz_poly <- watersheds[watersheds$watershed == "KNZ", ]
+shn_poly <- watersheds[watersheds$watershed == "SHN", ]
+ymr_poly <- watersheds[watersheds$watershed == "YMR", ]
+
+map_knz <- create_watershed_map("KNZ", knzElev, knz_poly, streams, sites, stics)
+map_shn <- create_watershed_map("SHN", shnElev, shn_poly, streams, sites, stics)
+map_ymr <- create_watershed_map("YMR", ymrElev, ymr_poly, streams, sites, stics)
+
+# Arrange maps vertically
+ws <- tmap_arrange(map_knz, map_shn, map_ymr)
+
+tmap_save(ws, here("Figs/SFS_25/WS_Map.png"), height = 12.7, width =  25.4, units = "in", bg = "transparent")
+```
+
+```{r}
+# Create the inset map
+insetMap <-  ggplot() +
+  geom_sf(data = usShape, fill = "white", color = "black", linewidth = 0.25) +
+  geom_sf(data = ksShape, fill = NA, color = "red", linewidth = 1) +
+  labs(x = NULL, y = NULL) +
+  theme_void() + 
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.ticks.length = unit(0, "pt"),
+        axis.title=element_blank(),
+        panel.background = element_rect(fill = "white"))
+
+# Main map with inset
+siteMap <- ggplot() +
+  geom_sf(data = ksShape, fill="#ffffff", color="black", linewidth=0.25) +
+  geom_sf(data = ksStreams, color = "#6c84a8")+
+  geom_sf(data = allSites, aes(color = Site), size = 5, shape = 20) +
+  scale_color_manual(values = c("KMZ" = "#345023", "Kings Creek Gage" = "#596C0B", "YMR" = "#3A1F46", "Elk River Gage" = "#7F4B89")) +
+  geom_label_repel(data = allSites, aes(label = Site, geometry = geometry),
+                   stat = "sf_coordinates", size = 5, fill = "white") +
+  ggspatial::annotation_scale(style = "ticks", line_width = 1.5, text_face = "bold")+
+  ggspatial::annotation_north_arrow(style = north_arrow_minimal(), pad_x = unit(-0.25, "cm"), pad_y = unit(0.5, "cm"))+
+  theme_few()+
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title.y = element_blank(),
+        legend.position = "none",
+        text = element_text(size = 20),       # Increase overall text size
+        axis.title = element_text(size = 20), # Increase axis titles size
+        axis.text = element_text(size = 20),  # Increase axis text size
+        strip.text = element_text(size = 20)  # Increase facet labels size) 
+        )
+#siteMap
+siteMap2 <- ggdraw() +
+  draw_plot(siteMap) +
+  draw_plot(insetMap, x = 0.15, y = 0.62, width = 0.3, height = 0.3)
+
+ggsave("siteMap.png", siteMap2, here("Figs/"), device = "png",  width = 9, height = 6, units = "in", dpi = "retina")
+
+```

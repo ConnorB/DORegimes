@@ -25,6 +25,8 @@ gpGeopkg <- "~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg"
 # EPSG for NAD83 / UTM zone 14N
 UTM_14N <- 26914
 source(here("Code/AIMS_DAGs.R"))
+source(here("Code/Functions/aims.R"))
+source(here("Code/Functions/stic_StreamDAG.R"))
 ```
 
 ```{r}
@@ -210,7 +212,7 @@ pts <- pts |>
   pivot_longer(-dateTime, names_to = "siteId", values_to = "wet_PT") |>
   mutate(siteId = str_remove(siteId, "_PT$"))
 
-sticsRaw <- sticsRaw |> 
+sticsRaw <- sticsRaw |>
   pivot_longer(-dateTime, names_to = "siteId", values_to = "wet_STIC")
 
 # 2. Join and coalesce values
@@ -274,6 +276,28 @@ dailyPercWet <- stics_wide |>
   filter(!is.na(PercWet_1d) & !is.na(dPercWet_1d)) |> 
   write_csv(here("Data/gpDailyPercWet.csv"))
 
+percWet_15 <- stics_wide |>
+  pivot_longer(-dateTime, names_to = "siteId", values_to = "wetdry") |> 
+  left_join(coords |> select(siteId, watershed) |> st_drop_geometry(), by = "siteId") |> 
+  group_by(watershed, dateTime) |>                                
+  summarize(
+    PercWet = sum(wetdry == 1, na.rm = TRUE) / sum(!is.na(wetdry)),
+    n_stics = n_distinct(siteId[!is.na(wetdry)]),
+    tot_stics = n_distinct(siteId),  # ← counted from all sites present on that day in this watershed
+    pct_coverage = n_stics / tot_stics,
+    .groups = "drop"
+  ) |> 
+  mutate(PercWet = case_when(is.na(PercWet)~0, T~PercWet)) |> 
+  #filter(! & !is.na(dPercWet_1d)) |> 
+  write_csv(here("Data/gp15minPercWet.csv"))
+
+percWet_15 |>
+  ggplot(aes(dateTime, PercWet)) +
+  geom_point() +
+  theme_few() +
+    theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))+
+  facet_wrap(~watershed, scales = "free", ncol = 1) 
 
 dailyPercWet |>
   ggplot(aes(Date, PercWet_1d)) +
@@ -300,6 +324,179 @@ dailyPercWet |>
   facet_wrap(~watershed, scales = "free", ncol = 1)
 ```
 
+# Site % Wet
+
+```{r}
+# Set up parallel processing - adjust workers as needed
+plan(multisession, workers = availableCores() - 1)
+
+# Process data
+daily_mode <- stics_wide |>
+  mutate(date = as_date(dateTime),
+         DOY = lubridate::yday(date)) |>
+  # Keep original date for gap calculation
+  group_by(DOY) |>
+  summarise(across(
+    where(is.numeric),
+    ~ preMetabolizer::calc_mode(.x, na.rm = TRUE)[1],
+    .names = "{.col}"
+  ), 
+  date = first(date)) |>  # Preserve date for gap calculation
+  ungroup() |>
+  arrange(date) |>  # Ensure chronological order
+  mutate(across(
+    where(is.numeric) & !matches("DOY|date"),
+    ~ case_when(.x == 1 ~ "Wet", .x == 0 ~ "Dry", TRUE ~ NA_character_)
+  )) |>
+  mutate(across(
+    where(is.character) & !matches("DOY|date"),
+    ~ {
+      # Convert to numeric index for gap calculation
+      rle <- rle(is.na(.x))
+      cum_length <- cumsum(rle$lengths)
+      # Identify fillable gaps (<10 days)
+      fillable <- rle$values & 
+        (rle$lengths < 10) & 
+        (lag(rle$lengths, default = 0) > 0) & 
+        (lead(rle$lengths, default = 0) > 0
+      # Create fill vector
+      fill_vec <- rep(NA, length(.x))
+      for(i in which(fillable)) {
+        start_idx <- ifelse(i == 1, 1, cum_length[i-1] + 1)
+        end_idx <- cum_length[i]
+        fill_vec[start_idx:end_idx] <- "Filled"
+      }
+      # Perform the fill
+      filled <- .x
+      filled[fill_vec == "Filled"] <- na.locf(filled, na.rm = FALSE)[fill_vec == "Filled"]
+      filled[fill_vec == "Filled"] <- na.locf(filled, fromLast = TRUE, na.rm = FALSE)[fill_vec == "Filled"]
+      filled
+    }
+  )) |>
+  select(-date) |>  # Remove temporary date column
+  pivot_longer(
+    cols = -DOY,
+    names_to = "siteId",
+    values_to = "wet_dry"
+  )
+
+# Join with site coordinates
+daily_map <- daily_mode |>
+  left_join(coords, by = "siteId") |>
+  sf::st_as_sf() |>  # Convert to sf before filtering to keep geometry for all sites
+  mutate(watershed = case_when(
+    watershed == "KNZ" ~ "Kings Creek",
+    watershed == "SHN" ~ "Shane Creek",
+    watershed == "YMR" ~ "Youngmeyer",
+    TRUE ~ watershed
+  ))
+
+# Get all unique watersheds
+unique_watersheds <- unique(daily_map$watershed)
+
+# Create temporary directory for all watershed frames
+tmp_dir <- tempfile("frames_")
+dir.create(tmp_dir)
+
+# Function to process a single watershed with device management
+process_watershed <- function(watershed_name, daily_map, stream, tmp_dir) {
+  # Explicitly open and close devices for each plot
+  on.exit(while (dev.cur() > 1) dev.off(), add = TRUE)
+  
+  # Filter data for current watershed
+  daily_map_ws <- daily_map |> 
+    filter(watershed == watershed_name) |> 
+    mutate(DateLabel = as.Date(DOY, origin = "1999-12-31"),
+           MonthDay = format(DateLabel, "%B %d"))
+  
+  stream_ws <- stream |> 
+    filter(watershed == case_when(
+      watershed_name == "Kings Creek" ~ "KNZ",
+      watershed_name == "Shane Creek" ~ "SHN",
+      watershed_name == "Youngmeyer" ~ "YMR",
+      TRUE ~ watershed_name
+    ))
+  
+  # Create subdirectory for this watershed's frames
+  ws_dir <- file.path(tmp_dir, watershed_name)
+  dir.create(ws_dir, showWarnings = FALSE)
+  
+  # Identify all unique sites for this watershed
+  all_sites <- daily_map_ws |> 
+    st_drop_geometry() |> 
+    distinct(siteId) |> 
+    pull(siteId)
+  
+  # Generate individual frames
+  unique_days <- unique(daily_map_ws$DateLabel)
+  png_files <- file.path(ws_dir, sprintf("frame_%03d.png", seq_along(unique_days)))
+  
+  for (i in seq_along(unique_days)) {
+    day <- unique_days[i]
+    
+    day_data <- daily_map_ws |> 
+      filter(DateLabel == day) |> 
+      complete(siteId = all_sites) |> 
+      sf::st_as_sf()
+    
+    day_label <- unique(na.omit(day_data$MonthDay))
+    
+    # Explicit device management
+    png(png_files[i], width = 1080, height = 1080)
+    
+    p <- ggplot() +
+      geom_sf(data = stream_ws, color = "#0084A8", size = 1.5) +
+      geom_sf(data = day_data |> filter(!is.na(wet_dry)),
+              aes(color = wet_dry), size = 6) +
+      geom_sf(data = day_data |> filter(is.na(wet_dry)),
+              shape = 1, size = 6, color = "gray50") +  # Hollow circles for NA sites
+      scale_color_manual(values = c("Dry" = "#D55E00", "Wet" = "#009E73"),
+                        drop = FALSE) +
+      labs(title = watershed_name,
+           subtitle = day_label) +
+      ggthemes::theme_few() +
+      theme(
+        plot.title = element_text(size = 30, face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(size = 25, hjust = 0.5),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        legend.text = element_text(size = 20),
+        axis.text = element_text(size = 20),  
+        plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm")
+      )
+    
+    print(p)
+    dev.off()
+  }
+  
+  # Combine frames into GIF
+  output_gif <- paste0("~/Desktop/wet_dry_animation_", 
+                      gsub(" ", "_", watershed_name), ".gif")
+  gifski(png_files, 
+         output_gif,
+         width = 1080, 
+         height = 1080, 
+         delay = 0.2)
+  
+  return(output_gif)
+}
+
+# Process watersheds in parallel with progress bar
+message("Processing watersheds in parallel...")
+output_gifs <- future_map(unique_watersheds, 
+                         ~process_watershed(.x, daily_map, stream, tmp_dir),
+                         .options = furrr_options(seed = TRUE, 
+                                                packages = c("tidyverse", "sf", "gifski")),
+                         .progress = TRUE)
+
+# Clean up
+unlink(tmp_dir, recursive = TRUE)
+
+# Print results
+message("\nSuccessfully created animations:")
+walk(output_gifs, ~message("- ", .x))
+```
+
 # StreamDAG
 
 ```{r}
@@ -319,7 +516,7 @@ daily_presAbs <- stics |>
   ) |>
   filter(!is.na(watershed)) |>
   group_by(watershed, siteId, date) |>
-  summarise(wetdry = get_mode(wetdry), .groups = "drop") |>
+  summarise(wetdry = calc_mode(wetdry), .groups = "drop") |>
   split(~watershed, drop = TRUE) |> 
   lapply(\(df) {
     df |>
@@ -329,6 +526,13 @@ daily_presAbs <- stics |>
         values_from = wetdry
       )
   })
+
+# Convert the list to a single dataframe with watershed column
+gpPresAbs <- bind_rows(daily_presAbs, .id = "watershed")
+
+# Write to CSV
+write_csv(gpPresAbs, here("Data/STICs/GP_DailyPresAbs.csv"))
+
 daily_presAbs <- daily_presAbs |> imap(\(df, ws) {
   site_data <- df |> select(-date)
   

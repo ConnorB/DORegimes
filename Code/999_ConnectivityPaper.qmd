@@ -74,7 +74,7 @@ seMaint <- bind_rows(all_sheets) |>
 # Load GP
 gpDat <- fread(here("Data/GP_dailyData.csv")) |>
   dplyr::select(
-    -minDO.obs, -maxDO.obs, -avgDO.obs, -DO.hyp, -DO.amp,
+    -DO.hyp, -DO.amp,
     -probHyp, -dayProbConc, -nightProbConc, -NHR_obs,
     -dPercCon, -wetdry_SW
   ) |>
@@ -83,7 +83,7 @@ gpDat <- fread(here("Data/GP_dailyData.csv")) |>
 # Load SE
 seDat <- fread(here("Data/SE_dailyData.csv")) |>
   dplyr::select(
-    -minDO.obs, -maxDO.obs, -avgDO.obs, -DO.hyp, -DO.amp,
+    -DO.hyp, -DO.amp,
     -probHyp, -dayProbConc, -nightProbConc, -NHR_obs, -maxPar, -avgPar
   ) |>
   mutate(Date = as_date(Date)) |>
@@ -104,14 +104,14 @@ allDat <- gpDat |>
   dplyr::select(-totalDO, -DOSat.hyp, -cvDO.pctsat, -sdDO.pctsat, -DOSat.slope) |>
   group_by(Site) |>
   mutate(
-    excProb = calc_exceedance_prob(Q_1d, rm.Zero = TRUE),
-    DOSat.exc = calc_exceedance_prob(avgDO.pctsat, rm.Zero = TRUE)
+    excProb = calc_exceedance_prob(Q_1d, rm.zero = TRUE),
+    DOSat.exc = calc_exceedance_prob(avgDO.pctsat, rm.zero = TRUE)
   ) |>
   ungroup() |> 
   filter(Date > as_date("2021-06-01"))
 
 conDat <- allDat |> 
-  select(Site, Date, minDO.pctsat, maxDO.pctsat, avgDO.pctsat,  PercWet_1d, Q_1d, percentConnected, upstream_length, AlphaCentrality, IntactStreamLength, ICSL, Harary) |> 
+  select(Site, Date, minDO.obs, maxDO.obs, avgDO.obs, Q_1d) |> 
   filter(Site %in% c("TAL", "WHR", "PRF", "KNZ")) |> 
   write_csv(here("Data/ConnectivityPaper_Data.csv"))
 ```

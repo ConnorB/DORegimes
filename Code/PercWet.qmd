@@ -1,0 +1,2477 @@
+---
+title: "STICs"
+author: "CLB"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+#| echo: false
+
+library(tidyverse)
+library(tidygraph)
+library(data.table)
+library(ggthemes)
+library(here)
+library(sf)
+library(streamDAG)
+library(furrr)
+library(future)
+library(riverdist)
+library(sfnetworks)
+library(gganimate)
+source(here("Code/paths+packages.R"))
+library(mapview)
+library(cli)
+library(whitebox)
+wbt_init(exe_path = "~/WBT/whitebox_tools")
+# EPSG for NAD83 / UTM zone 14N
+UTM_14N <- 26914
+source(here("Code/AIMS_DAGs.R"))
+source(here("Code/Functions/aims.R"))
+source(here("Code/Functions/stic_StreamDAG.R"))
+```
+
+# Streams and Sites
+
+```{r}
+# knzS <- st_read("~/Desktop/AIMS_GreatPlains.gpkg", layer = "Streams") |> 
+#   st_transform(crs = 4326)
+
+gpStreams <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Streams", quiet = T) |> 
+  filter(watershed %in% c("KNZ", "SHN", "YMR")) |> 
+  st_transform(crs = 4326)
+
+# Load sites
+gpSites <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Sites") |> 
+  filter(watershed %in% c("KNZ", "SHN", "YMR")) |> 
+  st_transform(crs = 4326) |> 
+  mutate(
+    lon = st_coordinates(geom)[, "X"],
+    lat  = st_coordinates(geom)[, "Y"]
+  ) 
+
+seSites <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_SouthEast.gpkg", layer = "sites") |> 
+  filter(!sublocation == "HW") |> 
+  st_transform(4326) |>
+  mutate(
+    lon = st_coordinates(geom)[, 1],
+    lat = st_coordinates(geom)[, 2]
+  ) 
+
+seStreams <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_SouthEast.gpkg", layer = "streams") |> 
+  st_transform(4326)
+
+
+mwSites <- st_read("~/Dropbox/AIMS/GIS/Results/GBJ.gpkg", layer = "Sites") |> 
+  st_transform(4326)
+mwStreams <- st_read("~/Dropbox/AIMS/GIS/Results/GBJ.gpkg", layer = "Streams") |> 
+  st_transform(4326)
+
+mapview(mwSites, map.types = "Esri.WorldImagery") +
+  mapview(mwStreams) +
+  mapview(mwSites,color = "green")
+
+data("AIMS.node.coords")
+
+mwSDsites <- AIMS.node.coords |> 
+  mutate(watershed = case_when(
+    startsWith(site, "D") ~ "DRC",
+    startsWith(site, "G") ~ "GBJ",
+    startsWith(site, "J") ~ "JDR",
+    TRUE ~ NA_character_  
+  )) |> 
+  drop_na(watershed) |> 
+  select(siteId = Object.ID, piezo, lat, long, watershed) |> 
+   st_as_sf(coords = c("long", "lat"), crs = 4326)
+```
+
+```{r}
+# First identify common columns we want to keep
+common_cols <- intersect(
+  names(gpSites), 
+  c("siteId", "slope", "twi", "drainage_area_sqkm", "outlet_dist_m", 
+    "elev_m", "watershed", "geom", "lon", "lat")
+)
+
+# Process seSites to match gpSites structure
+seSites <- seSites |>
+  mutate(
+    elev_m = elevation,
+    slope = slope_point,
+    outlet_dist_m = distance_from_outlet,
+    drainage_area_sqkm = drainage_area_m / 1000000  # Convert m² to km²
+  ) |>
+  # Select only the columns we want to keep
+  select(all_of(common_cols))
+
+# Process gpSites to match same column selection
+gpSites <- gpSites |>
+  select(all_of(common_cols))
+
+# Combine the two data frames
+allSites <- bind_rows(gpSites, seSites)
+
+# Combine streams
+allStreams <- list(
+  seStreams |> select(watershed),
+  gpStreams |> select(watershed),
+  mwStreams |> select(watershed)) |> 
+  bind_rows()
+
+# Add missing columns to mwSites, filled with NA
+mwSites <- mwSites |>
+  mutate(
+    slope = NA_real_,
+    twi = NA_real_,
+    drainage_area_sqkm = NA_real_,
+    outlet_dist_m = NA_real_,
+    elev_m = NA_real_,
+    watershed = as.character(watershed),  # ensure type match
+    lon = st_coordinates(geom)[, 1],
+    lat = st_coordinates(geom)[, 2]
+  ) |>
+  select(all_of(common_cols))  # enforce column order
+
+# Bind all sites together
+allSites <- bind_rows(allSites, mwSites)
+
+```
+
+# STICs
+
+```{r}
+gpPresAbs <- read_csv(here("Data/STICs/GP_DailyPresAbs.csv"))
+sePresAbs <- read_csv(here("Data/STICs/SE_DailyPresAbs.csv"))
+
+presAbs <- bind_rows(
+  gpPresAbs,
+  sePresAbs)  |> 
+  arrange(watershed, date)
+
+suppressWarnings(rm(gpSites, gpStreams, common_cols, seSites, seStreams, gpPresAbs, sePresAbs, gpGeopkg, UTM_14N))
+```
+
+## MW STICs
+
+```{r}
+mwStics <- read_csv(here("Data/MW/STICs/allmergedgjformatted_2022_2023_2024_version0.csv")) |> 
+  select(SiteID:qual_rating) |> 
+  rename(dateTime = datetime) |>
+  filter(qual_rating != "poor") |>
+  mutate(
+    wetdry = case_when(
+    wetdry %in% c("dry", "0") ~ 0,
+    wetdry %in% c("wet", "1") ~ 1,
+    TRUE ~ NA_real_)) |> 
+  select(dateTime, siteId = SiteID, wetdry) |> 
+  mutate(watershed = case_when(
+    startsWith(siteId, "D") ~ "DRC",
+    startsWith(siteId, "G") ~ "GBJ",
+    startsWith(siteId, "J") ~ "JDR",
+    TRUE ~ NA_character_  
+  ))
+
+gbjSites <- read_csv(here("Data/MW/STICs/allmergedgjformatted_2022_2023_2024_version0.csv")) |> 
+  select(siteId = SiteID, lat, long) |> 
+  distinct(siteId, lat, long) |> 
+  group_by(siteId) |>
+  summarise(
+    lat = mean(lat, na.rm = TRUE),
+    long = mean(long, na.rm = TRUE),
+    .groups = "drop"
+  ) |> 
+  mutate(watershed = "GBJ") |> 
+  write_csv("~/Dropbox/AIMS/GIS/scratch/gbjsites.csv")
+
+
+daily_presAbsMW <- mwStics |>
+  mutate(
+    date = as_date(dateTime)
+  ) |>
+  filter(!is.na(watershed)) |>
+  group_by(watershed, siteId, date) |>
+  summarise(wetdry = calc_mode(wetdry), .groups = "drop") |>
+  split(~watershed, drop = T) |> 
+  lapply(\(df) {
+    df |>
+      select(date, siteId, wetdry) |>
+      pivot_wider(
+        names_from = siteId,
+        values_from = wetdry
+      )
+  }) 
+daily_presAbsMW <- bind_rows(daily_presAbsMW, .id = "watershed") |> 
+  drop_na(date) |> 
+  mutate(GJ8 = coalesce(GJ8, GJ8b)) |> 
+  select(-GJ8b)
+
+
+presAbs <- presAbs |> 
+  bind_rows(daily_presAbsMW) |> 
+  arrange(watershed, date)
+
+allSites <- allSites |> 
+  filter(!(watershed %in% c("DRC", "JDR")))
+
+allStreams <- allStreams |> 
+  filter(!(watershed %in% c("DRC", "JDR")))
+
+presAbs <- presAbs |> 
+  filter(!(watershed %in% c("DRC", "JDR")))
+```
+
+# Stream Distance
+
+```{r}
+#| include: false
+# Function to compute arc lengths for a single watershed with UTM zone handling
+get_watershed_lengths <- function(watershed_name, sites, streams) {
+  # Subset data
+  ws_sites <- sites |> filter(watershed == watershed_name) 
+  ws_streams <- streams |> filter(watershed == watershed_name) 
+     
+  # Skip if fewer than 2 sites or no streams
+  if (nrow(ws_sites) < 2 || nrow(ws_streams) < 1) return(NULL)
+  
+  # Determine UTM zone EPSG
+  utm_epsg <- case_when(
+    watershed_name %in% c("SHN", "KNZ", "YMR") ~ 26914, # NAD83/UTM zone 14N
+    watershed_name %in% c("PRF", "TAL", "WHR") ~ 26916, # NAD83/UTM zone 16N
+    watershed_name %in% c("GBJ") ~ 26912, # NAD83/UTM zone 12N
+    watershed_name %in% c("JDR", "DRC") ~ 26911, # NAD83/UTM zone 12N
+    TRUE ~ NA_integer_
+  )
+  
+  if (is.na(utm_epsg)) {
+    warning(paste("No UTM zone defined for watershed:", watershed_name))
+    return(NULL)
+  }
+  
+  # Transform to appropriate UTM zone if not already
+  if (st_crs(ws_sites)$epsg != utm_epsg) {
+    ws_sites <- ws_sites |> st_transform(crs = utm_epsg)
+  }
+  
+  if (st_crs(ws_streams)$epsg != utm_epsg) {
+    ws_streams <- ws_streams |> st_transform(crs = utm_epsg)
+  }
+  
+
+  # Build network
+  net <- as_sfnetwork(ws_streams, directed = F) |>
+    st_network_blend(ws_sites, tolerance = 50) |>
+    activate("edges") |> 
+    mutate(weight = edge_length())
+  
+  # Get cost matrix
+  cost_mat <- net |>
+    st_network_cost(from = ws_sites, to = ws_sites, direction = "out", weights = "weight") |> 
+    units::drop_units()
+  
+  rownames(cost_mat) <- ws_sites$siteId
+  colnames(cost_mat) <- ws_sites$siteId
+  
+  # Format into long tibble
+  as.data.frame(as.table(cost_mat)) |>
+    rename(from = Var1, to = Var2, Length = Freq) |>
+    filter(is.finite(Length), Length > 0) |>
+    mutate(
+      Arc = paste(from, to, sep = "->"),
+      Length = as.numeric(Length),
+      watershed = watershed_name,
+      UTM_EPSG = utm_epsg
+    ) |>
+    select(watershed, Arc, Length) |>
+    as_tibble()
+}
+
+# Get list of unique watersheds
+watersheds <- intersect(unique(allSites$watershed), unique(allStreams$watershed))
+
+# Apply function across watersheds
+all_arc_lengths <- watersheds |> 
+  set_names() |>  # Name list by watershed
+  map(\(w) get_watershed_lengths(w, allSites, allStreams)) |> 
+  compact()  # Drop NULLs
+```
+
+```{r}
+#| include: false
+
+# Clean stic data
+nestPresAbs <- presAbs |> 
+  nest(data = -watershed) |> 
+  mutate(
+    data = map2(data, watershed, ~ {
+      # Trim leading/trailing NA rows
+      trimmed <- trim_na_rows(.x)
+      # Then drop columns that are all NA (except date)
+      cleaned <- select(trimmed, date, where(~ !all(is.na(.))))
+      # Add watershed column to the cleaned data
+      cleaned$watershed <- .y
+      # Process STICs and automatically print the summary
+      result <- stics_not_na(presAbs = cleaned, percThresh = 0.5, watershed = .y)
+      # Ensure watershed column is preserved in the result
+      if (!"watershed" %in% names(result)) {
+        result$watershed <- .y
+      }
+      return(result)
+    })
+  )
+
+doParallel::registerDoParallel(cores = nCores)
+
+# Gap fill 
+nestPresAbs_filled <- nestPresAbs |> 
+  mutate(
+    data = map(data, ~ {
+      # Remove watershed column if it exists
+      if ("watershed" %in% names(.)) {
+        . <- select(., -watershed)
+      }
+      STIC.RFimpute_parallel(.)
+    })
+  )
+
+# Remove dropped STICs from network and reconnect
+aimsNets <- imap(aimsNets, \(net, wshed) {
+  # Start watershed processing
+  cli_h1("Processing watershed: {.field {wshed}}")
+  # Extract watershed data
+  wshed_data <- nestPresAbs_filled |> 
+    filter(watershed == wshed) |> 
+    pull(data) |> 
+    first()
+  # Get nodes to keep (excluding date)
+  keep_nodes <- names(wshed_data)[names(wshed_data) != "date"]
+  original_nodes <- igraph::V(net)$name
+  # 1. Check for missing expected nodes
+  missing_in_net <- setdiff(keep_nodes, original_nodes)
+  if (length(missing_in_net) > 0) {
+    cli_alert_warning(paste(
+      "{.val {length(missing_in_net)}} nodes in data but not in network:",
+      "{.val {missing_in_net}}"
+    ))
+  }
+  # 2. Check for extra nodes in network
+  extra_in_net <- setdiff(original_nodes, keep_nodes)
+  cli_ul()
+  cli_li("Nodes being removed: {.val {length(extra_in_net)}}")
+  # 3. Actual nodes that will be kept
+  actual_keep <- intersect(keep_nodes, original_nodes)
+  cli_li("Nodes being kept: {.val {length(actual_keep)}}/{.val {length(keep_nodes)}}")
+  # 4. Edge counts
+  cli_li("Original edges: {.val {igraph::ecount(net)}}")
+  # Process network
+  filtered_net <- reconnect_and_remove_nodes(net, actual_keep)
+  cli_li("Filtered edges: {.val {igraph::ecount(filtered_net)}}")
+  cli_end()
+  # 5. Verify final node set
+  final_nodes <- igraph::V(filtered_net)$name
+  if (!setequal(final_nodes, actual_keep)) {
+    cli_alert_danger("Critical error: Final nodes don't match expected set")
+    stop("Node mismatch in watershed ", wshed)
+  }
+  cli_alert_success("Successfully processed {.field {wshed}}")
+  return(filtered_net)
+})
+```
+
+```{r}
+reconnect_and_remove_nodes_tidy <- function(graph, keep_nodes) {
+  g <- as.igraph(graph)
+
+  # Set node names to siteId before manipulating
+  site_ids <- graph |> activate("nodes") |> pull(siteId)
+  V(g)$name <- site_ids
+
+  remove_nodes <- setdiff(V(g)$name, keep_nodes)
+
+  for (v in remove_nodes) {
+    if (!v %in% V(g)$name) next
+
+    upstream <- igraph::neighbors(g, v, mode = "in")$name
+    downstream <- igraph::neighbors(g, v, mode = "out")$name
+
+    if (length(upstream) > 0 && length(downstream) > 0) {
+      new_edges <- expand.grid(from = upstream, to = downstream, stringsAsFactors = FALSE)
+      for (i in seq_len(nrow(new_edges))) {
+        from <- new_edges$from[i]
+        to <- new_edges$to[i]
+        if (from != to && !are_adjacent(g, from, to)) {
+          g <- add_edges(g, c(from, to))
+        }
+      }
+    }
+
+    g <- delete_vertices(g, v)
+  }
+  graph_out <- as_sfnetwork(g)
+  return(graph_out)
+}
+```
+
+# TidyNetworks
+
+```{r}
+# sink_nodes <- list(
+#   KNZ = "SFM01",
+#   SHN = "SHM01",
+#   YMR = "ENM01",
+#   PRF = "PRM01",
+#   TAL = "TLM01",
+#   WHR = "WHM01",
+#   GBJ = "GJ1"
+# )
+# # Step 1: Build the input tibble
+# network_inputs <- aims_edges |>
+#   mutate(
+#     crs = case_when(
+#       watershed %in% c("KNZ", "SHN", "YMR") ~ 26914,
+#       watershed %in% c("PRF", "TAL", "WHR") ~ 26916,
+#       watershed %in% c("GBJ") ~ 26912,
+#       watershed %in% c("JDR", "DRC") ~ 26911,
+#     ),
+#     sink_node = map_chr(watershed, \(ws) sink_nodes[[ws]]),
+#     sites = map2(
+#       watershed,
+#       crs,
+#       ~ allSites |> filter(watershed == .x) |> st_transform(.y)
+#     ),
+#     streams = map2(
+#       watershed,
+#       crs,
+#       ~ allStreams |> filter(watershed == .x) |> st_transform(.y)
+#     ),
+#     lengths = map(
+#   watershed,
+#   ~ {
+#     arc_df <- all_arc_lengths[[.x]]
+#     if (is.null(arc_df)) return(NULL)
+# 
+#     arc_df |>
+#       select(-watershed) |>
+#       separate(Arc, into = c("from", "to"), sep = "->") |>
+#       mutate(across(c(from, to), trimws), Length_km = Length / 1000) |>
+#       select(-Length)
+#   }
+#   ),
+#     presAbs = map(
+#       watershed,
+#       ~ nestPresAbs_filled |>
+#         filter(watershed == .x) |>
+#         unnest(cols = c(data)) |>
+#         select(c("watershed", "date"), any_of(
+#           allSites |> filter(watershed == .x) |> pull(siteId)
+#         ))
+#     ),
+#     marginal_probs = map2(presAbs, edges, \(node_df, edge_df) {
+#       node_df <- node_df |>
+#         mutate(across(-c(watershed, date), ~ as.numeric(as.character(.))))
+#       
+#       node_long <- node_df |>
+#         pivot_longer(-c(watershed, date),
+#                      names_to = "siteId",
+#                      values_to = "present")
+#       
+#       edge_cross <- expand_grid(date = unique(node_df$date), edge = seq_len(nrow(edge_df))) |>
+#         mutate(from_site = edge_df$from[edge], to_site = edge_df$to[edge]) |>
+#         select(-edge)
+#       
+#       arc_presence <- edge_cross |>
+#         left_join(node_long, by = c("date", "from_site" = "siteId")) |>
+#         rename(p_from = present) |>
+#         left_join(node_long, by = c("date", "to_site" = "siteId")) |>
+#         rename(p_to = present) |>
+#         mutate(
+#           arc_presence = case_when(
+#             p_from == 1 & p_to == 1 ~ 1,
+#             p_from == 0 & p_to == 0 ~ 0,
+#             is.na(p_from) | is.na(p_to) ~ NA_real_,
+#             TRUE ~ 0.5
+#           )
+#         )
+#       
+#       arc_presence |>
+#         group_by(from_site, to_site) |>
+#         summarise(prob_presence = mean(arc_presence, na.rm = TRUE),
+#                   .groups = "drop") |>
+#         mutate(
+#           arc_id = paste(from_site, to_site, sep = "->"),
+#           prob_presence = coalesce(prob_presence, min(prob_presence, na.rm = TRUE))
+#         )
+#     })
+#   )
+```
+
+```{r}
+# plan(multisession)
+# 
+# jdrDat <- get.AIMS.data("jd_full")
+# 
+# # Full workflow per watershed
+# network_results <- network_inputs |> 
+#   mutate(
+#     metrics = pmap(
+#       list(sites, edges, lengths, presAbs, watershed, sink_node),
+#       \(sites, edges, lengths, presAbs, net_name, sink_id) {
+#         message(glue::glue("Processing {net_name}..."))
+#         
+#         net <- tryCatch({
+#           # Check for bad edges
+#           valid_site_ids <- sites$siteId
+#           bad_edges <- edges |> filter(!(from %in% valid_site_ids) | !(to %in% valid_site_ids))
+#           
+#           # Warn if any bad edges found
+#           if (nrow(bad_edges) > 0) {
+#             message(glue::glue(
+#               "Invalid edges in {net_name}: ",
+#               paste0(bad_edges$from, "->", bad_edges$to, collapse = ", ")
+#             ))
+#           }
+#           
+#           # Filter out invalid edges
+#           edges <- edges |> filter(from %in% valid_site_ids, to %in% valid_site_ids)
+#           
+#           # Build the sfnetwork
+#           sfnetwork(
+#             nodes = sites,
+#             edges = edges,
+#             node_key = "siteId",
+#             directed = TRUE
+#           )
+#         }, error = function(e) {
+#           message("❌ Failed to create network for ", net_name, ": ", e$message)
+#           if (exists("bad_edges") && nrow(bad_edges) > 0) {
+#             message("Bad edges:\n", paste0(bad_edges$from, " -> ", bad_edges$to, collapse = "\n"))
+#           }
+#           return(NULL)
+#         })
+#         
+#         
+#         pa_nodes <- presAbs |> names() |> setdiff(c("watershed", "date"))
+#         
+#         pruned_net <- reconnect_and_remove_nodes_tidy(net, pa_nodes)
+#         
+#         node_table <- pruned_net |> 
+#           activate(nodes) |> 
+#           as_tibble() |> 
+#           mutate(index = row_number()) |> 
+#           select(index, siteId)
+#         
+#         edge_table <- pruned_net |> 
+#           activate(edges) |> 
+#           as_tibble() |> 
+#           mutate(edge_id = row_number()) |> 
+#           left_join(node_table, by = c("from" = "index")) |> 
+#           rename(from_site = siteId) |>
+#           left_join(node_table, by = c("to" = "index")) |> 
+#           rename(to_site = siteId)
+#         
+#         marg_probs <- network_inputs |> 
+#           filter(watershed == net_name) |> 
+#           pull(marginal_probs) |> 
+#           pluck(1)
+#         
+#         edge_table_weighted <- edge_table |> 
+#           left_join(lengths, by = c("from_site" = "from", "to_site" = "to")) |> 
+#           left_join(marg_probs, by = c("from_site", "to_site"))
+#         
+#         pruned_net <- pruned_net |> 
+#           activate(edges) |> 
+#           mutate(
+#             reach_length_km = edge_table_weighted$Length_km,
+#             weight = reach_length_km,
+#             prob_presence = edge_table_weighted$prob_presence
+#           ) |>
+#           activate(nodes) |> 
+#           mutate(
+#             weighted_ac = centrality_alpha(weights = reach_length_km),
+#             ac = centrality_alpha(weights = NA)
+#           )
+#         
+#         long_data <- presAbs |>
+#           pivot_longer(cols = -c(watershed, date), 
+#                        names_to = "siteId", 
+#                        values_to = "present") |>
+#           filter(present == 1) |>
+#           group_by(date)
+#         
+#         data_list <- group_split(long_data)
+#         key_df <- group_keys(long_data)
+#         key_list <- split(key_df, seq_len(nrow(key_df)))
+#         
+#         future_map2_dfr(
+#           data_list,
+#           key_list,
+#           \(df, key) {
+#             present_nodes <- df$siteId
+#             
+#             pruned_subgraph <- pruned_net |>
+#               activate(nodes) |>
+#               morph(to_subgraph, siteId %in% present_nodes, subset_by = "nodes")
+#             
+#             node_metrics <- pruned_subgraph |>
+#               mutate(
+#                 alpha_centrality = centrality_alpha(),
+#                 alpha_centrality_weighted = centrality_alpha(weights = reach_length_km),
+#                 arcProbAC = centrality_alpha(weights = prob_presence),
+#                 upstream_length = size.intact.to.node(.G(), node = "all"),
+#                 icsl = ICSL(.G()),
+#                 harary = harary(.G())
+#               ) |>
+#               unmorph() |>
+#               activate(nodes) |>
+#               st_drop_geometry() |>
+#               as_tibble()
+#             
+#             
+#             node_metrics |>
+#               filter(!is.na(alpha_centrality)) |>
+#               mutate(
+#                 date = key[[1]]
+#               )
+#           },
+#           .options = furrr_options(seed = TRUE),
+#           .progress = TRUE
+#         ) |> 
+#           st_drop_geometry() |> 
+#           select(siteId, date, alpha_centrality_weighted, alpha_centrality, arcProbAC, upstream_length, icsl, harary)
+#       }
+#     )
+#   )
+# 
+# # Step 3: Combine all watershed results
+# all_metrics <- network_results |> 
+#   select(watershed, metrics) |> 
+#   unnest(metrics) |> 
+#   left_join(
+#     allSites |> 
+#       st_drop_geometry() |> 
+#       select(siteId, watershed, drainage_area_sqkm, outlet_dist_m),
+#     by = c("siteId", "watershed")
+#   ) #|> 
+# #write_csv(here("Data/STICs/alpha_centrality_GP-SE.csv"))
+# plan(sequential)
+```
+
+```{r}
+# 
+# all_metrics |> 
+#   group_by(date, watershed) |> 
+#   summarise(alpha_centrality = mean(alpha_centrality, na.rm = T)) |> 
+#   ggplot(aes(x = date, y = alpha_centrality, color = watershed)) +
+#   geom_line(alpha = 0.8, linewidth = 0.7) +
+#   scale_color_manual(values = okabeIto) +
+#   theme_few() +
+#   facet_wrap(~watershed) +
+#   theme(
+#     axis.text.x = element_text(angle = 45, hjust = 1),
+#     strip.text = element_text(face = "bold", size = 10),
+#     legend.position = "bottom",
+#     panel.grid.minor = element_blank()
+#   )
+# 
+# all_metrics |> 
+#   group_by(date, watershed) |> 
+#   summarise(alpha_centrality_weighted = mean(alpha_centrality_weighted, na.rm = T)) |> 
+#   ggplot(aes(x = date, y = alpha_centrality_weighted, color = watershed)) +
+#   geom_line(alpha = 0.8, linewidth = 0.7) +
+#   scale_color_manual(values = okabeIto) +
+#   theme_few() +
+#   facet_wrap(~watershed) +
+#   theme(
+#     axis.text.x = element_text(angle = 45, hjust = 1),
+#     strip.text = element_text(face = "bold", size = 10),
+#     legend.position = "bottom",
+#     panel.grid.minor = element_blank()
+#   )
+# 
+# out_nodes <- c("SFM01", "SHM01", "ENM01", "PRM01", "TLM01", "WHM01")
+# 
+# # Reshape and scale
+# all_metrics_long <- all_metrics |>
+#   pivot_longer(
+#     cols = c(alpha_centrality, alpha_centrality_weighted, upstream_length, icsl, harary),
+#     names_to = "Metric",
+#     values_to = "Value"
+#   ) |>
+#   mutate(
+#     Metric = case_when(
+#       Metric == "icsl" ~ "ICSL",
+#       Metric == "upstream_length" ~ "UpstreamLength",
+#       Metric == "alpha_centrality" ~ "AlphaCentrality",
+#       Metric == "alpha_centrality_weighted" ~ "WeightedAlphaCentrality",
+#       Metric == "harary" ~ "Harary"
+#     )
+#   ) |>
+#   group_by(watershed, Metric, date) |>
+#   mutate(Value = mean(Value, na.rm = T)) |>
+#   ungroup()
+# 
+# # Plot
+# ggplot(all_metrics_long, aes(x = date, y = Value, color = Metric)) +
+#   geom_line(alpha = 0.8, linewidth = 0.7) +
+#   facet_grid(Metric ~ watershed, scales = "free_y") +
+#   scale_color_manual(values = okabeIto) +
+#   labs(
+#     x = "",
+#     y = "",
+#     color = ""
+#   ) +
+#   theme_few() +
+#   theme(
+#     axis.text.x = element_text(angle = 45, hjust = 1),
+#     strip.text = element_text(face = "bold", size = 10),
+#     legend.position = "bottom",
+#     panel.grid.minor = element_blank()
+#   ) +
+#   scale_x_date(date_labels = "%b %Y") +
+#   scale_y_continuous(labels = scales::label_number(accuracy = 0.1))
+
+```
+
+# streamDAG Global Metrics
+
+Have to use "weight" not "weights", Maggi used weights in the KNZ code, Ken uses weight everywhere except in global metrics example
+
+```{r}
+sink_nodes <- list(
+  KNZ = "SFM01",
+  SHN = "SHM01",
+  YMR = "ENM01",
+  PRF = "PRM01",
+  TAL = "TLM01",
+  WHR = "WHM01",
+  GBJ = "GJ1"
+)
+
+# Set up parallel processing
+plan(multisession)
+
+# Compute metrics per watershed with upstream metrics
+streamDAG_Metrics <- nestPresAbs_filled |> 
+  mutate(
+    metrics = future_map2(watershed, data, \(wshed, df) {
+      # Get network and sink node for this watershed
+      net <- aimsNets[[wshed]]
+      sink <- sink_nodes[[wshed]]
+      arc_lengths <- all_arc_lengths[[wshed]]
+      
+      # Get all node names from the network
+      all_nodes <- V(net)$name
+      total_nodes <- length(all_nodes)
+      
+      # Prepare lookup for edge weights
+      arc_lengths <- arc_lengths |>
+        mutate(Arc_key = gsub("->", "|", Arc))
+      
+      # Compute metrics for each day
+      metric_df <- future_map(1:nrow(df), \(i) {
+        tryCatch({
+          # Get wet nodes (value = 1) and present nodes (non-NA)
+          node_values <- df[i, -which(names(df) == "date")]
+          wet_nodes_count <- sum(node_values == 1, na.rm = TRUE)
+          present_nodes_count <- sum(!is.na(node_values))
+          
+          # Calculate percent_network_wet
+          percent_network_wet <- ifelse(present_nodes_count > 0, 
+                              (wet_nodes_count/present_nodes_count)*100, 
+                              0)
+          # Convert from factors to characters to numeric
+          pa_vect <- node_values[1, ] |>
+            as.character() |>
+            as.numeric()
+          
+          # Set the names
+          names(pa_vect) <- colnames(node_values)
+          pa_vect <- pa_vect - 1
+          # Create temporary graph for this day
+          temp_graph <- delete.nodes.pa(
+            net, 
+            node_values,
+            na.response = "treat.as.1"
+          )
+          
+          # Skip if graph is empty
+          if (vcount(temp_graph) == 0) {
+            return(tibble(
+              date = df$date[i],
+              icsl = NA_real_,
+              #intact_to_sink = NA_real_,
+              a_cent_weighted = NA_real_,
+              a_cent = NA_real_,
+              harary = NA_real_,
+              active_upstream_length = 0,
+              present_nodes = present_nodes_count,
+              total_nodes = total_nodes,
+              #percent_upstream_wet = 0,
+              percent_network_wet = percent_network_wet
+            ))
+          }
+          
+          # Set edge weights (convert m to km)
+          edge_keys <- attributes(E(temp_graph))$vname
+          length_sub <- arc_lengths$Length[match(edge_keys, arc_lengths$Arc_key)]
+          E(temp_graph)$weight <- length_sub/1000
+          
+          # Calculate upstream metrics
+          if (sink %in% V(temp_graph)$name) {
+            upstream_nodes <- subcomponent(temp_graph, sink, mode = "in")
+            upstream_subgraph <- induced_subgraph(temp_graph, upstream_nodes)
+            #active_upstream_length <- sum(E(upstream_subgraph)$weight, na.rm = TRUE)
+            wet_nodes_upstream <- vcount(upstream_subgraph)
+          } else {
+            #active_upstream_length <- 0
+            wet_nodes_upstream <- 0
+          }
+          wet_nodes_all <- vcount(temp_graph)
+          # Calculate all metrics
+          tibble(
+            date = df$date[i],
+            icsl = ICSL(temp_graph, lengths = length_sub),
+            active_upstream_length = size.intact.to.sink(temp_graph, sink = sink),
+            a_cent_weighted = mean(alpha_centrality(temp_graph), na.rm = TRUE),
+            a_cent = mean(alpha_centrality(temp_graph, weights = NA), na.rm = TRUE),
+            harary = harary(temp_graph),
+            #active_upstream_length = active_upstream_length,
+            wet_upstream_nodes = wet_nodes_upstream,
+            wet_network_nodes = wet_nodes_all,
+            present_nodes = present_nodes_count,
+            total_nodes = total_nodes,
+            # percent_upstream_wet = ifelse(present_nodes_count > 0, 
+            #                         (wet_nodes_upstream/present_nodes_count)*100, 
+            #                         0),
+            percent_network_wet = percent_network_wet
+          )
+          
+        }, error = function(e) {
+          message("Error for ", wshed, " on ", df$date[i], ": ", e$message)
+          tibble(
+            date = df$date[i],
+            icsl = NA_real_,
+            #intact_to_sink = NA_real_,
+            a_cent_weighted = NA_real_,
+            a_cent = NA_real_,
+            harary = NA_real_,
+            active_upstream_length = NA_real_,
+            present_nodes = NA_real_,
+            total_nodes = total_nodes,
+            #percent_upstream_wet = NA_real_,
+            percent_network_wet = NA_real_
+          )
+        })
+      }, .options = furrr_options(seed = TRUE), .progress = TRUE) |> 
+        bind_rows()
+      
+      # Format final output
+      metric_df |>
+        pivot_longer(cols = -c(date, wet_upstream_nodes, wet_network_nodes, present_nodes, 
+                             total_nodes, percent_network_wet), 
+                     names_to = "metric", values_to = "value") |>
+        #mutate(metric = recode(metric, !!!metric_names)) |> 
+        pivot_wider(names_from = metric, values_from = value) 
+    }, .options = furrr_options(seed = TRUE), .progress = TRUE)
+  ) |> 
+  select(-data) |> 
+  unnest(metrics)
+
+
+streamDAG_Metrics <- streamDAG_Metrics |> 
+  group_by(watershed) |>
+  mutate(
+    a_cent_scaled = as.numeric(scale(a_cent)),
+    a_cent_weighted_scaled = as.numeric(scale(a_cent_weighted))
+  ) |>
+  ungroup() |> 
+  select(watershed, date, total_nodes, present_nodes, wet_upstream_nodes, wet_network_nodes, 
+         percent_network_wet, active_upstream_length, icsl, harary, a_cent, a_cent_scaled, 
+         a_cent_weighted, a_cent_weighted_scaled) |> 
+  write_csv(here("Data/STICs/streamDAG_metrics.csv"))
+# Reset parallel processing
+plan(sequential)
+```
+
+```{r}
+# First reshape the data to long format for plotting
+streamDAG_Metrics_long <- streamDAG_Metrics |>
+  pivot_longer(
+    cols = -c(watershed, date),
+    names_to = "Metric",
+    values_to = "Value"
+  ) |> 
+  mutate(watershed = forcats::fct_relevel(watershed, 
+                               "KNZ", "SHN", "YMR",  # Left column
+                               "TAL", "WHR", "PRF")) # Right column
+
+# Create faceted plot
+streamDAG_Metrics_long |> 
+  filter(Metric == "a_cent") |> 
+ggplot(aes(x = date, y = Value, color = watershed)) +
+  geom_line(alpha = 0.8, linewidth = 0.7) +
+  facet_wrap(~watershed, ncol = 2, dir = "v") +
+  scale_color_manual(values = okabeIto) +
+  labs(
+    x = "",
+    y = "Global Unweighted Alpha Centrality",
+    color = ""
+  ) +
+  theme_few() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold", size = 10),
+    legend.position = "none",
+    panel.grid.minor = element_blank()
+  ) +
+  scale_x_date(date_labels = "%b %Y") +
+  scale_y_continuous(labels = scales::label_number(accuracy = 0.1)) 
+
+streamDAG_Metrics_long |> 
+  filter(Metric == "a_cent_weighted") |> 
+ggplot(aes(x = date, y = Value, color = watershed)) +
+  geom_line(alpha = 0.8, linewidth = 0.7) +
+  facet_wrap(~watershed, ncol = 2, dir = "v", scales = "free_y") +
+  scale_color_manual(values = okabeIto) +
+  labs(
+    x = "",
+    y = "Global Weighted Alpha Centrality",
+    color = ""
+  ) +
+  theme_few() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold", size = 10),
+    legend.position = "none",
+    panel.grid.minor = element_blank()
+  ) +
+  scale_x_date(date_labels = "%b %Y") +
+  scale_y_continuous(labels = scales::label_number(accuracy = 0.1)) 
+
+streamDAG_Metrics_long |> 
+  filter(Metric %in% c("icsl", "a_cent_weighted", "a_cent", "harary")) |> 
+  group_by(watershed, Metric) |>
+    dplyr::mutate(across(where(is.numeric), ~ (. - mean(., na.rm = TRUE)) / sd(., na.rm = TRUE), .names = "{.col}")) |>
+    ungroup() |>
+ggplot(aes(x = date, y = Value, color = Metric)) +
+  geom_line(alpha = 0.8, linewidth = 0.7) +
+  facet_grid(Metric~watershed, scales = "free_y") +
+  scale_color_manual(values = okabeIto) +
+  labs(
+    x = "",
+    y = "",
+    color = ""
+  ) +
+  theme_few() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold", size = 10),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  ) +
+  scale_x_date(date_labels = "%b %Y") +
+  scale_y_continuous(labels = scales::label_number(accuracy = 0.1)) 
+
+streamDAG_Metrics_long |> 
+  filter(Metric %in% c("present_nodes", "wet_nodes", "total_nodes", "active_upstream_length", "percent_upstream_wet", "percent_network_wet")) |> 
+ggplot(aes(x = date, y = Value, color = Metric)) +
+  geom_line(alpha = 0.8, linewidth = 0.7) +
+  facet_grid(Metric~watershed, scales = "free_y") +
+  scale_color_manual(values = okabeIto) +
+  labs(
+    x = "",
+    y = "",
+    color = ""
+  ) +
+  theme_few() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold", size = 10),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  ) +
+  scale_x_date(date_labels = "%b %Y") +
+  scale_y_continuous(labels = scales::comma)
+```
+
+## Scaling Weights before Calc
+
+```{r}
+sink_nodes <- list(
+  KNZ = "SFM01",
+  SHN = "SHM01",
+  YMR = "ENM01",
+  PRF = "PRM01",
+  TAL = "TLM01",
+  WHR = "WHM01",
+  GBJ = "GJ1"
+)
+
+# Set up parallel processing
+plan(multisession)
+
+# Compute metrics per watershed with upstream metrics
+streamDAG_Metrics <- nestPresAbs_filled |> 
+  mutate(
+    metrics = future_map2(watershed, data, \(wshed, df) {
+      # Get network and sink node for this watershed
+      net <- aimsNets[[wshed]]
+      sink <- sink_nodes[[wshed]]
+      arc_lengths <- all_arc_lengths[[wshed]]
+      
+      # Get all node names from the network
+      all_nodes <- V(net)$name
+      total_nodes <- length(all_nodes)
+      
+      # Prepare lookup for edge weights
+      arc_lengths <- arc_lengths |>
+        mutate(Arc_key = gsub("->", "|", Arc))
+      
+      # Compute metrics for each day
+      metric_df <- future_map(1:nrow(df), \(i) {
+        tryCatch({
+          # Get wet nodes (value = 1) and present nodes (non-NA)
+          node_values <- df[i, -which(names(df) == "date")]
+          wet_nodes_count <- sum(node_values == 1, na.rm = TRUE)
+          present_nodes_count <- sum(!is.na(node_values))
+          
+          # Calculate percent_network_wet
+          percent_network_wet <- ifelse(present_nodes_count > 0, 
+                              (wet_nodes_count/present_nodes_count)*100, 
+                              0)
+          # Convert from factors to characters to numeric
+          pa_vect <- node_values[1, ] |>
+            as.character() |>
+            as.numeric()
+          
+          # Set the names
+          names(pa_vect) <- colnames(node_values)
+          pa_vect <- pa_vect - 1
+          
+          # Get Edge Weights
+          edge_keys <- attributes(E(net))$vname
+          length_sub <- arc_lengths$Length[match(edge_keys, arc_lengths$Arc_key)]
+          # Z transform lengths/weights
+          length_scaled <- (length_sub - mean(length_sub, na.rn = T)) / sd(length_sub, na.rm = T)
+                   
+          # Set weights
+          E(net)$weight <- length_scaled
+          
+          
+          # Create temporary graph for this day
+          temp_graph <- delete.nodes.pa(
+            net, 
+            node_values,
+            na.response = "treat.as.1"
+          )
+
+          # Skip if graph is empty
+          if (vcount(temp_graph) == 0) {
+            return(tibble(
+              date = df$date[i],
+              icsl = NA_real_,
+              #intact_to_sink = NA_real_,
+              a_cent_weighted = NA_real_,
+              a_cent = NA_real_,
+              harary = NA_real_,
+              active_upstream_length = 0,
+              present_nodes = present_nodes_count,
+              total_nodes = total_nodes,
+              #percent_upstream_wet = 0,
+              percent_network_wet = percent_network_wet
+            ))
+          }
+          
+          
+          
+          # Calculate upstream metrics
+          if (sink %in% V(temp_graph)$name) {
+            upstream_nodes <- subcomponent(temp_graph, sink, mode = "in")
+            upstream_subgraph <- induced_subgraph(temp_graph, upstream_nodes)
+            #active_upstream_length <- sum(E(upstream_subgraph)$weight, na.rm = TRUE)
+            wet_nodes_upstream <- vcount(upstream_subgraph)
+          } else {
+            #active_upstream_length <- 0
+            wet_nodes_upstream <- 0
+          }
+          wet_nodes_all <- vcount(temp_graph)
+          # Calculate all metrics
+          tibble(
+            date = df$date[i],
+            icsl = ICSL(temp_graph, lengths = length_sub),
+            active_upstream_length = size.intact.to.sink(temp_graph, sink = sink),
+            a_cent_weighted = mean(alpha_centrality(temp_graph), na.rm = TRUE),
+            a_cent = mean(alpha_centrality(temp_graph, weights = NA), na.rm = TRUE),
+            harary = harary(temp_graph),
+            #active_upstream_length = active_upstream_length,
+            wet_upstream_nodes = wet_nodes_upstream,
+            wet_network_nodes = wet_nodes_all,
+            present_nodes = present_nodes_count,
+            total_nodes = total_nodes,
+            # percent_upstream_wet = ifelse(present_nodes_count > 0, 
+            #                         (wet_nodes_upstream/present_nodes_count)*100, 
+            #                         0),
+            percent_network_wet = percent_network_wet
+          )
+          
+        }, error = function(e) {
+          message("Error for ", wshed, " on ", df$date[i], ": ", e$message)
+          tibble(
+            date = df$date[i],
+            icsl = NA_real_,
+            #intact_to_sink = NA_real_,
+            a_cent_weighted = NA_real_,
+            a_cent = NA_real_,
+            harary = NA_real_,
+            active_upstream_length = NA_real_,
+            present_nodes = NA_real_,
+            total_nodes = total_nodes,
+            #percent_upstream_wet = NA_real_,
+            percent_network_wet = NA_real_
+          )
+        })
+      }, .options = furrr_options(seed = TRUE), .progress = TRUE) |> 
+        bind_rows()
+      
+      # Format final output
+      metric_df |>
+        pivot_longer(cols = -c(date, wet_upstream_nodes, wet_network_nodes, present_nodes, 
+                             total_nodes, percent_network_wet), 
+                     names_to = "metric", values_to = "value") |>
+        #mutate(metric = recode(metric, !!!metric_names)) |> 
+        pivot_wider(names_from = metric, values_from = value) 
+    }, .options = furrr_options(seed = TRUE), .progress = TRUE)
+  ) |> 
+  select(-data) |> 
+  unnest(metrics)
+
+
+streamDAG_Metrics <- streamDAG_Metrics |> 
+  group_by(watershed) |>
+  mutate(
+    a_cent_scaled = as.numeric(scale(a_cent)),
+    a_cent_weighted_scaled = as.numeric(scale(a_cent_weighted))
+  ) |>
+  ungroup() |> 
+  select(watershed, date, total_nodes, present_nodes, wet_upstream_nodes, wet_network_nodes, 
+         percent_network_wet, active_upstream_length, icsl, harary, a_cent, a_cent_scaled, 
+         a_cent_weighted, a_cent_weighted_scaled) |> 
+  write_csv(here("Data/STICs/streamDAG_metrics.csv"))
+# Reset parallel processing
+plan(sequential)
+```
+
+```{r}
+# Step 1: Summarize all_metrics by watershed and date
+alpha_summary <- all_metrics |>
+  group_by(watershed, date) |>
+  summarise(
+    AlphaCentrality_cb = mean(alpha_centrality, na.rm = TRUE),
+    WeightedAlphaCentrality_cb = mean(alpha_centrality_weighted, na.rm = TRUE),
+    max_upstream = max(upstream_length, na.rm = T),
+    upstream_area_sqkm = max(drainage_area_sqkm, na.rm = T),
+    icsl_cb = max(icsl, na.rm = T),
+    harary_cb = max(harary, na.rm = T),
+    .groups = "drop"
+  )
+
+# Step 2: Join with streamDAG_Metrics
+comparison_df <- streamDAG_Metrics |>
+  left_join(alpha_summary, by = c("watershed", "date")) |>
+  mutate(
+    ac_diff = AlphaCentrality - AlphaCentrality_cb,
+    weightedAC_diff = WeightedAlphaCentrality - WeightedAlphaCentrality_cb
+  )
+
+comparison_df |> 
+ggplot(aes(x = date, y = ac_diff, color = watershed)) +
+  geom_line(alpha = 0.8, linewidth = 0.7) +
+  scale_color_manual(values = okabeIto) +
+  labs(
+    x = "",
+    y = "",
+    color = ""
+  ) +
+  theme_few() +
+  facet_wrap(~watershed)+
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold", size = 10),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  ) +
+  scale_x_date(date_labels = "%b %Y")
+
+comparison_df |> 
+ggplot(aes(x = date, y = weightedAC_diff, color = watershed)) +
+  geom_line(alpha = 0.8, linewidth = 0.7) +
+  scale_color_manual(values = okabeIto) +
+  labs(
+    x = "",
+    y = "",
+    color = ""
+  ) +
+  theme_few() +
+  facet_wrap(~watershed)+
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold", size = 10),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  ) +
+  scale_x_date(date_labels = "%b %Y")
+```
+
+```{r}
+plan(mu)
+walk(unique(all_metrics$watershed), \(ws) {
+
+  message(glue::glue("Rendering GIF for {ws}..."))
+
+  crs <- case_when(
+  ws %in% c("KNZ", "SHN", "YMR") ~ 26914,
+  ws %in% c("PRF", "TAL", "WHR") ~ 26916,
+  TRUE ~ 4326  # default to WGS 84
+  )
+
+  ws_sites <- allSites |> 
+    filter(watershed == ws) |> 
+    st_transform(crs)
+
+  ws_streams <- allStreams |> 
+    filter(watershed == ws) |> 
+    st_transform(crs)
+
+  ws_results <- all_metrics |> 
+    filter(watershed == ws)
+
+  # Calculate color scale per watershed
+  ac_min <- floor(min(ws_results$alpha_centrality, na.rm = TRUE))
+  ac_max <- ceiling(max(ws_results$alpha_centrality, na.rm = TRUE))
+
+  unique_days <- unique(ws_results$date)
+  # Create temp dir for individual plots
+  tmp_dir <- tempfile(paste0("frames_", ws, "_"))
+  dir.create(tmp_dir)
+  tmp_dir <- normalizePath(tmp_dir)
+  message("temporary files: ", tmp_dir)
+  png_files <- file.path(tmp_dir, sprintf("frame_%03d.png", seq_along(unique_days)))
+
+  future_walk2(
+    unique_days,
+    png_files,
+    \(day, png_file) {
+      day_results <- ws_results |> 
+        filter(date == day) |> 
+        st_drop_geometry()
+
+      day_data <- ws_sites |>
+        select(siteId) |>
+        left_join(day_results, by = "siteId")
+
+      day_label <- unique(na.omit(day_data$date))
+
+      png(png_file, width = 1080, height = 1080)
+
+      p <- ggplot() +
+        geom_sf(data = ws_streams, color = "#0084A8", size = 1.5) +
+        geom_sf(data = day_data |> filter(!is.na(alpha_centrality)),
+                aes(color = alpha_centrality), size = 6) +
+        geom_sf(data = day_data |> filter(is.na(alpha_centrality)),
+                size = 6, color = "gray") +
+        scale_color_viridis_c(option = "magma", limits = c(ac_min, ac_max)) +
+        labs(title = ws, subtitle = day_label) +
+        guides(color = guide_colorbar(barwidth = 20, barheight = 1.5)) +
+        theme_void() +
+        theme(
+          plot.title = element_text(size = 30, face = "bold", hjust = 0.5),
+          plot.subtitle = element_text(size = 25, hjust = 0.5),
+          legend.position = "bottom",
+          legend.title = element_blank(),
+          legend.text = element_text(size = 20),
+          axis.text = element_blank()
+        )
+
+      print(p)
+      dev.off()
+    },
+    .options = furrr_options(seed = TRUE),
+    .progress = TRUE
+  )
+
+  # Combine frames into GIF
+  output_gif <- here(glue::glue("Figs/STICs/gifs/{ws}_AC.gif"))
+  gifski::gifski(png_files, output_gif, width = 1080, height = 1080, delay = 0.05)
+
+  unlink(tmp_dir, recursive = TRUE)
+  }
+  )
+```
+
+```{r}
+
+plan(multisession)  
+
+# Generate individual frames
+tmp_dir <- tempfile("combined_frames_")
+dir.create(tmp_dir)
+unique_days <- unique(results$date)
+png_files <- file.path(tmp_dir, sprintf("frame_%03d.png", seq_along(unique_days)))
+
+all_sites <- knz_sites |> 
+    st_drop_geometry() |>
+    distinct(siteId) |>
+    pull(siteId)
+ 
+# Calculate global min and max values (excluding NAs)
+ac_min <- floor(min(results$alpha_centrality, na.rm = TRUE))
+ac_max <- ceiling(max(results$alpha_centrality, na.rm = TRUE))
+
+ 
+future_walk2(
+  unique_days,
+  png_files,
+  \(day, png_file) {
+    day_results <- results |> filter(date == day) |> 
+      st_drop_geometry()
+
+    day_data <- knz_sites |>
+      select(siteId) |>
+      left_join(day_results, by = "siteId")
+
+    day_label <- unique(na.omit(day_data$date))
+
+    png(png_file, width = 1080, height = 1080)
+
+    p <- ggplot() +
+    geom_sf(data = knz_streams, color = "#0084A8", size = 1.5) +
+    geom_sf(data = day_data |> filter(!is.na(alpha_centrality)),
+            aes(color = alpha_centrality), size = 6) +
+    geom_sf(data = day_data |> filter(is.na(alpha_centrality)),
+            size = 6, color = "gray") +  # Hollow circles for NA sites
+    scale_color_viridis_c(option = "magma", limits = c(ac_min, ac_max)) +  # Set fixed limits
+    labs(title = "KNZ",
+         subtitle = day_label) +
+    guides(color = guide_colorbar(barwidth = 20, barheight = 1.5)) +
+    theme_void() +
+    theme(
+      plot.title = element_text(size = 30, face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = 25, hjust = 0.5),
+      legend.position = "bottom",
+      legend.title = element_blank(),
+      legend.text = element_text(size = 20),
+      axis.text = element_blank()
+    )
+
+    print(p)
+    dev.off()
+  },
+  .options = furrr_options(seed = TRUE), .progress = TRUE
+)
+
+# Combine frames into GIF
+output_gif <- paste0(here("Figs/STICs/gifs/KNZ_AC.gif"))
+gifski::gifski(png_files,
+       output_gif,
+       width = 1080,
+       height = 1080,
+       delay = 0.05)
+unlink(tmp_dir, recursive = TRUE)
+
+
+tmp_dir <- tempfile("combined_frames_")
+dir.create(tmp_dir)
+unique_days <- unique(results$date)
+png_files <- file.path(tmp_dir, sprintf("frame_%03d.png", seq_along(unique_days)))
+
+all_sites <- knz_sites |> 
+    st_drop_geometry() |>
+    distinct(siteId) |>
+    pull(siteId)
+ 
+# Calculate global min and max values (excluding NAs)
+ac_min <- floor(min(results$alpha_centrality_weighted, na.rm = TRUE))
+ac_max <- ceiling(max(results$alpha_centrality_weighted, na.rm = TRUE))
+
+ 
+future_walk2(
+  unique_days,
+  png_files,
+  \(day, png_file) {
+    day_results <- results |> filter(date == day) |> 
+      st_drop_geometry()
+
+    day_data <- knz_sites |>
+      select(siteId) |>
+      left_join(day_results, by = "siteId")
+
+    day_label <- unique(na.omit(day_data$date))
+
+    png(png_file, width = 1080, height = 1080)
+
+    p <- ggplot() +
+    geom_sf(data = knz_streams, color = "#0084A8", size = 1.5) +
+    geom_sf(data = day_data |> filter(!is.na(alpha_centrality_weighted)),
+            aes(color = alpha_centrality_weighted), size = 6) +
+    geom_sf(data = day_data |> filter(is.na(alpha_centrality_weighted)),
+            size = 6, color = "gray") +  # Hollow circles for NA sites
+    scale_color_viridis_c(option = "magma", limits = c(ac_min, ac_max)) +  # Set fixed limits
+    labs(title = "KNZ",
+         subtitle = day_label) +
+    guides(color = guide_colorbar(barwidth = 20, barheight = 1.5)) +
+    theme_void() +
+    theme(
+      plot.title = element_text(size = 30, face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = 25, hjust = 0.5),
+      legend.position = "bottom",
+      legend.title = element_blank(),
+      legend.text = element_text(size = 20),
+      axis.text = element_blank()
+    )
+
+    print(p)
+    dev.off()
+  },
+  .options = furrr_options(seed = TRUE), .progress = TRUE
+)
+
+# Combine frames into GIF
+output_gif <- paste0(here("Figs/STICs/gifs/KNZ_ACweighted.gif"))
+gifski::gifski(png_files,
+       output_gif,
+       width = 1080,
+       height = 1080,
+       delay = 0.05)
+unlink(tmp_dir, recursive = TRUE)
+plan(sequential)
+```
+
+```{r}
+plan(multisession)  
+
+# Calc Network Measures
+plan(multisession)  
+long_data <- knz_presAbs |>
+  pivot_longer(cols = -c(watershed, date), 
+               names_to = "siteId", 
+               values_to = "present") |>
+  mutate(DOY = yday(date)) |> 
+  group_by(DOY, siteId) |> 
+  summarise(present = calc_mode(present)) |> 
+  filter(present == 1) |>
+  group_by(DOY)
+
+data_list <- group_split(long_data)
+key_df <- group_keys(long_data)
+key_list <- split(key_df, seq_len(nrow(key_df)))
+
+doy_res <- future_map2_dfr(
+  data_list,
+  key_list,
+  \(df, key) {
+    present_nodes <- df$siteId
+
+    pruned_net |>
+      activate(nodes) |>
+      morph(to_subgraph, siteId %in% present_nodes, subset_by = "nodes") |>
+      mutate(
+        alpha_centrality = centrality_alpha(),
+        alpha_centrality_weighted = centrality_alpha(weights = reach_length_km),
+        upstream_length = size.intact.to.node(.G(), node = "all"),
+        icsl = ICSL(.G()),
+        harary = harary(.G())
+      ) |>
+      unmorph() |>
+      activate(nodes) |>
+      st_drop_geometry() |>
+      as_tibble() |>
+      filter(!is.na(alpha_centrality)) |>
+      mutate(DOY = key[[1]])
+  },
+  .options = furrr_options(seed = TRUE), .progress = TRUE
+) |> 
+  st_drop_geometry() |> 
+  select(siteId, DOY, alpha_centrality_weighted, alpha_centrality, upstream_length, icsl, harary) |> 
+  mutate(DateLabel = as.Date(DOY, origin = "1999-12-31"),
+            MonthDay = format(DateLabel, "%B %d"))
+
+# Generate individual frames
+tmp_dir <- tempfile("combined_frames_")
+dir.create(tmp_dir)
+
+      
+unique_days <- unique(doy_res$DOY)
+png_files <- file.path(tmp_dir, sprintf("frame_%03d.png", seq_along(unique_days)))
+
+all_sites <- knz_sites |> 
+    st_drop_geometry() |>
+    distinct(siteId) |>
+    pull(siteId)
+ 
+# Calculate global min and max values (excluding NAs)
+ac_min <- floor(min(doy_res$alpha_centrality, na.rm = TRUE))
+ac_max <- ceiling(max(doy_res$alpha_centrality, na.rm = TRUE))
+
+ 
+future_walk2(
+  unique_days,
+  png_files,
+  \(d, png_file) {
+    day_results <- doy_res |> filter(DOY == d) |> 
+      st_drop_geometry()
+      
+
+    day_data <- knz_sites |>
+      select(siteId) |>
+      left_join(day_results, by = "siteId")
+
+    day_label <- unique(na.omit(day_data$MonthDay))
+
+    png(png_file, width = 1080, height = 1080)
+
+    p <- ggplot() +
+    geom_sf(data = knz_streams, color = "#0084A8", size = 1.5) +
+    geom_sf(data = day_data |> filter(!is.na(alpha_centrality)),
+            aes(color = alpha_centrality), size = 6) +
+    geom_sf(data = day_data |> filter(is.na(alpha_centrality)),
+            size = 6, color = "gray") +  # Hollow circles for NA sites
+    scale_color_viridis_c(option = "magma", limits = c(ac_min, ac_max)) +  # Set fixed limits
+    labs(title = "KNZ",
+         subtitle = day_label) +
+    guides(color = guide_colorbar(barwidth = 20, barheight = 1.5)) +
+    theme_void() +
+    theme(
+      plot.title = element_text(size = 30, face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = 25, hjust = 0.5),
+      legend.position = "bottom",
+      legend.title = element_blank(),
+      legend.text = element_text(size = 20),
+      axis.text = element_blank()
+    )
+
+    print(p)
+    dev.off()
+  },
+  .options = furrr_options(seed = TRUE), .progress = TRUE
+)
+
+# Combine frames into GIF
+output_gif <- paste0(here("Figs/STICs/gifs/KNZ_AC_DOY.gif"))
+gifski::gifski(png_files,
+       output_gif,
+       width = 1080,
+       height = 1080,
+       delay = 0.05)
+unlink(tmp_dir, recursive = TRUE)
+
+
+
+tmp_dir <- tempfile("combined_frames_")
+dir.create(tmp_dir)
+
+unique_days <- unique(doy_res$DOY)
+png_files <- file.path(tmp_dir, sprintf("frame_%03d.png", seq_along(unique_days)))
+
+# Calculate global min and max values (excluding NAs)
+ac_min <- floor(min(doy_res$alpha_centrality_weighted, na.rm = TRUE))
+ac_max <- ceiling(max(doy_res$alpha_centrality_weighted, na.rm = TRUE))
+
+plan(multisession)  
+future_walk2(
+  unique_days,
+  png_files,
+  \(d, png_file) {
+    day_results <- doy_res |> filter(DOY == d) |> 
+      st_drop_geometry()
+      
+
+    day_data <- knz_sites |>
+      select(siteId) |>
+      left_join(day_results, by = "siteId")
+
+    day_label <- unique(na.omit(day_data$MonthDay))
+
+    png(png_file, width = 1080, height = 1080)
+
+    p <- ggplot() +
+    geom_sf(data = knz_streams, color = "#0084A8", size = 1.5) +
+    geom_sf(data = day_data |> filter(!is.na(alpha_centrality_weighted)),
+            aes(color = alpha_centrality_weighted), size = 6) +
+    geom_sf(data = day_data |> filter(is.na(alpha_centrality_weighted)),
+            size = 6, color = "gray") +  # Hollow circles for NA sites
+    scale_color_viridis_c(option = "magma", limits = c(ac_min, ac_max)) +  # Set fixed limits
+    labs(title = "KNZ",
+         subtitle = day_label) +
+    guides(color = guide_colorbar(barwidth = 20, barheight = 1.5)) +
+    theme_void() +
+    theme(
+      plot.title = element_text(size = 30, face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = 25, hjust = 0.5),
+      legend.position = "bottom",
+      legend.title = element_blank(),
+      legend.text = element_text(size = 20),
+      axis.text = element_blank()
+    )
+
+    print(p)
+    dev.off()
+  },
+  .options = furrr_options(seed = TRUE), .progress = TRUE
+)
+
+# Combine frames into GIF
+output_gif <- paste0(here("Figs/STICs/gifs/KNZ_ACweighted_DOY.gif"))
+gifski::gifski(png_files,
+       output_gif,
+       width = 1080,
+       height = 1080,
+       delay = 0.05)
+unlink(tmp_dir, recursive = TRUE)
+
+```
+
+```{r}
+
+```
+
+## Plot
+
+```{r}
+
+```
+
+## Exc Prob
+
+```{r}
+excProb <- streamDAG_Metrics |>
+  group_by(watershed) |> 
+  mutate(acUnweighted_expProb = calc_exceedance_prob(AlphaCentrality, rm.zero = F),
+         acWeighted_excProb = calc_exceedance_prob(WeightedAlphaCentrality)) |> 
+  ungroup() |> 
+  mutate(watershed = forcats::fct_relevel(watershed, 
+                               "KNZ", "SHN", "YMR",  # Left column
+                               "TAL", "WHR", "PRF")) # Right column
+
+
+excProb |> 
+  ggplot(aes(x = acUnweighted_expProb, y = AlphaCentrality, color = watershed)) +
+  geom_line(alpha = 0.8, linewidth = 0.7) +
+  scale_color_manual(values = okabeIto) +
+  labs(
+    x = "Exceedance probability",
+    y = "Unweighted Alpha Centrality",
+    color = ""
+  ) +
+  theme_few() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold", size = 10),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )+
+  scale_x_continuous(labels = scales::label_percent())
+
+excProb |> 
+  ggplot(aes(x = acWeighted_excProb, y = WeightedAlphaCentrality, color = watershed)) +
+  geom_line(alpha = 0.8, linewidth = 0.7) +
+  scale_color_manual(values = okabeIto) +
+  labs(
+    x = "Exceedance probability",
+    y = "Weighted Alpha Centrality",
+    color = ""
+  ) +
+  theme_few() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold", size = 10),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )+
+  scale_x_continuous(labels = scales::label_percent())
+
+excProb |> 
+  ggplot(aes(x = percent_network_wet, y = acUnweighted_expProb, color = watershed)) +
+  geom_point(alpha = 0.8, size = 2) +
+  scale_color_manual(values = okabeIto) +
+  labs(
+    x = "% Wet",
+    y = "Unweighted Alpha Centrality (Exc Prob)",
+    color = ""
+  ) +
+  theme_few() +
+  facet_wrap(~watershed) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold", size = 10),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )
+
+excProb |> 
+  ggplot(aes(x = percent_network_wet, y = acWeighted_excProb, color = watershed)) +
+  geom_point(alpha = 0.8, size = 2) +
+  scale_color_manual(values = okabeIto) +
+  labs(
+    x = "% Wet",
+    y = "Weighted Alpha Centrality (Exc Prob)",
+    color = ""
+  ) +
+  theme_few() +
+  facet_wrap(~watershed) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold", size = 10),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )
+
+excProb |> 
+  ggplot(aes(x = percent_network_wet, y = WeightedAlphaCentrality, color = watershed)) +
+  geom_point(alpha = 0.8, size = 2) +
+  scale_color_manual(values = okabeIto) +
+  labs(
+    x = "% Wet",
+    y = "Weighted Alpha Centrality",
+    color = ""
+  ) +
+  theme_few() +
+  facet_wrap(~watershed) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold", size = 10),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )
+
+excProbWY <- streamDAG_Metrics |>
+  mutate(waterYear = calcWaterYear(date)) |> 
+  group_by(watershed, waterYear) |> 
+  mutate(acUnweighted_expProb = calc_exceedance_prob(AlphaCentrality),
+         acWeighted_excProb = calc_exceedance_prob(WeightedAlphaCentrality)) |> 
+  ungroup() |> 
+  mutate(watershed = forcats::fct_relevel(watershed, 
+                               "KNZ", "SHN", "YMR",  # Left column
+                               "TAL", "WHR", "PRF")) # Right column
+
+
+excProbWY |> 
+  ggplot(aes(x = acUnweighted_expProb, y = AlphaCentrality, color = factor(waterYear))) +
+  geom_line(alpha = 0.8, linewidth = 0.7) +
+  scale_color_manual(values = okabeIto) +
+  labs(
+    x = "Exceedance Probability",
+    y = "Unweighted Alpha Centrality",
+    color = "Water Year"
+  ) +
+  theme_few() +
+  facet_wrap(~watershed) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold", size = 10),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )+
+  scale_x_continuous(labels = scales::label_percent())
+
+excProbWY |> 
+  ggplot(aes(x = acWeighted_excProb, y = WeightedAlphaCentrality, color = factor(waterYear))) +
+  geom_line(alpha = 0.8, linewidth = 0.7) +
+  scale_color_manual(values = okabeIto) +
+  labs(
+    x = "Exceedance Probability",
+    y = "Weighted Alpha Centrality",
+    color = "Water Year"
+  ) +
+  theme_few() +
+  facet_wrap(~watershed) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold", size = 10),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )+
+  scale_x_continuous(labels = scales::label_percent())
+```
+
+# Wet/Dry Through Time
+
+```{r}
+# #| include: false
+# 
+# # Process data
+# daily_mode <- nestPresAbs_filled |> 
+#   unnest(cols = data) |> 
+#   mutate(across(
+#     .cols = -c(watershed, date),
+#     .fns = ~ as.numeric(as.character(.))
+#   )) |> 
+#   # Convert date and create DOY
+#   mutate(date = as_date(date),
+#          DOY = yday(date)) |>
+#   # Group by DOY to calculate modes
+#   group_by(DOY) |>
+#   summarise(
+#     across(
+#       where(is.numeric),
+#       ~ calc_mode(., na.rm = TRUE)[1],  # Take first mode if multiple exist
+#       .names = "{.col}"
+#     ),
+#     date = first(date)  # Keep date for ordering
+#   ) |>
+#   ungroup() |>
+#   arrange(date) |>
+#   # Convert numeric values to Wet/Dry
+#   mutate(across(
+#     where(is.numeric) & !matches("DOY|date"),
+#     ~ case_when(. == 1 ~ "Wet", 
+#                 . == 0 ~ "Dry", 
+#                 TRUE ~ NA_character_)
+#   )) |>
+#   # Pivot to long format
+#   select(-date) |>
+#   pivot_longer(
+#     cols = -DOY,
+#     names_to = "siteId",
+#     values_to = "wet_dry"
+#   )
+# 
+# # Join with site coordinates
+# daily_map <- daily_mode |>
+#   left_join(allSites, by = "siteId") |>
+#   sf::st_as_sf() |>  # Convert to sf before filtering to keep geometry for all sites
+#   mutate(watershed = case_when(
+#     watershed == "KNZ" ~ "Kings Creek",
+#     watershed == "SHN" ~ "Shane Creek",
+#     watershed == "YMR" ~ "Youngmeyer",
+#     watershed == "TAL" ~ "Talladega",
+#     watershed == "WHR" ~ "Weyerhaeuser",
+#     watershed == "PRF" ~ "Paint Rock",
+#     TRUE ~ watershed
+#   ))
+# 
+# allStreams <- allStreams |> 
+#   mutate(watershed = case_when(
+#     watershed == "KNZ" ~ "Kings Creek",
+#     watershed == "SHN" ~ "Shane Creek",
+#     watershed == "YMR" ~ "Youngmeyer",
+#     watershed == "TAL" ~ "Talladega",
+#     watershed == "WHR" ~ "Weyerhaeuser",
+#     watershed == "PRF" ~ "Paint Rock",
+#     TRUE ~ watershed
+#   ))
+# 
+# # Get all unique watersheds
+# unique_watersheds <- unique(daily_map$watershed)
+# 
+# # Create temporary directory for all watershed frames
+# tmp_dir <- tempfile("frames_")
+# dir.create(tmp_dir)
+# 
+# # Function to process a single watershed with device management
+# process_watershed <- function(watershed_name, daily_map, allStreams, tmp_dir) {
+#   # Explicitly open and close devices for each plot
+#   on.exit(while (dev.cur() > 1) dev.off(), add = TRUE)
+#   
+#   # Filter data for current watershed
+#   daily_map_ws <- daily_map |> 
+#     filter(watershed == watershed_name) |> 
+#     mutate(DateLabel = as.Date(DOY, origin = "1999-12-31"),
+#            MonthDay = format(DateLabel, "%B %d"))
+#   
+#   stream_ws <- allStreams |> 
+#     filter(watershed == case_when(
+#       watershed_name == "KNZ" ~ "Kings Creek",
+#     watershed_name == "SHN" ~ "Shane Creek",
+#     watershed_name == "YMR" ~ "Youngmeyer",
+#     watershed_name == "TAL" ~ "Talladega",
+#     watershed_name == "WHR" ~ "Weyerhaeuser",
+#     watershed_name == "PRF" ~ "Paint Rock",
+#       TRUE ~ watershed_name
+#     ))
+#   
+#   # Create subdirectory for this watershed's frames
+#   ws_dir <- file.path(tmp_dir, watershed_name)
+#   dir.create(ws_dir, showWarnings = FALSE)
+#   
+#   # Identify all unique sites for this watershed
+#   all_sites <- daily_map_ws |> 
+#     st_drop_geometry() |> 
+#     distinct(siteId) |> 
+#     pull(siteId)
+#   
+#   # Generate individual frames
+#   unique_days <- unique(daily_map_ws$DateLabel)
+#   png_files <- file.path(ws_dir, sprintf("frame_%03d.png", seq_along(unique_days)))
+#   
+#   for (i in seq_along(unique_days)) {
+#     day <- unique_days[i]
+#     
+#     day_data <- daily_map_ws |> 
+#       filter(DateLabel == day) |> 
+#       complete(siteId = all_sites) |> 
+#       sf::st_as_sf()
+#     
+#     day_label <- unique(na.omit(day_data$MonthDay))
+#     
+#     # Explicit device management
+#     png(png_files[i], width = 1080, height = 1080)
+#     
+#     p <- ggplot() +
+#       geom_sf(data = stream_ws, color = "#0084A8", size = 1.5) +
+#       geom_sf(data = day_data |> filter(!is.na(wet_dry)),
+#               aes(color = wet_dry), size = 6) +
+#       geom_sf(data = day_data |> filter(is.na(wet_dry)),
+#               shape = 1, size = 6, color = "gray50") +  # Hollow circles for NA sites
+#       scale_color_manual(values = c("Dry" = "#D55E00", "Wet" = "#009E73"),
+#                         drop = FALSE) +
+#       labs(title = watershed_name,
+#            subtitle = day_label) +
+#       theme_void() +
+#       theme(
+#         plot.title = element_text(size = 30, face = "bold", hjust = 0.5),
+#         plot.subtitle = element_text(size = 25, hjust = 0.5),
+#         legend.position = "bottom",
+#         legend.title = element_blank(),
+#         legend.text = element_text(size = 20),
+#         axis.text = element_blank()
+#       )
+#     
+#     print(p)
+#     dev.off()
+#   }
+#   
+#   # Combine frames into GIF
+#   output_gif <- paste0(here("Figs/STICs/gifs/"), 
+#                       gsub(" ", "_", watershed_name), ".gif")
+#   gifski(png_files, 
+#          output_gif,
+#          width = 1080, 
+#          height = 1080, 
+#          delay = 0.1)
+#   
+#   return(output_gif)
+# }
+# # Set up parallel processing - adjust workers as needed
+# plan(multisession, workers = availableCores() - 1)
+# # Process watersheds in parallel with progress bar
+# message("Processing watersheds in parallel...")
+# output_gifs <- suppressWarnings(future_map(unique_watersheds, 
+#                          ~process_watershed(.x, daily_map, allStreams, tmp_dir),
+#                          .options = furrr_options(seed = TRUE, 
+#                                                 packages = c("tidyverse", "sf", "gifski")),
+#                          .progress = TRUE))
+# 
+# # Clean up
+# unlink(tmp_dir, recursive = TRUE)
+# 
+# # Print results
+# message("\nSuccessfully created animations:")
+# walk(output_gifs, ~message("- ", .x))
+```
+
+## All Sheds
+
+```{r}
+# #| include: false
+# 
+# # Set up parallel processing
+# plan(multisession, workers = availableCores() - 1)  # Leave one core free
+# 
+# # First, ensure all watersheds have the same DOY range
+# all_days <- daily_map |> 
+#   st_drop_geometry() |> 
+#   mutate(
+#     DateLabel = as.Date(DOY, origin = as.Date("1999-12-31")),  # Adjust origin year as needed
+#     MonthDay = format(DateLabel, "%B %d")
+#   ) |> 
+#   distinct(DOY, DateLabel, MonthDay) |> 
+#   arrange(DOY)
+# 
+# # Create a temporary directory for frames
+# tmp_dir <- tempfile("combined_frames_")
+# dir.create(tmp_dir)
+# 
+# # Get all unique sites for each watershed
+# watershed_sites <- daily_map |> 
+#   st_drop_geometry() |> 
+#   distinct(watershed, siteId) |> 
+#   group_by(watershed) |> 
+#   summarise(sites = list(siteId))
+# 
+# # Function to create a single combined frame with one shared legend
+# create_single_frame <- function(i, all_days, daily_map, allStreams, watershed_sites, tmp_dir) {
+#   library(tidyverse)
+#   library(sf)
+#   library(patchwork)
+#   library(grid)
+#   
+#   current_day <- all_days$DOY[i]
+#   day_label <- all_days$MonthDay[i]
+#   
+#   day_data <- daily_map |> 
+#     filter(DOY == current_day)
+#   
+#   # Create a list of plots for each watershed (WITHOUT LEGENDS)
+#   plot_list <- map(watershed_sites$watershed, function(ws) {
+#     ws_day_data <- day_data |> 
+#       filter(watershed == ws) |> 
+#       complete(siteId = watershed_sites$sites[[which(watershed_sites$watershed == ws)]]) |> 
+#       sf::st_as_sf()
+#     
+#     ws_stream <- allStreams |> 
+#       filter(watershed == ws)
+#     
+#     ggplot() +
+#       geom_sf(data = ws_stream, color = "#0084A8", size = 0.8) +
+#       geom_sf(data = ws_day_data |> filter(!is.na(wet_dry)),
+#               aes(color = wet_dry), size = 3, show.legend = TRUE) +  # Ensure color mapping is consistent
+#       geom_sf(data = ws_day_data |> filter(is.na(wet_dry)),
+#               shape = 1, size = 3, color = "gray50") +
+#       scale_color_manual(values = c("Dry" = "#D55E00", "Wet" = "#009E73"),
+#                         drop = FALSE, name = "Status") +  # Name for the legend
+#       labs(title = ws) +
+#       theme_void() +
+#       theme(
+#         plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+#         legend.position = "none"  # Remove individual legends
+#       )
+#   })
+#   
+#   # Combine plots into a 2x3 grid and collect legends
+#   combined_plot <- wrap_plots(plot_list, nrow = 2, ncol = 3, guides = "collect") +
+#     plot_annotation(
+#       subtitle = day_label,
+#       theme = theme(
+#         plot.subtitle = element_text(size = 20, hjust = 0.5),
+#         legend.position = "bottom",  # Single legend at bottom
+#         legend.text = element_text(size = 14),
+#         legend.title = element_text(size = 14)
+#       )
+#     )
+#   
+#   # Save the frame
+#   png_file <- file.path(tmp_dir, sprintf("frame_%03d.png", i))
+#   ggsave(png_file, combined_plot, width = 18, height = 12, dpi = 310, units = "in")
+#   
+#   return(png_file)
+# }
+# 
+# # Generate all frames in parallel with progress bar
+# message("Creating combined frames in parallel...")
+# png_files <- suppressWarnings(future_map(seq_len(nrow(all_days)),
+#                        ~create_single_frame(.x, all_days, daily_map, allStreams, watershed_sites, tmp_dir),
+#                        .options = furrr_options(
+#                          seed = TRUE,
+#                          packages = c("tidyverse", "sf", "patchwork", "ggthemes")
+#                        ),
+#                        .progress = TRUE)
+#                        )
+# 
+# # Combine frames into GIF
+# output_gif <- here("Figs/STICs/gifs/allSheds.gif")
+# gifski::gifski(unlist(png_files), 
+#        output_gif,
+#        width = 1800, 
+#        height = 1200, 
+#        delay = 0.1)
+# 
+# # Clean up
+# unlink(tmp_dir, recursive = TRUE)
+# 
+# # Reset parallel plan
+# plan(sequential)
+# 
+# message("\nSuccessfully created combined animation:")
+# message("- ", output_gif)
+```
+
+## Great Plains
+
+```{r}
+# #| include: false
+# 
+# # Set up parallel processing
+# plan(multisession, workers = availableCores() - 1)  # Leave one core free
+# 
+# # Define the watersheds to include
+# selected_watersheds <- c("Kings Creek", "Shane Creek", "Youngmeyer")
+# 
+# # First, ensure all watersheds have the same DOY range
+# all_days <- daily_map |> 
+#   st_drop_geometry() |> 
+#   mutate(
+#     DateLabel = as.Date(DOY, origin = as.Date("1999-12-31")),  # Adjust origin year as needed
+#     MonthDay = format(DateLabel, "%B %d")
+#   ) |> 
+#   distinct(DOY, DateLabel, MonthDay) |> 
+#   arrange(DOY)
+# 
+# # Create a temporary directory for frames
+# tmp_dir <- tempfile("combined_frames_")
+# dir.create(tmp_dir)
+# 
+# # Get all unique sites for each selected watershed
+# watershed_sites <- daily_map |> 
+#   st_drop_geometry() |> 
+#   filter(watershed %in% selected_watersheds) |>
+#   distinct(watershed, siteId) |> 
+#   group_by(watershed) |> 
+#   summarise(sites = list(siteId), .groups = "drop")
+# 
+# # Function to create a single combined frame with one shared legend
+# create_single_frame <- function(i, all_days, daily_map, allStreams, watershed_sites, tmp_dir) {
+#   library(tidyverse)
+#   library(sf)
+#   library(patchwork)
+#   library(grid)
+#   
+#   current_day <- all_days$DOY[i]
+#   day_label <- all_days$MonthDay[i]
+#   
+#   day_data <- daily_map |> 
+#     filter(DOY == current_day, watershed %in% selected_watersheds)
+#   
+#   # Create a list of plots for each selected watershed
+#   plot_list <- map(watershed_sites$watershed, function(ws) {
+#     ws_day_data <- day_data |> 
+#       filter(watershed == ws) |> 
+#       complete(siteId = watershed_sites$sites[[which(watershed_sites$watershed == ws)]]) |> 
+#       sf::st_as_sf()
+#     
+#     ws_stream <- allStreams |> 
+#       filter(watershed == ws)
+#     
+#     ggplot() +
+#       geom_sf(data = ws_stream, color = "#0084A8", size = 0.8) +
+#       geom_sf(data = ws_day_data |> filter(!is.na(wet_dry)),
+#               aes(color = wet_dry), size = 3, show.legend = TRUE) +
+#       geom_sf(data = ws_day_data |> filter(is.na(wet_dry)),
+#               shape = 1, size = 3, color = "gray50") +
+#       scale_color_manual(values = c("Dry" = "#D55E00", "Wet" = "#009E73"),
+#                          drop = FALSE, name = "Status") +
+#       labs(title = ws) +
+#       theme_void() +
+#       theme(
+#         plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+#         legend.position = "none"
+#       )
+#   })
+#   # Create a named list of plots
+#   names(plot_list) <- watershed_sites$watershed
+#   p1 <- plot_list[["Kings Creek"]] +
+#   theme(plot.margin = ggplot2::margin(1, 1, 1, 1, unit = "pt"))
+# p2 <- plot_list[["Shane Creek"]] +
+#   theme(plot.margin = ggplot2::margin(1, 1, 1, 1, unit = "pt"))
+# p3 <- plot_list[["Youngmeyer"]] +
+#   theme(plot.margin = ggplot2::margin(1, 1, 1, 1, unit = "pt"))
+#   
+#   # Combine plots with reduced spacing
+#   combined_plot <- (
+#     p1 | (p2 / p3 + plot_layout(guides = "auto", heights = c(1, 1)))
+#   ) +
+#     plot_layout(
+#       guides = "collect",
+#       widths = c(1, 1),
+#       design = NULL
+#     ) +
+#     plot_annotation(
+#       subtitle = day_label,
+#       theme = theme(
+#         plot.subtitle = element_text(size = 20, hjust = 0.5),
+#         legend.position = "bottom",
+#         legend.text = element_text(size = 14),
+#         legend.title = element_text(size = 14),
+#         plot.margin = ggplot2::margin(2, 2, 2, 2, unit = "pt")  # Global margin
+#       )
+#     )
+#   
+#   # Save the frame
+#   png_file <- file.path(tmp_dir, sprintf("frame_%03d.png", i))
+#   ggsave(png_file, combined_plot, width = 12, height = 12, dpi = 310, units = "in")
+#   
+#   return(png_file)
+# }
+# 
+# # Generate all frames in parallel with progress bar
+# message("Creating combined frames in parallel...")
+# png_files <- suppressWarnings(future_map(seq_len(nrow(all_days)),
+#                                          ~create_single_frame(.x, all_days, daily_map, allStreams, watershed_sites, tmp_dir),
+#                                          .options = furrr_options(
+#                                            seed = TRUE,
+#                                            packages = c("tidyverse", "sf", "patchwork", "ggthemes")
+#                                          ),
+#                                          .progress = TRUE)
+# )
+# 
+# # Combine frames into GIF
+# output_gif <- here("Figs/STICs/gifs/gpSheds.gif")
+# gifski::gifski(unlist(png_files), 
+#                output_gif,
+#                width = 1200, 
+#                height = 1200,
+#                delay = 0.1)
+# 
+# # Clean up
+# unlink(tmp_dir, recursive = TRUE)
+# 
+# # Reset parallel plan
+# plan(sequential)
+# 
+# message("\nSuccessfully created combined animation:")
+# message("- ", output_gif)
+
+```
+
+# Check streamDAG coords and lengths
+
+```{r}
+data(kon_coords)
+kon_coords <- kon_coords |>
+  mutate(Object.ID = sub("_[0-9]+$", "", Object.ID),
+         watershed = "KNZ") |> 
+  dplyr::rename(siteId = Object.ID) |> 
+  st_as_sf(coords = c("long", "lat"), crs = 4326, remove = F) |> 
+  st_transform(crs = 26914) 
+
+data("kon_lengths")
+kon_lengths <- kon_lengths |>
+  within(Arcs <- gsub("(_[0-9]+)(?=->|$)", "", Arcs, perl = TRUE)) |> 
+  separate(Arcs, into = c("from", "to"), sep = "->") |> 
+  rename(streamDAG_lengths = Lengths)
+
+
+kon_full <- streamDAGs("konza_full") |>
+  set_vertex_attr("name", value = sub("_[0-9]+$", "", V(kon_full)$name))
+
+knzCoords <- allSites |> 
+  filter(watershed == "KNZ") |> 
+  st_transform(crs = 26914)
+knzLengths <- all_arc_lengths[["KNZ"]] |> 
+  select(-watershed) |> 
+  separate(Arc, into = c("from", "to"), sep = "->") |> 
+  mutate(
+    from = trimws(from),
+    to   = trimws(to),
+    Length_km = Length/1000
+  ) |> 
+  select(-Length) |> 
+  rename(Con_length_km = Length_km)
+
+compLength <- kon_lengths |> 
+  left_join(knzLengths) |> 
+  mutate(diff_m = (Con_length_km - streamDAG_lengths)*1000,
+         Arc = paste(from, to, sep = "->")) 
+ggplot(compLength, aes(x = Arc, y = diff_m)) +
+  geom_point(color = "steelblue") +
+  geom_hline(yintercept = 0) +
+  labs(x = "Segment", y = "Difference (m)") +
+  theme_few()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) -> p
+p
+ggsave(filename = "arcDif_2.png", plot = p,
+         path = "~/Desktop/", device = "png", create.dir = TRUE,
+         width = 25.4, height = 14.2875, units = "cm", dpi = "retina")
+
+spatial.plot.sf(kon_coords$long, kon_coords$lat, kon_coords$siteId, shapefile = allStreams |> filter(watershed == "KNZ")) +
+  labs(title = "streamDAG")
+spatial.plot.sf(knzCoords$lon, knzCoords$lat, knzCoords$siteId, shapefile = allStreams |> filter(watershed == "KNZ")) +
+  labs(title = "Connor")
+
+
+kon_coords_length <- get_watershed_lengths("KNZ", kon_coords, allStreams) 
+
+```
+
+```{r}
+# Subset data
+knz_sites <- allSites |> filter(watershed == "KNZ") |> 
+  st_transform(26914)
+knz_streams <- allStreams |> filter(watershed == "KNZ") |> 
+  st_transform(26914)
+knzLengths <- all_arc_lengths[["KNZ"]] |> 
+  select(-watershed) |> 
+  separate(Arc, into = c("from", "to"), sep = "->") |> 
+  mutate(
+    from = trimws(from),
+    to   = trimws(to),
+    Length_km = Length/1000
+  ) |> 
+  select(-Length) |> 
+  rename(Con_length_km = Length_km)
+knz_presAbs <- nestPresAbs_filled |> 
+  unnest(cols = c(data)) |>
+  select(
+    c("watershed", "date"),
+    any_of(knz_sites$siteId)
+  )
+
+# Build network
+sites <- tribble(
+  ~from,   ~to,
+  "04M13", "04M12",
+  "04M12", "04M11",
+  "04M11", "04M10",
+  "04M10", "04M09",
+  "04M09", "04M08",
+  "04T02", "04M08",
+  "04M08", "04M07",
+  "04M07", "04M06",
+  "04T01", "04M06",
+  "04M06", "04M05",
+  "04M05", "04M04",
+  "04M04", "04M03",
+  "04M03", "04M02",
+  "04M02", "04M01",
+  "04M01", "SFM02",
+  "04W04", "04W03",
+  "04W03", "04W02",
+  "04W02", "04W01",
+  "04W01", "04M01",
+  "02M11", "02M10",
+  "02M10", "02M09",
+  "02M09", "02M08",
+  "02M08", "02M07",
+  "02M07", "02M06",
+  "02M06", "02M05",
+  "02M05", "02M04",
+  "02M04", "02M03",
+  "02M03", "02M02",
+  "02M02", "02M01",
+  "02M01", "SFM01",
+  "20M05", "20M04",
+  "20M04", "20M03",
+  "20M03", "20M02",
+  "20M02", "20M01",
+  "20M01", "SFM07",
+  "01M06", "01M05",
+  "01M05", "01M04",
+  "01M04", "01M03",
+  "01M03", "01M02",
+  "01M02", "01M01",
+  "01M01", "SFM07",
+  "SFM07", "SFM06",
+  "SFM06", "SFM05",
+  "SFT02", "SFM05",
+  "SFM05", "SFM04",
+  "SFM04", "SFM03",
+  "SFT01", "SFM03",
+  "SFM03", "SFM02",
+  "SFM02", "SFM01"
+)
+knz_nodes <- knz_sites |>
+  dplyr::mutate(siteId = as.character(siteId)) |>
+  dplyr::distinct(siteId, .keep_all = TRUE)
+
+# Build the sfnetwork
+knz_net <- sfnetwork(
+  nodes = knz_nodes,
+  edges = edges,
+  node_key = "siteId",
+  directed = TRUE
+)
+plot(knz_net)
+
+knz_net <- as_sfnetwork(knz_streams, directed = TRUE) |> 
+  st_network_blend(knz_sites) |> 
+  activate("edges") |> 
+  mutate(weight = st_length(geom))
+plot(knz_net)
+# Pull node data to get siteId info
+node_data <- knz_net |> 
+  activate("nodes") |> 
+  as_tibble() |> 
+  mutate(node_id = row_number()) |> 
+  st_drop_geometry()
+
+# Pull edge data and add from/to node siteIds
+edge_data <- knz_net |> 
+  activate("edges") |> 
+  as_tibble() |>
+  mutate(edge_id = row_number()) |>
+  left_join(node_data |> select(from = node_id, siteId_from = siteId), by = "from") |>
+  left_join(node_data |> select(to = node_id, siteId_to = siteId), by = "to")
+
+# Get edge geometries and compute length
+edge_geom <- knz_net |> 
+  activate("edges") |> 
+  st_geometry()
+
+edge_data <- edge_data |> 
+  mutate(length_m = st_length(edge_geom) |> as.numeric(),
+         weight = ifelse(!is.na(siteId_from) & !is.na(siteId_to), length_m, NA_real_))
+
+# Add the weights back into the sfnetwork
+knz_net <- knz_net |> 
+  activate("edges") |> 
+  mutate(weight = edge_data$weight) |> 
+  activate("nodes") |> 
+  mutate(is_terminal = node_is_leaf(),
+         has_siteId = !is.na(siteId)) |>
+  filter(!(is_terminal & !has_siteId)) |>
+  select(-is_terminal, -has_siteId) |> 
+  activate("nodes") |> 
+  mutate(is_terminal = node_is_leaf(),
+         has_siteId = !is.na(siteId)) |>
+  filter(!(is_terminal & !has_siteId)) |>
+  select(-is_terminal, -has_siteId) |> 
+  filter(!(node_is_root() & is.na(siteId)))
+
+
+
+
+tm_shape(knz_net |> activate(edges) |> as_tibble() |> st_as_sf()) +
+  tm_lines() +
+tm_shape(knz_net |> activate(nodes) |> as_tibble() |> st_as_sf()) +
+  tm_dots(size = 0.5, fill = "red") +
+    tm_basemap("Esri.WorldImagery")+
+  tmap_mode("view")
+
+day_i <- knz_presAbs[1,]
+# Get vector of site IDs with a value of 0 on that day
+sites_to_remove <- day_i |>
+  select(-watershed, -date) |>
+  purrr::keep(~ .x == "0") |>
+  names()
+
+# Remove those nodes from the network
+knz_net_subset <- knz_net |>
+  activate("nodes") |>
+  filter(!(siteId %in% sites_to_remove)) |> 
+  mutate(is_terminal = node_is_leaf(),
+         has_siteId = !is.na(siteId),
+         is_sink = node_is_sink())
+
+library(tmap)
+tm_shape(knz_net_subset |> activate(edges) |> as_tibble() |> st_as_sf()) +
+  tm_lines() +
+tm_shape(knz_net_subset |> activate(nodes) |> as_tibble() |> st_as_sf()) +
+  tm_dots(size = 0.5, fill = "red") +
+    tm_basemap("Esri.WorldImagery")+
+  tmap_mode("view")
+
+
+
+plot(knznet)
+# Extract coordinates from node geometries
+coords <- knz_net_subset |> 
+  sf::st_as_sf() |>
+  sf::st_coordinates() |>
+  as.data.frame()
+
+# Combine coordinates with node data for manual layout
+layout_df <- knz_net_subset |> 
+  sf::st_as_sf() |> 
+  dplyr::mutate(x = coords$X, y = coords$Y)
+
+# Now plot using ggraph with manual layout
+ggraph(knz_net_subset, layout = "manual", x = layout_df$x, y = layout_df$y) +
+  geom_edge_link(
+    edge_width = 0.8,
+    arrow = arrow(length = unit(4, "mm")), 
+    end_cap = circle(3, 'mm')
+  ) +
+  geom_node_point(color = "black") +
+  geom_node_text(aes(label = siteId), size = 2.5, repel = TRUE) +
+  theme_void()
+```

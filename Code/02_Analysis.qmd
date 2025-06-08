@@ -9,20 +9,16 @@ editor: visual
 #| include: false
 library(here)
 source(here("Code/paths+packages.R"))
-library(sf)
 library(preMetabolizer)
 library(furrr)
 library(PerformanceAnalytics)
 library(corrr)
 library(cluster)
 library(factoextra)
-library(lavaan)
 library(beepr)
 library(glue)
 library(cowplot)
 library(ggExtra)
-library(piecewiseSEM)
-library(lme4)
 library(caret)
 library(randomForest)
 library(gganimate)
@@ -78,9 +74,6 @@ seMaint <- bind_rows(all_sheets) |>
 ```
 
 ```{r}
-sites <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Sites")
-streams <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Streams")
-
 flowObs <- read_csv(here("Metadata/FlowObs.csv"))
 
 streamLight <- read_csv(here("Data/streamLight/predLight/all_sites_results.csv")) |> 
@@ -107,6 +100,8 @@ seDat <- fread(here("Data/SE_dailyData.csv")) |>
   mutate(Date = as_date(Date)) |> 
   full_join(seMaint)
 
+
+
 allDat <- gpDat |> 
   full_join(seDat) |> 
   select(-excProb, -DOSat.exc) |> 
@@ -119,9 +114,49 @@ allDat <- gpDat |>
          ) |> 
   select(-totalDO) |> 
     group_by(Site) |> 
-    mutate(excProb = calc_exceedance_prob(Q_1d, rm.Zero = T),
-           DOSat.exc = calc_exceedance_prob(avgDO.pctsat, rm.Zero = T)) |> 
-    ungroup()
+    mutate(excProb = calc_exceedance_prob(Q_1d, rm.zero = T),
+           DOSat.exc = calc_exceedance_prob(avgDO.pctsat, rm.zero = T)) |> 
+    ungroup() |> 
+  group_by(Site, waterYear) |> 
+  mutate(excProb_WY = calc_exceedance_prob(Q_1d, rm.zero = T)) |> 
+  ungroup()
+
+# Calculate stage thresholds for each site
+flowThresh <- allDat |>
+  drop_na(wetQf) |>
+  group_by(Site, wetQf) |>
+  summarise(
+    mean = mean(Depth_1d, na.rm = TRUE),
+    sd = sd(Depth_1d, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  filter(wetQf == "Pooled" & !is.na(mean) & !is.na(sd)) |>
+  mutate(thresh = mean + sd) |>
+  dplyr::select(Site, thresh)
+
+# Assign flowState based on threshold
+allDat <- allDat |>
+  left_join(flowThresh, by = "Site") |>
+  mutate(across(
+    .cols = matches("Depth_|maxDepth|minDepth"),
+    .fns = \(x) ifelse(x < 0, 0, x)
+  )) |> 
+  mutate(
+    percentConnected = percentConnected/100,
+    flowState = case_when(
+      is.na(thresh) ~ NA_character_,
+      Depth_1d > thresh ~ "Flowing",
+      TRUE ~ "Pooled"
+    )
+  )
+
+## New Alpha centrality
+sticAC <- read_csv(here("Data/STICs/streamDAG_metrics.csv")) |> 
+  rename(Date = date, Site = watershed)
+
+allDat <- allDat |> 
+  select(-c(ICSL, AlphaCentrality, Harary)) |> 
+  left_join(sticAC)
 
 dailyHydro <- allDat|>
   select(Site, Date, wetQf, PercWet_1d, PercWet_7d, PercWet_14d, PercWet_30d, PercWet_60d,
@@ -129,7 +164,7 @@ dailyHydro <- allDat|>
          minDepth, maxDepth, Depth_1d, Depth_7d, Depth_14d, Depth_30d, Depth_60d,
          minQ, maxQ, Q_1d, Q_7d, Q_14d, Q_30d, Q_60d, excProb,
          PPT_1d, PPT_7d, PPT_14d, PPT_30d, PPT_60d,
-         AlphaCentrality, upstream_length, percentConnected, DOY_sin, DOY_cos)
+         a_cent, upstream_length, percentConnected, DOY, DOY_sin, DOY_cos)
 
 dailyDat <- allDat |> 
   drop_na(avgDO.pctsat)
@@ -154,7 +189,59 @@ dailyDat |>
   labs(title = "Histograms of Variables", x = "Value", y = "Frequency")
 
 dailyDat |>
+  filter(Site %in% c("KNZ", "SHN", "YMR")) |>
   ggplot(aes(x = excProb, y = Q_1d, color = Site)) +
+  geom_line(na.rm = TRUE, linewidth = 2) +
+  scale_color_manual(values = okabeIto) +
+  scale_y_continuous(
+    trans = "log10",
+    labels = label_number()
+  ) +
+  scale_x_continuous(labels = label_percent(accuracy = 1)) +
+  labs(
+    x = "Discharge Exceedance Probability (%)",
+    y = bquote("Discharge ("*L~s^{-1}*")")
+  ) +
+  #facet_wrap(~waterYear, ncol = 1) +
+  theme_few() +
+  guides(color = guide_legend(title = NULL)) +
+  theme(
+    text = element_text(size = 20),          # overall text size
+    legend.text = element_text(size = 20),   # legend entries
+    legend.title = element_text(size = 20),  # legend title
+    axis.title = element_text(size = 20),    # axis titles
+    axis.text = element_text(size = 20),     # axis tick labels
+    plot.title = element_text(size = 20, hjust = 0.5),
+    legend.position = "bottom"
+  ) -> excProb
+ggsave(filename = "excProb.png", plot = excProb, path = here("Figs/"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = "retina")
+
+dailyDat |>
+  filter(Site %in% c("KNZ", "SHN", "YMR")) |>
+  ggplot(aes(x = DOSat.exc, y = avgDO.pctsat, color = Site)) +
+  geom_line(na.rm = TRUE, linewidth = 2) +
+  scale_color_manual(values = okabeIto) +
+  scale_x_continuous(labels = label_percent(accuracy = 1)) +
+  labs(
+  x = "DO Exceedance Probability (%)",
+  y = expression("Daily Mean DO"["% Sat"])
+  )+
+  theme_few() +
+  guides(color = guide_legend(title = NULL)) +
+  theme(
+    text = element_text(size = 20),          # overall text size
+    legend.text = element_text(size = 20),   # legend entries
+    legend.title = element_text(size = 20),  # legend title
+    axis.title = element_text(size = 20),    # axis titles
+    axis.text = element_text(size = 20),     # axis tick labels
+    plot.title = element_text(size = 20, hjust = 0.5),
+    legend.position = "bottom"
+  ) -> doExcProb
+ggsave(filename = "DO_ExcProb.png", plot = doExcProb, path = here("Figs/"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = "retina")
+
+dailyDat |>
+  filter(Site %in% c("KNZ", "SHN", "YMR")) |>
+  ggplot(aes(x = excProb, y = DOSat.exc, color = Site)) +
   geom_line(na.rm = TRUE, linewidth = 1) +
   scale_color_manual(values = okabeIto) +
   scale_y_continuous(
@@ -164,24 +251,13 @@ dailyDat |>
   scale_x_continuous(labels = label_percent(accuracy = 1)) +
   labs(
     x = "Exceedance Probability (%)",
-    y = bquote("Discharge ("*L~s^{-1}*")")
+    y = bquote("DO (% Sat)")
   ) +
+  #facet_wrap(~waterYear, ncol = 1) +
   theme_few() +
   theme(legend.position = "bottom") +
   guides(color = guide_legend(title = NULL))
 
-dailyDat |>
-  ggplot(aes(x = DOSat.exc, y = avgDO.pctsat, color = Site)) +
-  geom_line(na.rm = TRUE, linewidth = 1) +
-  scale_color_manual(values = okabeIto) +
-  scale_x_continuous(labels = label_percent(accuracy = 1)) +
-  labs(
-    x = "Exceedance Probability (%)",
-    y = bquote("DO ("*"% saturation"*")")
-  ) +
-  theme_few() +
-  theme(legend.position = "bottom") +
-  guides(color = guide_legend(title = NULL))
 wetQf_colors <- c("Flowing" = "#0077BB", "Pooled" = "#BBBB00", "Dry" = "#E69F00")
 
 dailyHydro |> 
@@ -216,6 +292,22 @@ dailyHydro |>
     strip.text = element_text(face = "bold")
   ) +
   facet_wrap(~ Site, ncol = 1, scales = "free") 
+
+dailyHydro |> 
+  filter(Site %in% c("KNZ", "SHN", "YMR")) |>
+  ggplot(aes(x = DOY, y = PercWet_1d, color = Site)) +
+  geom_point(size = 3, alpha = 0.8) +
+  scale_color_manual(values = okabeIto) +
+  labs(
+    x = "",
+    y = "Discharge (L/s)"
+  ) +
+  theme_few() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    strip.text = element_text(face = "bold")
+  )
 ```
 
 # StreamDAG vs % Wet
@@ -223,9 +315,9 @@ dailyHydro |>
 ```{r}
 dailyDat |>
   group_by(Site) |> 
-  mutate(AlphaCentrality = scale(AlphaCentrality)[, 1]) |> 
+  mutate(a_cent = scale(a_cent)[, 1]) |> 
   ungroup() |> 
-  ggplot(aes(x = PercWet_1d, y = AlphaCentrality, color = DOY)) +
+  ggplot(aes(x = percent_network_wet, y = a_cent, color = DOY)) +
   geom_point(na.rm = TRUE) +
   scale_color_distiller(palette = "Spectral") +
   scale_x_continuous(labels = label_percent(accuracy = 1)) +
@@ -235,48 +327,22 @@ dailyDat |>
 p
 ggsave(filename = "AC_PercWet.png", plot = p, path = here("Figs/STICs"), device = "png", width = 25.4, height = 14.2875, units = "cm", dpi = "retina")
 
-dailyDat |>
-  group_by(Site) |> 
-  mutate(IntactStreamLength = scale(IntactStreamLength)[, 1]) |> 
-  ungroup() |> 
-  ggplot(aes(x = PercWet_1d, y = IntactStreamLength, color = DOY)) +
-  geom_point(na.rm = TRUE) +
-  scale_color_distiller(palette = "Spectral") +
-  scale_x_continuous(labels = label_percent(accuracy = 1)) +
-  labs(x = "% Wet", y = "Intact Stream Length") +
-  theme_few() +
-  facet_wrap(~Site) -> p
-p
-ggsave(filename = "ISL_PercWet.png", plot = p, path = here("Figs/STICs"), device = "png", width = 25.4, height = 14.2875, units = "cm", dpi = "retina")
 
 dailyDat |>
-  group_by(Site) |> 
-  mutate(Harary = scale(Harary)[, 1]) |> 
-  ungroup() |> 
-  ggplot(aes(x = PercWet_1d, y = Harary, color = DOY)) +
-  geom_point(na.rm = TRUE) +
-  scale_color_distiller(palette = "Spectral") +
-  scale_x_continuous(labels = label_percent(accuracy = 1)) +
-  labs(x = "% Wet", y = "Harary") +
-  theme_few() +
-  facet_wrap(~Site) -> p
+  mutate(Year = year(Date), 
+         Month = factor(lubridate::month(Date, label = T))) |>
+  filter(!Month %in% c("Oct", "Nov", "Dec")) |> 
+  group_by(Site, Month) |> 
+  summarise(Q = mean(Q_1d, na.rn = T)) |> 
+  filter(Site %in% c("KNZ", "SHN", "YMR")) |> 
+  ggplot(aes(x = factor(Month), y = log1p(Q), fill = Site)) +
+  #geom_point(na.rm = TRUE) +
+  geom_bar(stat = "identity", position = "dodge")+
+  scale_fill_manual(values = okabeIto)+
+  #scale_x_continuous(labels = label_percent(accuracy = 1)) +
+  labs(x = "Month") +
+  theme_few()
 p
-ggsave(filename = "Har_PercWet.png", plot = p, path = here("Figs/STICs"), device = "png", width = 25.4, height = 14.2875, units = "cm", dpi = "retina")
-
-
-dailyDat |>
-  group_by(Site) |> 
-  mutate(ICSL = scale(ICSL)[, 1]) |> 
-  ungroup() |> 
-  ggplot(aes(x = PercWet_1d, y = ICSL, color = DOY)) +
-  geom_point(na.rm = TRUE) +
-  scale_color_distiller(palette = "Spectral") +
-  scale_x_continuous(labels = label_percent(accuracy = 1)) +
-  labs(x = "% Wet", y = "ICSL") +
-  theme_few() +
-  facet_wrap(~Site) -> p
-p
-ggsave(filename = "ICSL_PercWet.png", plot = p, path = here("Figs/STICs"), device = "png", width = 25.4, height = 14.2875, units = "cm", dpi = "retina")
 ```
 
 # Temporal Autocorrelation
@@ -297,7 +363,7 @@ dailyDat |>
 ```
 
 ```{r}
-vars <- c("avgDO.pctsat", "DOpctsat.amp", "DOSat.exc", "PercWet_1d", "AlphaCentrality", "upstream_length", "percentConnected","Depth_1d", "Q_1d", "excProb", "avgPar", "PPT_1d")#, "DOpctsat.amp_diff", "DOSat.exc_diff")# "avgDO.pctsat", "PercWet_1d", "AlphaCentrality", "upstream_length", "percentConnected","Depth_1d", "Q_1d", "excProb",
+vars <- c("avgDO.pctsat", "DOpctsat.amp", "DOSat.exc", "percent_network_wet", "a_cent", "upstream_length", "percentConnected","Depth_1d", "Q_1d", "excProb", "avgPar", "PPT_1d")#, "DOpctsat.amp_diff", "DOSat.exc_diff")# "avgDO.pctsat", "PercWet_1d", "alpha_cent", "upstream_length", "percentConnected","Depth_1d", "Q_1d", "excProb",
 
 dailyDat <- dailyDat |> 
   group_by(Site) |> 
@@ -376,69 +442,13 @@ p
 #ggsave(filename = "PACF.png", plot = p, path = here("Figs/"), device = "png", width = 25.4, height = 14.2875, units = "cm", dpi = "retina")
 ```
 
-# Hydro Metrics PCA
-
-```{r}
-sticDat <- dailyDat |>
-  select(Site, Date, PercWet_1d, AlphaCentrality, upstream_length, percentConnected, Depth_1d, Q_1d, excProb, avgDO.pctsat, DOpctsat.amp, DOSat.exc, sdDO.pctsat, DOSat.slope, probHypSat, minDO.pctsat, maxDO.pctsat, PPT_1d) |>
-  group_by(Site) |>
-    mutate(across(where(is.numeric), ~ (. - mean(., na.rm = TRUE)) / sd(., na.rm = TRUE), .names = "{.col}")) |>
-  ungroup() |> 
-  drop_na()
-
-#PCA
-# Select columns for PCA
-sticPCA <- sticDat |>
-  select(PercWet_1d, AlphaCentrality, upstream_length, percentConnected, Depth_1d, Q_1d, excProb, avgDO.pctsat, DOpctsat.amp, DOSat.exc, sdDO.pctsat, DOSat.slope, probHypSat, minDO.pctsat, maxDO.pctsat, PPT_1d) |>
-  drop_na() |>  # Remove rows with missing values
-  prcomp() 
-
-#extract loadings
-sticPCA |>
-  tidy(matrix = "loadings")
-
-#Variance explained
-sticPCA |>
-  tidy(matrix = "eigenvalues")
-
-#Scree plot
-fviz_eig(sticPCA, addlabels = TRUE)
-
-#Qual of representation
-fviz_cos2(sticPCA, choice = "var", axes = 1)
-fviz_cos2(sticPCA, choice = "var", axes = 2)
-fviz_cos2(sticPCA, choice = "var", axes = 3)
-
-#Biplot
-fviz_pca_biplot(
-  sticPCA,
-  geom = "point",
-  habillage = sticDat$Site,
-  addEllipses = TRUE,
-  ellipse.level = 0.95,
-  col.var = "black",
-  repel = TRUE
-) +
-  scale_color_manual(values = okabeIto) +
-  scale_fill_manual(values = okabeIto) +
-  labs(color = "Site", shape = "Site", fill = "Site") +
-  theme_few() +
-  theme(legend.position = "bottom") -> p
-p
-
-ggMarginal(
-  p,
-  type = "density",
-  groupColour = TRUE,
-  groupFill = TRUE
-)
-```
-
 # DO Metrics PCA
 
 ```{r}
+gpSens <- c("KNZ", "SHN", "YMR")
 pcaDat <- dailyDat |>
-  select(Site, Date, avgDO.pctsat, DOpctsat.amp, DOSat.exc, sdDO.pctsat, DOSat.slope, probHypSat, minDO.pctsat, maxDO.pctsat) |>
+  filter(Site %in% gpSens) |> 
+  select(Site, Date, avgDO.pctsat, DOpctsat.amp, DOSat.exc, probHypSat, minDO.pctsat, maxDO.pctsat) |>
   group_by(Site) |>
     mutate(across(where(is.numeric), ~ (. - mean(., na.rm = TRUE)) / sd(., na.rm = TRUE), .names = "{.col}")) |>
   ungroup() |> 
@@ -447,7 +457,7 @@ pcaDat <- dailyDat |>
 #PCA
 # Select columns for PCA
 doPCA <- pcaDat |>
-  select(avgDO.pctsat, DOpctsat.amp, DOSat.exc, sdDO.pctsat, DOSat.slope, probHypSat, minDO.pctsat, maxDO.pctsat) |>
+  select(avgDO.pctsat, DOpctsat.amp, DOSat.exc, probHypSat, minDO.pctsat, maxDO.pctsat) |>
   drop_na() |>  # Remove rows with missing values
   prcomp() 
 
@@ -475,8 +485,8 @@ fviz_pca_biplot(
   addEllipses = TRUE,
   ellipse.level = 0.95,
   col.var = "black",
-  repel = TRUE
-) +
+  repel = TRUE) +
+  labs(title = "") +
   scale_color_few()+
   scale_fill_few()+
   #scale_color_manual(values = okabeIto) +
@@ -493,11 +503,97 @@ ggMarginal(
   groupColour = TRUE,
   groupFill = TRUE
 )
+# Set descriptive variable labels
+var_labels <- c(
+  avgDO.pctsat = "Avg.",
+  DOpctsat.amp = "Amplitude",
+  DOSat.exc = "Exceedence Probability",
+  probHypSat = "Probability of Hypoxia",
+  minDO.pctsat = "Min",
+  maxDO.pctsat = "Max"
+)
+
+# Rename the variable labels in the PCA object
+rownames(doPCA$rotation) <- var_labels[rownames(doPCA$rotation)]
+
+# Re-run biplot with new labels
+pcaPlt <- fviz_pca_biplot(
+  doPCA,
+  geom = "point",
+  habillage = pcaDat$Site,
+  addEllipses = TRUE,
+  ellipse.level = 0.95,
+  col.var = "black",
+  repel = TRUE
+) +
+  labs(title = "Daily DO Metrics") +
+  scale_color_few() +
+  scale_fill_few() +
+  labs(color = "Site", shape = "Site", fill = "Site") +
+  theme_few() +
+  theme(legend.position = "bottom") 
+pcaPlt
+ggsave(filename = "DO_PCA_sfs.png", plot = pcaPlt, path = here("Figs/"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = "retina")
+
+# Add marginal histograms
+ggMarginal(
+  pcaPlt,
+  type = "density",
+  groupColour = TRUE,
+  groupFill = TRUE
+)
+
+pcaPlt <- fviz_pca_biplot(
+  doPCA,
+  geom = "point",
+  habillage = pcaDat$Site,
+  addEllipses = TRUE,
+  ellipse.level = 0.95,
+  col.var = "black",
+  repel = TRUE,
+  labelsize = 6,  # increase for variable labels (try 6–8 for slides)
+  pointsize = 3,       # control size here
+  point.alpha = 0.5    # control alpha here
+) +
+  labs(title = expression(paste("Daily DO"["% Sat"], " Metrics")))+
+  scale_color_few() +
+  scale_fill_few() +
+  labs(color = "Site", shape = "Site", fill = "Site") +
+  theme_few() +
+  theme(
+    text = element_text(size = 18),          # overall text size
+    legend.text = element_text(size = 16),   # legend entries
+    legend.title = element_text(size = 18),  # legend title
+    axis.title = element_text(size = 18),    # axis titles
+    axis.text = element_text(size = 16),     # axis tick labels
+    plot.title = element_text(size = 20, hjust = 0.5),
+    legend.position = "bottom"
+  )
+
+pcaPlt
+# Save at high resolution, large size for slides
+ggsave(
+  filename = "DO_PCA_sfs.png",
+  plot = pcaPlt,
+  path = here("Figs/"),
+  device = "png",
+  width = 25.4, height = 25.4, units = "cm",
+  dpi = 600 
+)
+
+# Add marginal histograms
+ggMarginal(
+  pcaPlt,
+  type = "density",
+  groupColour = TRUE,
+  groupFill = TRUE
+)
 
 ```
 
 ```{r}
 pcaDat <- dailyDat |>
+  filter(Site %in% gpSens) |> 
   select(Site, Date, avgDO.pctsat, DOpctsat.amp, DOSat.exc) |>
   group_by(Site) |>
     mutate(across(where(is.numeric), ~ (. - mean(., na.rm = TRUE)) / sd(., na.rm = TRUE), .names = "{.col}")) |>
@@ -535,7 +631,9 @@ fviz_pca_biplot(
   addEllipses = TRUE,
   ellipse.level = 0.95,
   col.var = "black",
-  repel = TRUE
+  repel = TRUE,
+  pointsize = 3,       
+  point.alpha = 0.5    
 ) +
   scale_color_few()+
   scale_fill_few()+
@@ -555,7 +653,7 @@ ggMarginal(
 )
 
 
-ggsave(filename = "DO_PCA.png", plot = pcaPlt, path = here("Figs/"), device = "png", width = 25.4, height = 14.2875, units = "cm", dpi = "retina")
+ggsave(filename = "DO_PCA.png", plot = pcaPlt, path = here("Figs/"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = "retina")
 
 
 pca_scores <- as.data.frame(doPCA$x) |>
@@ -592,166 +690,166 @@ ggplot(pca_scores, aes(x = PC1, y = PC2, color = cluster)) +
 # NMDS
 
 ```{r}
-# Step 1: Prepare data
-ordData <- dailyDat |>
-  select(Site, Date,
-         # community (DO regime)
-         avgDO.pctsat, DOpctsat.amp, DOSat.exc, #) |>
-         # environmental variables
-         AlphaCentrality, upstream_length, percentConnected, minQ, maxQ, Q_1d, excProb,
-         maxDepth, PPT_1d, PercWet_1d, avgPar, water.temp, DOY) |>
-  drop_na()
-
-# Step 2: Separate community and environment matrices
-comm <- ordData |>
-  select(avgDO.pctsat, DOpctsat.amp, DOSat.exc)
-
-env <- ordData |>
-  select(AlphaCentrality, upstream_length, percentConnected, minQ, maxQ, Q_1d, excProb,
-         maxDepth, PPT_1d, PercWet_1d, avgPar, water.temp, DOY)
-
-# Step 3: Run NMDS (2 dimensions)
-set.seed(42)
-nmds <- metaMDS(comm, distance = "bray", k = 2, try = 50, maxtry = 200, autotransform = TRUE)
-stressplot(nmds)
-# Step 4: Fit environmental vectors
-fit <- envfit(nmds, env, permutations = 999)
-
-# Step 5: Extract NMDS scores and bind metadata
-nmds_scores <- scores(nmds, display = "sites") |> as_tibble() |>
-  bind_cols(ordData |> select(Site, Date))
-
-# Step 6: Plot NMDS with environmental vectors
-nmds_plot <- ggplot(nmds_scores, aes(x = NMDS1, y = NMDS2, color = Site, shape = Site)) +
-  geom_point(size = 2, alpha = 0.8) +
-  #stat_ellipse(aes(group = Site), linetype = "dashed") +
-  scale_color_manual(values = okabeIto) +
-  labs(title = "NMDS - DO Regime Structure",
-       x = "NMDS1", y = "NMDS2") +
-  theme_few() #+
-  #theme(legend.position = "bottom")
-
-# Add envfit arrows
-arrow_df <- as.data.frame(scores(fit, display = "vectors"))
-arrow_df$var <- rownames(arrow_df)
-# Add envfit arrows
-nmds_plot <- nmds_plot +
-  geom_segment(
-    data = arrow_df,
-    aes(x = 0, y = 0, xend = NMDS1, yend = NMDS2),
-    inherit.aes = FALSE,  # CRITICAL: prevents looking for 'Site' in arrow_df
-    arrow = arrow(length = unit(0.25, "cm")),
-    color = "black"
-  ) +
-  geom_text_repel(
-    data = arrow_df,
-    aes(x = NMDS1 * 1.1, y = NMDS2 * 1.1, label = var),
-    inherit.aes = FALSE, 
-    size = 3,
-    color = "black"
-  )
-nmds_plot
-nmds_scores <- scores(nmds, display = "sites") |> 
-  as.data.frame() |> 
-  bind_cols(ordData |> select(Site, Date))  # Add metadata
-
+# # Step 1: Prepare data
+# ordData <- dailyDat |>
+#   select(Site, Date,
+#          # community (DO regime)
+#          avgDO.pctsat, DOpctsat.amp, DOSat.exc, #) |>
+#          # environmental variables
+#          alpha_cent, upstream_length, percentConnected, minQ, maxQ, Q_1d, excProb,
+#          maxDepth, PPT_1d, PercWet_1d, avgPar, water.temp, DOY) |>
+#   drop_na()
 # 
-# majority_rule <- NbClust::NbClust(data = nmds_scores |> select(-Site, -Date), 
-#                                   distance='euclidean', 
-#                                   min.nc = 2, max.nc = 9, 
-#                                   method="ward.D2", 
-#                                   index = "all") |> 
-#   (\(x) {
-#     tbl <- table(x$Best.nc["Number_clusters", ])
-#     as.numeric(names(tbl)[which.max(tbl)])
-#   })()
-
-set.seed(123)
-k_clust <- kmeans(comm, centers = 3)  # try 2–6 clusters
-
-nmds_scores$Cluster <- factor(k_clust$cluster)
-clusterColors <- c("1" = "#BBBB00", "2" = "#E69F00", "3" = "#0077BB")
-ggplot(nmds_scores, aes(x = NMDS1, y = NMDS2, color = Cluster, shape = Site)) +
-  # Points with custom aesthetics
-  geom_point(alpha = 0.5) +
-  # Cluster ellipses (using cluster grouping)
-  #stat_ellipse(aes(group = Cluster, color = Cluster),linetype = "dashed",linewidth = 0.8, show.legend = FALSE) +
-  # Custom color scale (clusters)
-  scale_color_manual(values = clusterColors) +
-  # Labels and theme
-  labs(
-    title = "DO Regime Clusters in NMDS Space", x = "NMDS1", y = "NMDS2") +
-  theme_few() +
-  theme(
-    legend.position = "right",
-    legend.box = "vertical"
-  ) +
-  # Separate legends for color (cluster) and shape (site)
-  guides(
-    color = guide_legend(order = 1, title = "Cluster"),
-    shape = guide_legend(order = 2, title = "Site")
-  ) +
-  geom_segment(
-    data = arrow_df,
-    aes(x = 0, y = 0, xend = NMDS1, yend = NMDS2),
-    inherit.aes = FALSE, 
-    arrow = arrow(length = unit(0.25, "cm")),
-    color = "black"
-  ) +
-  geom_text_repel(
-    data = arrow_df,
-    aes(x = NMDS1 * 1.1, y = NMDS2 * 1.1, label = var),
-    inherit.aes = FALSE, 
-    size = 3,
-    color = "black"
-  )
-
-table(nmds_scores$Cluster, nmds_scores$Site)
-fviz_nbclust(nmds_scores[, 1:2], kmeans, method = "silhouette")  # optimal k
-sil <- silhouette(k_clust$cluster, dist(nmds_scores[, 1:2]))
-mean(sil[, "sil_width"])  # closer to 1 is better
-
-
-# 1. Add cluster assignments to your original data
-ordData_with_clusters <- ordData |> 
-  mutate(Cluster = factor(k_clust$cluster))
-
-# 2. Create the plot
-ggplot(ordData_with_clusters, aes(x = Date, y = avgDO.pctsat, color = Cluster)) +
-  geom_point(alpha = 0.7) +
-  facet_wrap(~ Site, scales = "free_x") + 
-  scale_color_manual(values = clusterColors) +
-  labs(title = "Dissolved Oxygen (% Saturation) by Cluster",
-       x = "Date",
-       y = "DO (% saturation)",
-       color = "Cluster") +
-  theme_few() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
-
-library(gganimate)
-
-nmds_scores <- scores(nmds, display = "sites") |> 
-  as.data.frame() |> 
-  bind_cols(ordData |> select(Site, Date, DOY)) |> 
-  arrange(DOY) |>
-  mutate(DateLabel = as.Date(DOY, origin = "1999-12-31"))  
-
-nmds_anim <- ggplot(nmds_scores, aes(x = NMDS1, y = NMDS2, color = DOY)) +
-  geom_point(alpha = 0.7, size = 1.5) +
-  scale_color_viridis_c() +
-  ggtitle(
-    "NMDS - DO Regime",
-    subtitle = '{format(frame_time, "%b %d")}'
-  ) +
-  theme_few() +
-  transition_time(DateLabel)
-
-
-# Animate it
-nmds_gif <- animate(nmds_anim, width = 800, height = 600, fps = 15, duration = 10, renderer = gifski_renderer())
-# Save as GIF
-anim_save("~/Desktop/nmds.gif", animation = nmds_gif)
-
+# # Step 2: Separate community and environment matrices
+# comm <- ordData |>
+#   select(avgDO.pctsat, DOpctsat.amp, DOSat.exc)
+# 
+# env <- ordData |>
+#   select(alpha_cent, upstream_length, percentConnected, minQ, maxQ, Q_1d, excProb,
+#          maxDepth, PPT_1d, PercWet_1d, avgPar, water.temp, DOY)
+# 
+# # Step 3: Run NMDS (2 dimensions)
+# set.seed(42)
+# nmds <- metaMDS(comm, distance = "bray", k = 2, try = 50, maxtry = 200, autotransform = TRUE)
+# stressplot(nmds)
+# # Step 4: Fit environmental vectors
+# fit <- envfit(nmds, env, permutations = 999)
+# 
+# # Step 5: Extract NMDS scores and bind metadata
+# nmds_scores <- scores(nmds, display = "sites") |> as_tibble() |>
+#   bind_cols(ordData |> select(Site, Date))
+# 
+# # Step 6: Plot NMDS with environmental vectors
+# nmds_plot <- ggplot(nmds_scores, aes(x = NMDS1, y = NMDS2, color = Site, shape = Site)) +
+#   geom_point(size = 2, alpha = 0.8) +
+#   #stat_ellipse(aes(group = Site), linetype = "dashed") +
+#   scale_color_manual(values = okabeIto) +
+#   labs(title = "NMDS - DO Regime Structure",
+#        x = "NMDS1", y = "NMDS2") +
+#   theme_few() #+
+#   #theme(legend.position = "bottom")
+# 
+# # Add envfit arrows
+# arrow_df <- as.data.frame(scores(fit, display = "vectors"))
+# arrow_df$var <- rownames(arrow_df)
+# # Add envfit arrows
+# nmds_plot <- nmds_plot +
+#   geom_segment(
+#     data = arrow_df,
+#     aes(x = 0, y = 0, xend = NMDS1, yend = NMDS2),
+#     inherit.aes = FALSE,  # CRITICAL: prevents looking for 'Site' in arrow_df
+#     arrow = arrow(length = unit(0.25, "cm")),
+#     color = "black"
+#   ) +
+#   geom_text_repel(
+#     data = arrow_df,
+#     aes(x = NMDS1 * 1.1, y = NMDS2 * 1.1, label = var),
+#     inherit.aes = FALSE, 
+#     size = 3,
+#     color = "black"
+#   )
+# nmds_plot
+# nmds_scores <- scores(nmds, display = "sites") |> 
+#   as.data.frame() |> 
+#   bind_cols(ordData |> select(Site, Date))  # Add metadata
+# 
+# # 
+# # majority_rule <- NbClust::NbClust(data = nmds_scores |> select(-Site, -Date), 
+# #                                   distance='euclidean', 
+# #                                   min.nc = 2, max.nc = 9, 
+# #                                   method="ward.D2", 
+# #                                   index = "all") |> 
+# #   (\(x) {
+# #     tbl <- table(x$Best.nc["Number_clusters", ])
+# #     as.numeric(names(tbl)[which.max(tbl)])
+# #   })()
+# 
+# set.seed(123)
+# k_clust <- kmeans(comm, centers = 3)  # try 2–6 clusters
+# 
+# nmds_scores$Cluster <- factor(k_clust$cluster)
+# clusterColors <- c("1" = "#BBBB00", "2" = "#E69F00", "3" = "#0077BB")
+# ggplot(nmds_scores, aes(x = NMDS1, y = NMDS2, color = Cluster, shape = Site)) +
+#   # Points with custom aesthetics
+#   geom_point(alpha = 0.5) +
+#   # Cluster ellipses (using cluster grouping)
+#   #stat_ellipse(aes(group = Cluster, color = Cluster),linetype = "dashed",linewidth = 0.8, show.legend = FALSE) +
+#   # Custom color scale (clusters)
+#   scale_color_manual(values = clusterColors) +
+#   # Labels and theme
+#   labs(
+#     title = "DO Regime Clusters in NMDS Space", x = "NMDS1", y = "NMDS2") +
+#   theme_few() +
+#   theme(
+#     legend.position = "right",
+#     legend.box = "vertical"
+#   ) +
+#   # Separate legends for color (cluster) and shape (site)
+#   guides(
+#     color = guide_legend(order = 1, title = "Cluster"),
+#     shape = guide_legend(order = 2, title = "Site")
+#   ) +
+#   geom_segment(
+#     data = arrow_df,
+#     aes(x = 0, y = 0, xend = NMDS1, yend = NMDS2),
+#     inherit.aes = FALSE, 
+#     arrow = arrow(length = unit(0.25, "cm")),
+#     color = "black"
+#   ) +
+#   geom_text_repel(
+#     data = arrow_df,
+#     aes(x = NMDS1 * 1.1, y = NMDS2 * 1.1, label = var),
+#     inherit.aes = FALSE, 
+#     size = 3,
+#     color = "black"
+#   )
+# 
+# table(nmds_scores$Cluster, nmds_scores$Site)
+# fviz_nbclust(nmds_scores[, 1:2], kmeans, method = "silhouette")  # optimal k
+# sil <- silhouette(k_clust$cluster, dist(nmds_scores[, 1:2]))
+# mean(sil[, "sil_width"])  # closer to 1 is better
+# 
+# 
+# # 1. Add cluster assignments to your original data
+# ordData_with_clusters <- ordData |> 
+#   mutate(Cluster = factor(k_clust$cluster))
+# 
+# # 2. Create the plot
+# ggplot(ordData_with_clusters, aes(x = Date, y = avgDO.pctsat, color = Cluster)) +
+#   geom_point(alpha = 0.7) +
+#   facet_wrap(~ Site, scales = "free_x") + 
+#   scale_color_manual(values = clusterColors) +
+#   labs(title = "Dissolved Oxygen (% Saturation) by Cluster",
+#        x = "Date",
+#        y = "DO (% saturation)",
+#        color = "Cluster") +
+#   theme_few() +
+#   theme(axis.text.x = element_text(angle = 45, hjust = 1))
+# 
+# library(gganimate)
+# 
+# nmds_scores <- scores(nmds, display = "sites") |> 
+#   as.data.frame() |> 
+#   bind_cols(ordData |> select(Site, Date, DOY)) |> 
+#   arrange(DOY) |>
+#   mutate(DateLabel = as.Date(DOY, origin = "1999-12-31"))  
+# 
+# nmds_anim <- ggplot(nmds_scores, aes(x = NMDS1, y = NMDS2, color = DOY)) +
+#   geom_point(alpha = 0.7, size = 1.5) +
+#   scale_color_viridis_c() +
+#   ggtitle(
+#     "NMDS - DO Regime",
+#     subtitle = '{format(frame_time, "%b %d")}'
+#   ) +
+#   theme_few() +
+#   transition_time(DateLabel)
+# 
+# 
+# # Animate it
+# nmds_gif <- animate(nmds_anim, width = 800, height = 600, fps = 15, duration = 10, renderer = gifski_renderer())
+# # Save as GIF
+# anim_save("~/Desktop/nmds.gif", animation = nmds_gif)
+# 
 
 ```
 
@@ -787,10 +885,11 @@ anim_save("~/Desktop/nmds.gif", animation = nmds_gif)
 ```{r}
 # Define cluster colors
 #clusterColors <- c("1" = "#228833", "2" = "#66CCEE", "3" = "#AA3377")
-clusterColors <- c("1" = "#0077BB", "2" = "#BBBB00", "3" = "#E69F00")
+clusterColors <- c("1" = "#0077BB", "2" = "#E69F00", "3" = "#BBBB00")
 
 # Select DO columns and drop missing values
 kmDat <- dailyDat |>
+  filter(Site %in% gpSens) |> 
   select(Site, Date, avgDO.pctsat, DOpctsat.amp, DOSat.exc) |> 
   group_by(Site) |>
   mutate(across(where(is.numeric), ~ (. - mean(., na.rm = TRUE)) / sd(., na.rm = TRUE), .names = "{.col}")) |>
@@ -814,7 +913,12 @@ kmeans_result |>
 
 # Create a cluster column
 kmDat <- kmDat |> 
-  mutate(cluster = as.factor(kmeans_result$cluster))
+  mutate(cluster = kmeans_result$cluster) |> 
+  mutate(cluster = as.factor(case_when(
+           cluster == 1 ~ 3,
+           cluster == 3 ~ 2,
+           cluster == 2 ~ 1,
+           TRUE ~ cluster)))
 
 # Perform PCA
 kmeansPCA <- kmDat |> 
@@ -838,81 +942,244 @@ kmeansScores <- kmeansPCA |>
   pivot_wider(names_from = PC, values_from = value) |> 
   select(PC1 = `1`, PC2 = `2`) |> 
   bind_cols(kmDat)  # Attach Site & Cluster info
-
+  
 # Extract PCA loadings (variable influence on components)
 kmeansLoadings <- as.data.frame(kmeansPCA$rotation) |> 
   rownames_to_column(var = "Variable") |> 
   mutate(PC1 = PC1 * max(abs(kmeansScores$PC1)) * 0.9,  # Scale arrows
          PC2 = PC2 * max(abs(kmeansScores$PC2)) * 0.9)  
+# Set descriptive variable labels
+var_labels <- c(
+  avgDO.pctsat = "Avg.",
+  DOpctsat.amp = "Amplitude",
+  DOSat.exc = "Exceedance Probability"
+)
 
+# Apply new labels to the variable arrows
+kmeansLoadings <- kmeansLoadings |>
+  mutate(Variable = var_labels[Variable])
 # PCA with Site shapes
 p <- ggplot(kmeansScores, aes(x = PC1, y = PC2, color = cluster, shape = Site)) +
   geom_point(size = 3, alpha = 0.5) +  # Points with site-based shapes
   stat_ellipse(aes(group = cluster, fill = cluster, color = cluster, shape = NULL), geom = "polygon", alpha = 0.2) +  
-  #scale_color_manual(values = clusterColors) + 
-  #scale_fill_manual(values = clusterColors) +  # Fill colors for ellipses
+  scale_color_manual(values = clusterColors) + 
+  scale_fill_manual(values = clusterColors) +  # Fill colors for ellipses
   #scale_shape_cleveland() +
-  scale_color_few()+
-  scale_fill_few()+
+  #scale_color_few()+
+  #scale_fill_few()+
   scale_shape()+
   geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
   geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
   geom_segment(data = kmeansLoadings, aes(x = 0, y = 0, xend = PC1, yend = PC2),
                arrow = arrow(length = unit(0.3, "cm")), color = "black", inherit.aes = FALSE) +  # Arrows for variables
   geom_text(data = kmeansLoadings, aes(x = PC1, y = PC2, label = Variable),
-            vjust = -0.5, color = "black", fontface = "bold", inherit.aes = FALSE) +  # Labels for variables
-  labs(title = "PCA - Clustered by K-Means with Site Shapes",
+            vjust = -0.5, color = "black", inherit.aes = FALSE, size = 6) +  # Labels for variables
+  labs(title = "DO Metrics Clustered by K-Means",
        x = paste0("Dim1 (", round(summary(kmeansPCA)$importance[2, 1] * 100, 1), "%)"),
        y = paste0("Dim2 (", round(summary(kmeansPCA)$importance[2, 2] * 100, 1), "%)"),
        color = "Cluster",
        fill = "Cluster",
        shape = "Site") +
   theme_few()+
-  theme(legend.position = "bottom")
+  theme(
+    text = element_text(size = 18),          # overall text size
+    legend.text = element_text(size = 16),   # legend entries
+    legend.title = element_text(size = 18),  # legend title
+    axis.title = element_text(size = 18),    # axis titles
+    axis.text = element_text(size = 16),     # axis tick labels
+    plot.title = element_text(size = 20, hjust = 0.5),
+    legend.position = "bottom"
+  )
 p
 # Add marginal histograms
-p <- ggMarginal(
-  p,
-  type = "density",
-  groupColour = TRUE,
-  groupFill = TRUE
-)
-p
+# p <- ggMarginal(
+#   p,
+#   type = "density",
+#   groupColour = TRUE,
+#   groupFill = TRUE
+# )
+#p
 # Save the plot
-ggsave(filename = "KmeansPCA.png", plot = p, path = here("Figs/"), device = "png", width = 25.4, height = 14.2875, units = "cm", dpi = "retina")
+ggsave(filename = "KmeansPCA_sfs.png", plot = p, path = here("Figs/"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = "retina")
 
 # Add cluster information back to the original dataset
 dailyDat <- dailyDat |>
+  select(-matches("clusters")) |> 
   left_join(kmDat |> select(Site, Date, clusters = cluster), by = c("Site", "Date"))
 ```
 
+### Cluster Time-series
+
 ```{r}
+
+doDates <- dailyDat |>
+  filter(Site %in% gpSens) |> 
+  mutate(Year = year(Date)) |> 
+  filter(!is.na(avgDO.pctsat)) |>
+  group_by(Site, Year) |>
+  summarise(
+    first_date = min(Date),
+    last_date = max(Date),
+    .groups = "drop"
+  ) |> 
+  mutate(WinterStart_preY = as.Date(paste0(as.integer(as.character(Year))-1, "-12-01")),
+         WinterStart = as.Date(paste0(as.integer(as.character(Year)), "-12-01"))) |> 
+  mutate(WinterStart = case_when(Site == "YMR" & Year == "2021"~ as_date("2021-12-20"), T~WinterStart),
+         WinterStart_preY = case_when(Site == "YMR" & Year == "2022"~ as_date("2021-12-20"), T~WinterStart_preY)) |> 
+  mutate(WinterStart_preY = case_when(Site == "SHN" & Year == "2023" ~ NA, T~WinterStart_preY))
+
+# Create separate data frame for the SHN pre-first-date grey box
+preFirstDate_SHN <- doDates |>
+  filter(Site == "SHN") |>
+  mutate(xmin = as.Date("2021-06-01"),  # or your actual xlim min
+         xmax = first_date,
+         ymin = -Inf,
+         ymax = Inf) |> 
+  filter(Year == "2023")
+
+
 # Create the plot
-ggplot(dailyDat, aes(x = Date, y = avgDO.pctsat, color = factor(clusters))) +
-  geom_point() +
+dailyDat |> 
+  filter(Site %in% gpSens) |> 
+  ggplot(aes(x = Date, y = avgDO.pctsat, color = clusters)) +
+  geom_point(size = 3, alpha = 0.8) +
   facet_wrap(~Site, scales = "free_y", ncol = 1) +
-  #scale_color_manual(values = clusterColors, name = "Cluster") +
-  scale_color_few()+
-  scale_fill_few()+
-  theme_minimal() +
+  scale_color_manual(values = clusterColors, name = "Cluster") +
+  geom_rect(data = doDates,
+            aes(xmin = WinterStart_preY, xmax = first_date, ymin = -Inf, ymax = Inf),
+            inherit.aes = FALSE,
+            fill = "#42d4f4", alpha = 0.2) +
+  geom_rect(data = doDates,
+            aes(xmin = last_date, xmax = WinterStart, ymin = -Inf, ymax = Inf),
+            inherit.aes = FALSE,
+            fill = "#9A6324", alpha = 0.2) +
+  geom_rect(data = preFirstDate_SHN,
+          aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+          inherit.aes = FALSE,
+          fill = "grey5", alpha = 0.2) +
+  ylim(0,100)+
+  scale_x_date(labels = date_format("%b '%y")) +
+  xlim(as_date("2021-06-01"), as_date("2024-12-01"))+
+  theme_few() +
+  #scale_x_date(date_labels = "%b %Y", breaks = scales::breaks_pretty(n = 5))+
   labs(
-    x = "",
-    y = "Average DO % Saturation"
-  ) +
+  x = "",
+  y = expression("Daily Average DO"["% Sat"])
+  )+
   theme_few() +
   theme(
-    legend.position = "bottom",
-    axis.text.x = element_text(angle = 45, hjust = 1)
-  )
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    text = element_text(size = 18),          # overall text size
+    legend.text = element_text(size = 16),   # legend entries
+    legend.title = element_text(size = 18),  # legend title
+    axis.title = element_text(size = 18),    # axis titles
+    axis.text = element_text(size = 16),     # axis tick labels
+    plot.title = element_text(size = 20, hjust = 0.5),
+    legend.position = "bottom"
+  ) -> p 
+p
+ggsave(filename = "clusterTime.png", plot = p, path = here("Figs/"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = 600)
+
+
+clusterTS <- dailyDat |> 
+  select(Site, Date, avgDO.pctsat, clusters) |> 
+  full_join(dailyHydro, by = c("Site", "Date")) |> 
+  mutate(PercWet_1d = PercWet_1d * 100)
+
+doDates <- doDates |> 
+  filter(Year == "2024") |> 
+  mutate(WinterStart_preY = as_date("2024-01-01"))
+
+clusterTS |> 
+  filter(Site %in% gpSens) |> 
+  filter(year(Date) == 2024) |> 
+  ggplot(aes(x = Date)) +
+  geom_point(aes(y = avgDO.pctsat, color = clusters), size = 3, alpha = 0.8) +
+  facet_wrap(~Site, scales = "free_y", ncol = 1) +
+  geom_rect(data = doDates,
+            aes(xmin = WinterStart_preY, xmax = first_date, ymin = -Inf, ymax = Inf),
+            inherit.aes = FALSE,
+            fill = "#42d4f4", alpha = 0.2) +
+  geom_rect(data = doDates,
+            aes(xmin = last_date, xmax = WinterStart, ymin = -Inf, ymax = Inf),
+            inherit.aes = FALSE,
+            fill = "#9A6324", alpha = 0.2) +
+  scale_color_manual(values = clusterColors, name = "Cluster", na.translate = FALSE) +
+  scale_x_date(labels = date_format("%b"), breaks = "2 months") +
+  ylab(
+    label = expression("Daily Average DO"["% Sat"])) +
+  ylim(0,100)+
+  xlim(as_date("2024-01-01"), as_date("2024-12-01")) +
+  theme_few() +
+  labs(x = "") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    text = element_text(size = 18),
+    legend.text = element_text(size = 16),
+    legend.title = element_text(size = 18),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 16),
+    plot.title = element_text(size = 20, hjust = 0.5),
+    legend.position = "bottom"
+  ) -> p 
+
+p
+ggsave(filename = "cluster2024.png", plot = p, path = here("Figs/"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = 600)
+
+clusterTS |> 
+  filter(Site %in% gpSens) |> 
+  filter(year(Date) == 2024) |> 
+  ggplot(aes(x = Date)) +
+  geom_point(aes(y = avgDO.pctsat, color = clusters), size = 3, alpha = 0.8) +
+  geom_line(aes(y = PercWet_1d), color = "black", size = 1) +
+  facet_wrap(~Site, scales = "free_y", ncol = 1) +
+  geom_rect(data = doDates,
+            aes(xmin = WinterStart_preY, xmax = first_date, ymin = -Inf, ymax = Inf),
+            inherit.aes = FALSE,
+            fill = "#42d4f4", alpha = 0.2) +
+  geom_rect(data = doDates,
+            aes(xmin = last_date, xmax = WinterStart, ymin = -Inf, ymax = Inf),
+            inherit.aes = FALSE,
+            fill = "#9A6324", alpha = 0.2) +
+  scale_color_manual(values = clusterColors, name = "Cluster", na.translate = FALSE) +
+  scale_x_date(labels = date_format("%b"), breaks = "2 months") +
+  scale_y_continuous(
+    limits = c(0, 100),
+    name = expression("Daily Average DO"["% Sat"]),
+    sec.axis = sec_axis(~ ., name = "Network Wet (%)")  # Identity transformation
+  ) +
+  xlim(as_date("2024-01-01"), as_date("2024-12-01")) +
+  theme_few() +
+  labs(x = "") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    text = element_text(size = 18),
+    legend.text = element_text(size = 16),
+    legend.title = element_text(size = 18),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 16),
+    plot.title = element_text(size = 20, hjust = 0.5),
+    legend.position = "bottom"
+  ) -> p 
+
+p
+ggsave(filename = "cluster2024_PercWet.png", plot = p, path = here("Figs/"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = 600)
+```
+
+\
+
+```{r}
 
 # Daily Min
-ggplot(dailyDat, aes(x = Date, y = minDO.pctsat, color = factor(clusters))) +
+dailyDat |> 
+  filter(Site %in% gpSens) |> 
+  ggplot(aes(x = Date, y = minDO.pctsat, color = factor(clusters))) +
   geom_point() +
   facet_wrap(~Site, scales = "free_y", ncol = 1) +
-  #scale_color_manual(values = clusterColors, name = "Cluster") +
-  scale_color_few()+
-  scale_fill_few()+
-  theme_minimal() +
+  scale_color_manual(values = clusterColors, name = "Cluster") +
+  #scale_color_few()+
+  #scale_fill_few()+
+  theme_few() +
   labs(
     x = "",
     y = "Minimum DO % Saturation"
@@ -923,12 +1190,14 @@ ggplot(dailyDat, aes(x = Date, y = minDO.pctsat, color = factor(clusters))) +
     axis.text.x = element_text(angle = 45, hjust = 1)
   )
 
-ggplot(dailyDat, aes(x = Date, y = maxDO.pctsat, color = factor(clusters))) +
+dailyDat |> 
+  filter(Site %in% gpSens) |>
+ggplot(aes(x = Date, y = maxDO.pctsat, color = factor(clusters))) +
   geom_point() +
   facet_wrap(~Site, scales = "free_y", ncol = 1) +
-  #scale_color_manual(values = clusterColors, name = "Cluster") +
-  scale_color_few()+
-  scale_fill_few()+
+  scale_color_manual(values = clusterColors, name = "Cluster") +
+  #scale_color_few()+
+  #scale_fill_few()+
   theme_minimal() +
   labs(
     x = "",
@@ -940,12 +1209,14 @@ ggplot(dailyDat, aes(x = Date, y = maxDO.pctsat, color = factor(clusters))) +
     axis.text.x = element_text(angle = 45, hjust = 1)
   )
 
-ggplot(dailyDat, aes(x = DOSat.exc, y = avgDO.pctsat, color = factor(clusters))) +
+dailyDat |> 
+  filter(Site %in% gpSens) |> 
+  ggplot(aes(x = DOSat.exc, y = avgDO.pctsat, color = factor(clusters))) +
   geom_point() +
   facet_wrap(~Site, scales = "free_y", ncol = 1) +
-  #scale_color_manual(values = clusterColors, name = "Cluster") +
-  scale_color_few()+
-  scale_fill_few()+
+  scale_color_manual(values = clusterColors, name = "Cluster") +
+  #scale_color_few()+
+  #scale_fill_few()+
   theme_minimal() +
   labs(
     x = "Exceedance Probability (%)",
@@ -960,49 +1231,194 @@ ggplot(dailyDat, aes(x = DOSat.exc, y = avgDO.pctsat, color = factor(clusters)))
 
 # Create month column and calculate frequencies
 cluster_freq <- dailyDat |>
+  filter(Site %in% gpSens) |> 
+  #filter(!(Site == "YMR" & year(Date) == "2023")) |> 
   mutate(Month = factor(lubridate::month(Date, label = T))) |>
   group_by(Site, Month, clusters) |>
   summarise(count = n(), .groups = 'drop') |>
   mutate(clusters = factor(clusters))
 
-# Create the plot
-ggplot(cluster_freq, aes(x = Month, y = count, fill = factor(clusters))) +
-  geom_bar(stat = "identity", position = "stack") +
-  facet_wrap(~Site, scales = "free_y") +
-  #scale_fill_manual(values = clusterColors, name = "Cluster") +
-  scale_color_few()+
-  scale_fill_few()+
-  theme_minimal() +
-  labs(
-    title = "Cluster Frequency by Month and Site",
-    x = "Month",
-    y = "Count"
-  ) +
-  theme_few() +
-  theme(
-    legend.position = "bottom",
-    axis.text.x = element_text(angle = 45, hjust = 1)
-  )
+monthlyPercWet <- dailyHydro |>
+  filter(Site %in% gpSens) |>
+  #filter(!(Site == "YMR" & year(Date) == 2023)) |>
+  mutate(Month = factor(lubridate::month(Date, label = TRUE))) |>
+  group_by(Site, Month) |>
+  summarise(meanPercWet = mean(PercWet_1d, na.rm = TRUE) * 100, .groups = "drop")
 
-ggplot(cluster_freq, aes(x = Month, y = count, fill = factor(clusters))) +
+cluster_freq |> 
+  filter(!Month %in% c("Oct", "Nov", "Dec", "Jan")) |> 
+  ggplot(aes(x = Month, y = count, fill = factor(clusters))) +
   geom_bar(stat = "identity", position = "fill") +
-  facet_wrap(~Site, scales = "free_y") +
-  #scale_fill_manual(values = clusterColors, name = "Cluster") +
-  scale_color_few()+
-  scale_fill_few()+
+  geom_point(
+    data = monthlyPercWet |> filter(!Month %in% c("Oct", "Nov", "Dec", "Jan")),
+    aes(x = Month, y = meanPercWet / 100),  # scale to proportion
+    inherit.aes = FALSE,
+    size = 3,
+    shape = 21,
+    fill = "black"
+  ) +
+  facet_wrap(~Site, ncol = 3) +
+  scale_fill_manual(values = clusterColors, name = "Cluster") +
   scale_y_continuous(labels = scales::percent) +
   theme_minimal() +
   labs(
-    title = "Cluster Distribution by Month and Site",
-    x = "Month",
+    title = "",
+    x = "",
     y = "Proportion"
   ) +
   theme_few() +
   theme(
-    legend.position = "bottom",
-    axis.text.x = element_text(angle = 45, hjust = 1)
-  )
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    text = element_text(size = 18),
+    legend.text = element_text(size = 16),
+    legend.title = element_text(size = 18),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 16),
+    plot.title = element_text(size = 20, hjust = 0.5),
+    plot.margin = grid::unit(c(0, 0, 0, 0), "lines"),
+    legend.position = "bottom"
+  ) -> p
+p
+ggsave(filename = "clusterDist_PercWet.png", plot = p, path = here("Figs/"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = 600)
 
+
+cluster_freq |> 
+  filter(!Month %in% c("Oct", "Nov", "Dec")) |> 
+ggplot(aes(x = Month, y = count, fill = factor(clusters))) +
+  geom_bar(stat = "identity", position = "fill") +
+  facet_wrap(~Site, ncol = 3) +
+  scale_fill_manual(values = clusterColors, name = "Cluster") +
+  #scale_color_few()+
+  #scale_fill_few()+
+  scale_y_continuous(labels = scales::percent) +
+  theme_minimal() +
+  labs(
+    title = "",
+    x = "",
+    y = "Proportion"
+  ) +
+  theme_few() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    text = element_text(size = 18),          # overall text size
+    legend.text = element_text(size = 16),   # legend entries
+    legend.title = element_text(size = 18),  # legend title
+    axis.title = element_text(size = 18),    # axis titles
+    axis.text = element_text(size = 16),     # axis tick labels
+    plot.title = element_text(size = 20, hjust = 0.5),
+    plot.margin = grid::unit(c(0, 0, 0, 0), "lines"),
+    legend.position = "bottom"
+  ) -> p 
+p
+ggsave(filename = "clusterDist.png", plot = p, path = here("Figs/"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = 600)
+
+
+# Create month column and calculate frequencies
+cluster_freq_flow <- dailyDat |>
+  filter(Site %in% gpSens) |> 
+  mutate(Month = factor(lubridate::month(Date, label = T))) |>
+  group_by(Site, flowState, clusters) |>
+  summarise(count = n(), .groups = 'drop') |>
+  mutate(clusters = factor(clusters))
+
+# Create the plot
+cluster_freq_flow |>
+  ggplot(aes(x = flowState, y = count, fill = factor(clusters))) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.9)) +
+  geom_text(
+    aes(label = count),
+    position = position_dodge(width = 0.9),
+    vjust = -0.3,
+    size = 5
+  ) +
+  facet_wrap(~Site, scales = "free_y") +
+  scale_fill_manual(values = clusterColors, name = "Cluster") +
+  theme_minimal() +
+  labs(
+    title = "",
+    x = "",
+    y = "Count"
+  ) +
+  theme_few() +
+  scale_y_continuous(expand = expansion(mult = c(0, .1)))+
+  theme(
+    text = element_text(size = 18),
+    legend.text = element_text(size = 16),
+    legend.title = element_text(size = 18),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 16),
+    plot.title = element_text(size = 20, hjust = 0.5),
+    legend.position = "bottom"
+  ) -> clustFlow
+
+
+library(ggsignif)
+
+
+dailyDat |>
+  filter(Site %in% gpSens) |>
+  mutate(upstream_length_km = upstream_length / 1000) |>
+  ggboxplot(
+    x = "flowState",
+    y = "upstream_length_km",
+    color = "flowState",
+    palette = "jco",  # or use your own color palette
+    add = "jitter"
+  ) +
+  #facet_wrap(~Site)+
+  geom_signif(comparisons = list(c("Flowing", "Pooled")), 
+              map_signif_level=TRUE)+
+  labs(
+    title = "",
+    x = "Flow State",
+    y = "Upstream Length (km)"
+  ) +
+  theme_few() +
+  theme(
+    text = element_text(size = 18),
+    legend.position = "none"
+  )-> upstreamFlowState
+
+
+dailyDat |>
+  filter(Site %in% gpSens) |>
+  ggboxplot(
+    x = "flowState",
+    y = "PercWet_1d",
+    color = "flowState",
+    palette = "jco",  # or use your own color palette
+    add = "jitter"
+  ) +
+  #facet_wrap(~Site)+
+  geom_signif(comparisons = list(c("Flowing", "Pooled")), 
+              map_signif_level=TRUE)+
+  labs(
+    title = "",
+    x = "Flow State",
+    y = "% Wet"
+  ) +
+  theme_few() +
+  theme(
+    text = element_text(size = 18),
+    legend.position = "none"
+  )-> percWetFlowState
+
+clustFlow
+upstreamFlowState
+percWetFlowState
+
+
+ggsave(filename = "clusterByFlowstate.png", plot = clustFlow, 
+         path = here("Figs/"), device = "png", create.dir = TRUE,
+         width = 25.4, height = 14.2875, units = "cm", dpi = "retina")
+
+ggsave(filename = "usFlowstate.png", plot = upstreamFlowState, 
+         path = here("Figs/"), device = "png", create.dir = TRUE,
+         width = 25.4, height = 14.2875, units = "cm", dpi = "retina")
+
+ggsave(filename = "percWetFlowstate.png", plot = percWetFlowState, 
+         path = here("Figs/"), device = "png", create.dir = TRUE,
+         width = 25.4, height = 14.2875, units = "cm", dpi = "retina")
 ```
 
 # Variables by Global Clusters
@@ -1236,32 +1652,32 @@ PPT_1d <- lm(PPT_1d ~ DOY_sin + DOY_cos, data = semDat)
 avgPar <- lmer(avgPar ~ PPT_1d + DOY_sin + DOY_cos + (1|Site), data = semDat)
 water.temp <- lmer(water.temp ~ avgPar + PPT_1d + DOY_sin + DOY_cos + (1|Site), data = semDat)
 # Depth
-Depth_1d <- lmer(Depth_1d ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos + excProb + headGradient_1d + percentConnected + AlphaCentrality + upstream_length + PercWet_1d + (1|Site), data = semDat)
+Depth_1d <- lmer(Depth_1d ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos + excProb + headGradient_1d + percentConnected + alpha_cent + upstream_length + PercWet_1d + (1|Site), data = semDat)
 # Discharge
 excProb <- lmer(excProb ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos + percentConnected + 
-                       AlphaCentrality + upstream_length + PercWet_1d + (1|Site), data = semDat)
+                       alpha_cent + upstream_length + PercWet_1d + (1|Site), data = semDat)
 #Groundwater inputs
 headGradient_1d <- lmer(headGradient_1d ~ avgPar + water.temp + PPT_1d + DOY_sin + DOY_cos + percentConnected + 
-                  AlphaCentrality + upstream_length + PercWet_1d + (1|Site), data = semDat)
+                  alpha_cent + upstream_length + PercWet_1d + (1|Site), data = semDat)
 # Network connectivity drivers
 percentConnected <- lmer(percentConnected ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos + (1|Site) , data = semDat)
-AlphaCentrality <- lmer(AlphaCentrality ~ water.temp +  avgPar + percentConnected + PPT_1d + DOY_sin + DOY_cos + (1|Site) , data = semDat)
-upstream_length <- lmer(upstream_length ~ water.temp + avgPar + AlphaCentrality + percentConnected + 
+alpha_cent <- lmer(alpha_cent ~ water.temp +  avgPar + percentConnected + PPT_1d + DOY_sin + DOY_cos + (1|Site) , data = semDat)
+upstream_length <- lmer(upstream_length ~ water.temp + avgPar + alpha_cent + percentConnected + 
                          PPT_1d + DOY_sin + DOY_cos + (1|Site), data = semDat)
-PercWet_1d <- lmer(PercWet_1d ~ water.temp + avgPar + percentConnected + upstream_length + AlphaCentrality + 
+PercWet_1d <- lmer(PercWet_1d ~ water.temp + avgPar + percentConnected + upstream_length + alpha_cent + 
                     PPT_1d + DOY_sin + DOY_cos +  (1|Site), data = semDat)
 # DO responses
-DOSat.exc <- lmer(DOSat.exc ~  water.temp + PPT_1d + Depth_1d + excProb + percentConnected + AlphaCentrality + 
+DOSat.exc <- lmer(DOSat.exc ~  water.temp + PPT_1d + Depth_1d + excProb + percentConnected + alpha_cent + 
                      upstream_length + PercWet_1d + headGradient_1d + avgPar + DOY_sin + DOY_cos + (1|Site), 
                      data = semDat)
 
 DOpctsat.amp <- lmer(DOpctsat.amp ~ DOSat.exc + water.temp + PPT_1d + Depth_1d + excProb + percentConnected +
-                      AlphaCentrality + upstream_length + PercWet_1d + headGradient_1d + avgPar + 
+                      alpha_cent + upstream_length + PercWet_1d + headGradient_1d + avgPar + 
                       DOY_sin + DOY_cos + (1|Site), data = semDat)
   
 # Define the piecewise SEM
 sem_model <- psem(
-  PPT_1d, avgPar, water.temp, Depth_1d, excProb, headGradient_1d, percentConnected, AlphaCentrality, upstream_length,
+  PPT_1d, avgPar, water.temp, Depth_1d, excProb, headGradient_1d, percentConnected, alpha_cent, upstream_length,
   PercWet_1d, DOSat.exc, DOpctsat.amp
 )
 
@@ -1317,29 +1733,29 @@ sem_mod <- c('
   
   # Depth model
   Depth_1d ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos +
-              excProb + headGradient_1d + percentConnected + AlphaCentrality +
+              excProb + headGradient_1d + percentConnected + alpha_cent +
               upstream_length + PercWet_1d
   
   # Discharge probability
   excProb ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos +
-            percentConnected + AlphaCentrality + upstream_length + PercWet_1d
+            percentConnected + alpha_cent + upstream_length + PercWet_1d
   
   # Groundwater inputs
   headGradient_1d ~ avgPar + water.temp + PPT_1d + DOY_sin + DOY_cos +
-                   percentConnected + AlphaCentrality + upstream_length + PercWet_1d
+                   percentConnected + alpha_cent + upstream_length + PercWet_1d
   
   # Network connectivity
-  flow_state =~ percentConnected + AlphaCentrality + upstream_length + PercWet_1d
+  flow_state =~ percentConnected + alpha_cent + upstream_length + PercWet_1d
   flow_state ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos
-  percentConnected ~~ AlphaCentrality
+  percentConnected ~~ alpha_cent
   upstream_length ~~ PercWet_1d
   # DO responses
   DOSat.exc ~ prior("normal(0.7, 0.2)")*lag_DOSat.exc + water.temp + PPT_1d + Depth_1d + excProb + percentConnected +
-              AlphaCentrality + upstream_length + PercWet_1d + headGradient_1d +
+              alpha_cent + upstream_length + PercWet_1d + headGradient_1d +
               avgPar + DOY_sin + DOY_cos
   
   DOpctsat.amp ~ prior("normal(0.5, 0.2)")*lag_DOpctsat.amp + DOSat.exc + water.temp + PPT_1d + Depth_1d + excProb +
-                percentConnected + AlphaCentrality + upstream_length + PercWet_1d +
+                percentConnected + alpha_cent + upstream_length + PercWet_1d +
                 headGradient_1d + avgPar + DOY_sin + DOY_cos
 ')
 fit <- sem(sem_mod, data = semDat, missing = "FIML", estimator = "MLR", parallel = T)
@@ -1365,19 +1781,19 @@ full_model <-
   bf(water.temp ~ avgPar + PPT_1d + DOY_sin + DOY_cos) +
   bf(Depth_1d ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos + 
        excProb + headGradient_1d + percentConnected + 
-       AlphaCentrality + upstream_length + PercWet_1d) +
+       alpha_cent + upstream_length + PercWet_1d) +
   bf(excProb ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos + 
-       percentConnected + AlphaCentrality + upstream_length + PercWet_1d) +
+       percentConnected + alpha_cent + upstream_length + PercWet_1d) +
   bf(headGradient_1d ~ avgPar + water.temp + PPT_1d + DOY_sin + DOY_cos + 
-       percentConnected + AlphaCentrality + upstream_length + PercWet_1d) +
+       percentConnected + alpha_cent + upstream_length + PercWet_1d) +
   bf(percentConnected ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos) +
-  bf(AlphaCentrality ~ water.temp + avgPar + percentConnected + PPT_1d + DOY_sin + DOY_cos) +
-  bf(upstream_length ~ water.temp + avgPar + AlphaCentrality + percentConnected + PPT_1d + DOY_sin + DOY_cos) +
-  bf(PercWet_1d ~ water.temp + avgPar + percentConnected + upstream_length + AlphaCentrality + PPT_1d + DOY_sin + DOY_cos) +
+  bf(alpha_cent ~ water.temp + avgPar + percentConnected + PPT_1d + DOY_sin + DOY_cos) +
+  bf(upstream_length ~ water.temp + avgPar + alpha_cent + percentConnected + PPT_1d + DOY_sin + DOY_cos) +
+  bf(PercWet_1d ~ water.temp + avgPar + percentConnected + upstream_length + alpha_cent + PPT_1d + DOY_sin + DOY_cos) +
   bf(DOSat.exc ~ water.temp + PPT_1d + Depth_1d + excProb + percentConnected + 
-       AlphaCentrality + upstream_length + PercWet_1d + headGradient_1d + avgPar + DOY_sin + DOY_cos + ar(Date, gr = Site)) +
+       alpha_cent + upstream_length + PercWet_1d + headGradient_1d + avgPar + DOY_sin + DOY_cos + ar(Date, gr = Site)) +
   bf(DOpctsat.amp ~ DOSat.exc + water.temp + PPT_1d + Depth_1d + excProb + 
-       percentConnected + AlphaCentrality + upstream_length + PercWet_1d + 
+       percentConnected + alpha_cent + upstream_length + PercWet_1d + 
        headGradient_1d + avgPar + DOY_sin + DOY_cos + ar(Date, gr = Site))
 fit <- brm(
   formula = full_model,
@@ -1440,20 +1856,20 @@ sem_model <- psem(
   # Depth
   Depth_1d = glmmTMB(
     Depth_1d ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos +
-      excProb + headGradient_1d + percentConnected + AlphaCentrality +
+      excProb + headGradient_1d + percentConnected + alpha_cent +
       upstream_length + PercWet_1d + (1 | Site),
     data = semDat
   ),
   # Discharge
   excProb = glmmTMB(
     excProb ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos +
-      percentConnected + AlphaCentrality + upstream_length + PercWet_1d + (1 | Site),
+      percentConnected + alpha_cent + upstream_length + PercWet_1d + (1 | Site),
     data = semDat
   ),
   # Groundwater inputs
   headGradient_1d = glmmTMB(
     headGradient_1d ~ avgPar + water.temp + PPT_1d + DOY_sin + DOY_cos +
-      percentConnected + AlphaCentrality + upstream_length + PercWet_1d + (1 | Site),
+      percentConnected + alpha_cent + upstream_length + PercWet_1d + (1 | Site),
     data = semDat
   ),
   # Network connectivity
@@ -1461,25 +1877,25 @@ sem_model <- psem(
     percentConnected ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos + (1 | Site),
     data = semDat
   ),
-  AlphaCentrality = glmmTMB(
-    AlphaCentrality ~ water.temp + avgPar + percentConnected +
+  alpha_cent = glmmTMB(
+    alpha_cent ~ water.temp + avgPar + percentConnected +
       PPT_1d + DOY_sin + DOY_cos + (1 | Site),
     data = semDat
   ),
   upstream_length = glmmTMB(
-    upstream_length ~ water.temp + avgPar + AlphaCentrality + percentConnected +
+    upstream_length ~ water.temp + avgPar + alpha_cent + percentConnected +
       PPT_1d + DOY_sin + DOY_cos + (1 | Site),
     data = semDat
   ),
   PercWet_1d = glmmTMB(
     PercWet_1d ~ water.temp + avgPar + percentConnected + upstream_length +
-      AlphaCentrality + PPT_1d + DOY_sin + DOY_cos,
+      alpha_cent + PPT_1d + DOY_sin + DOY_cos,
     data = semDat
   ),
   # DO responses
   DOSat.exc = glmmTMB(
     DOSat.exc ~ water.temp + PPT_1d + Depth_1d + excProb + percentConnected +
-      AlphaCentrality + upstream_length + PercWet_1d + headGradient_1d +
+      alpha_cent + upstream_length + PercWet_1d + headGradient_1d +
       avgPar + DOY_sin + DOY_cos +
       (1 | Site) + ar1(date_num + 0 | Site),
     data = semDat
@@ -1487,7 +1903,7 @@ sem_model <- psem(
   
   DOpctsat.amp = glmmTMB(
     DOpctsat.amp ~ DOSat.exc + water.temp + PPT_1d + Depth_1d + excProb +
-      percentConnected + AlphaCentrality + upstream_length + PercWet_1d +
+      percentConnected + alpha_cent + upstream_length + PercWet_1d +
       headGradient_1d + avgPar + DOY_sin + DOY_cos +
       (1 | Site) + ar1(date_num + 0 | Site),
     data = semDat
@@ -1524,20 +1940,20 @@ sem_model <- psem(
   avgPar = lm(avgPar ~ PPT_1d + DOY_sin + DOY_cos, data = semDat),
   water.temp = lmer(water.temp ~ avgPar + PPT_1d + DOY_sin + DOY_cos + (1|waterYear), data = semDat),
   # Depth
-  Depth_1d = lmer(Depth_1d ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos + excProb + headGradient_1d + percentConnected + AlphaCentrality + upstream_length + PercWet_1d + (1|waterYear), data = semDat),
+  Depth_1d = lmer(Depth_1d ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos + excProb + headGradient_1d + percentConnected + alpha_cent + upstream_length + PercWet_1d + (1|waterYear), data = semDat),
   # Discharge
-  excProb = lm(excProb ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos + percentConnected + AlphaCentrality + upstream_length + PercWet_1d, data = semDat),
+  excProb = lm(excProb ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos + percentConnected + alpha_cent + upstream_length + PercWet_1d, data = semDat),
   # Vertical Head Gradient
-  headGradient_1d = lmer(headGradient_1d ~ avgPar + water.temp + PPT_1d + DOY_sin + DOY_cos + percentConnected + AlphaCentrality + upstream_length + PercWet_1d + (1|waterYear), data = semDat),
+  headGradient_1d = lmer(headGradient_1d ~ avgPar + water.temp + PPT_1d + DOY_sin + DOY_cos + percentConnected + alpha_cent + upstream_length + PercWet_1d + (1|waterYear), data = semDat),
   # Network Connection
   percentConnected = lmer(percentConnected ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos + (1|waterYear) , data = semDat),
-  AlphaCentrality = lmer(AlphaCentrality ~  upstream_length + water.temp + avgPar + percentConnected + PPT_1d + DOY_sin + DOY_cos + (1|waterYear) , data = semDat),
+  alpha_cent = lmer(alpha_cent ~  upstream_length + water.temp + avgPar + percentConnected + PPT_1d + DOY_sin + DOY_cos + (1|waterYear) , data = semDat),
   upstream_length = lm(upstream_length ~ water.temp + avgPar + percentConnected + PPT_1d + DOY_sin + DOY_cos, data = semDat),
-  PercWet_1d = lmer(PercWet_1d ~ water.temp + avgPar + percentConnected + upstream_length + AlphaCentrality + PPT_1d + DOY_sin + DOY_cos + (1|waterYear), data = semDat),
+  PercWet_1d = lmer(PercWet_1d ~ water.temp + avgPar + percentConnected + upstream_length + alpha_cent + PPT_1d + DOY_sin + DOY_cos + (1|waterYear), data = semDat),
   
   # DO responses
-  DOSat.exc = lm(DOSat.exc ~ water.temp + PPT_1d + Depth_1d + excProb + percentConnected + AlphaCentrality + upstream_length + PercWet_1d + headGradient_1d + avgPar + DOY_sin + DOY_cos, data = semDat),
-  DOpctsat.amp = lm(DOpctsat.amp ~ DOSat.exc + water.temp + PPT_1d + Depth_1d + excProb + percentConnected + AlphaCentrality + upstream_length + PercWet_1d + headGradient_1d + avgPar + DOY_sin + DOY_cos, data = semDat),
+  DOSat.exc = lm(DOSat.exc ~ water.temp + PPT_1d + Depth_1d + excProb + percentConnected + alpha_cent + upstream_length + PercWet_1d + headGradient_1d + avgPar + DOY_sin + DOY_cos, data = semDat),
+  DOpctsat.amp = lm(DOpctsat.amp ~ DOSat.exc + water.temp + PPT_1d + Depth_1d + excProb + percentConnected + alpha_cent + upstream_length + PercWet_1d + headGradient_1d + avgPar + DOY_sin + DOY_cos, data = semDat),
   data = semDat
 )
 
@@ -1583,18 +1999,18 @@ sem_model <- psem(
   water.temp = lmer(water.temp ~ avgPar + PPT_1d + DOY_sin + DOY_cos + (1|waterYear), data = semDat),
   # Depth
   Depth_1d = lmer(Depth_1d ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos + excProb + percentConnected +
-                    AlphaCentrality + upstream_length + PercWet_1d + (1|waterYear), data = semDat),
+                    alpha_cent + upstream_length + PercWet_1d + (1|waterYear), data = semDat),
   # Discharge
-  excProb = lm(excProb ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos + percentConnected + AlphaCentrality + upstream_length + PercWet_1d, data = semDat),
+  excProb = lm(excProb ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos + percentConnected + alpha_cent + upstream_length + PercWet_1d, data = semDat),
   # Network Connection
   percentConnected = lmer(percentConnected ~ water.temp + avgPar + PPT_1d + DOY_sin + DOY_cos + (1|waterYear) , data = semDat),
-  AlphaCentrality = lmer(AlphaCentrality ~  upstream_length + water.temp + avgPar + percentConnected + PPT_1d + DOY_sin + DOY_cos + (1|waterYear) , data = semDat),
+  alpha_cent = lmer(alpha_cent ~  upstream_length + water.temp + avgPar + percentConnected + PPT_1d + DOY_sin + DOY_cos + (1|waterYear) , data = semDat),
   upstream_length = lm(upstream_length ~ water.temp + avgPar + percentConnected + PPT_1d + DOY_sin + DOY_cos, data = semDat),
-  PercWet_1d = lmer(PercWet_1d ~ water.temp + avgPar + percentConnected + upstream_length + AlphaCentrality + PPT_1d + DOY_sin + DOY_cos + (1|waterYear), data = semDat),
+  PercWet_1d = lmer(PercWet_1d ~ water.temp + avgPar + percentConnected + upstream_length + alpha_cent + PPT_1d + DOY_sin + DOY_cos + (1|waterYear), data = semDat),
   
   # DO responses
-  DOSat.exc = lm(DOSat.exc ~ water.temp + PPT_1d + Depth_1d + excProb + percentConnected + AlphaCentrality + upstream_length + PercWet_1d + avgPar + DOY_sin + DOY_cos, data = semDat),
-  DOpctsat.amp = lm(DOpctsat.amp ~ DOSat.exc + water.temp + PPT_1d + Depth_1d + excProb + percentConnected + AlphaCentrality + upstream_length + PercWet_1d + avgPar + DOY_sin + DOY_cos, data = semDat),
+  DOSat.exc = lm(DOSat.exc ~ water.temp + PPT_1d + Depth_1d + excProb + percentConnected + alpha_cent + upstream_length + PercWet_1d + avgPar + DOY_sin + DOY_cos, data = semDat),
+  DOpctsat.amp = lm(DOpctsat.amp ~ DOSat.exc + water.temp + PPT_1d + Depth_1d + excProb + percentConnected + alpha_cent + upstream_length + PercWet_1d + avgPar + DOY_sin + DOY_cos, data = semDat),
   data = semDat
 )
 
@@ -1617,7 +2033,7 @@ flow_vars <- c("minQ", "maxQ", "Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d", "excPr
 precip_vars <- c("PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d")
 depth_vars <- c("Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d")
 stic_vars <- c("PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d")
-network_vars <- c("ICSL", "IntactStreamLength", "AlphaCentrality")
+network_vars <- c("ICSL", "IntactStreamLength", "alpha_cent")
 delta_vars <- c("dPercWet_7d", "dPercWet_14d", "dPercWet_30d", "dPercWet_60d")
 
 all_predictors <- c(flow_vars, precip_vars, depth_vars, stic_vars, network_vars, delta_vars, "waterYear", "Season")
@@ -2424,7 +2840,7 @@ flow_vars <- c("minQ", "maxQ", "Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d", "excPr
 precip_vars <- c("PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d")
 depth_vars <- c("Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d")
 stic_vars <- c("PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d")
-network_vars <- c("ICSL", "IntactStreamLength", "AlphaCentrality")
+network_vars <- c("ICSL", "IntactStreamLength", "alpha_cent")
 delta_vars <- c("dPercWet_7d", "dPercWet_14d", "dPercWet_30d", "dPercWet_60d")
 
 # Combine all predictor groups into a list
@@ -2600,7 +3016,7 @@ full_model_formula <- minDO.pctsat ~ s(waterYear, bs = "re") +
   s(PPT_1d) + s(PPT_7d) + s(PPT_14d) + s(PPT_30d) + s(PPT_60d) +
   s(Depth_1d) + s(Depth_7d) + s(Depth_14d) + s(Depth_30d) + s(Depth_60d) +
   s(PercWet_1d) + s(PercWet_7d) + s(PercWet_14d) + s(PercWet_30d) + s(PercWet_60d) +
-  s(ICSL) + s(IntactStreamLength) + s(AlphaCentrality) +
+  s(ICSL) + s(IntactStreamLength) + s(alpha_cent) +
   s(dPercWet_7d) + s(dPercWet_14d) + s(dPercWet_30d) + s(dPercWet_60d)
 
 # Fit the full model
@@ -2640,7 +3056,7 @@ flow_vars <- c("minQ", "maxQ", "Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d", "excPr
 precip_vars <- c("PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d")
 depth_vars <- c("Depth_1d", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d")
 stic_vars <- c("PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d")
-network_vars <- c("ICSL", "IntactStreamLength", "AlphaCentrality")
+network_vars <- c("ICSL", "IntactStreamLength", "alpha_cent")
 delta_vars <- c("dPercWet_7d", "dPercWet_14d", "dPercWet_30d", "dPercWet_60d")
 
 # Combine all predictor groups into a list
@@ -2791,7 +3207,7 @@ dailyDat_scaled <- dailyDat |>
 flow_vars <- c("minQ", "maxQ", "Q_1d", "Q_7d", "Q_14d", "Q_30d", "Q_60d", "excProb")
 precip_vars <- c("PPT_1d", "PPT_7d", "PPT_14d", "PPT_30d", "PPT_60d")
 depth_vars <- c("minDepth_scaled", "maxDepth_scaled", "Depth_1d_scaled", "Depth_7d", "Depth_14d", "Depth_30d", "Depth_60d")
-stic_vars <- c("PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d", "ICSL", "IntactStreamLength", "AlphaCentrality")
+stic_vars <- c("PercWet_1d", "PercWet_7d", "PercWet_14d", "PercWet_30d", "PercWet_60d", "ICSL", "IntactStreamLength", "alpha_cent")
 delta_vars <- c("dPercWet_7d", "dPercWet_14d", "dPercWet_30d", "dPercWet_60d")
 
 # Generate all possible _day variable selections

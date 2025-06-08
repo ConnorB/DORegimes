@@ -14,6 +14,7 @@ source(here("Code/paths+packages.R"))
 #source(here("Code/Functions/exoPipeline.R"))
 #source(here("Code/Functions/BaseflowSeparation.R"))
 library(preMetabolizer)
+source(here("Code/Functions/aims.R"))
 
 ```
 
@@ -463,9 +464,9 @@ neonDat <- neonBP |>
   full_join(neonTemp) |> 
   select(dateTime = startDateTime, siteID, bp_kPa = staPresMean, airTempC = tempTripleMean)
 
-neonF <- flag_outliers(neonDat, window_size = 2016)
-neonDat <- consolidate_flags(neonF)
-neonDat <- remove_outliers(neonDat)
+# neonF <- flag_outliers(neonDat, window_size = 2016)
+# neonDat <- consolidate_flags(neonF)
+# neonDat <- remove_outliers(neonDat)
 
 #rm(neonBP, neonTemp)
 neonSens <- neon_read(table = "sensor_positions", site = c("KONZ")) 
@@ -486,7 +487,7 @@ neonBP <- neonDat |>
          airTempC =  zoo::na.approx(airTempC, na.rm = F, maxgap = 12)) |> 
   ungroup() |> 
   filter(minute(dateTime) %% 10 == 0) |> 
-  select(-siteID, Flag)
+  select(-siteID)
 
 KNZNeon <- neonBP |> 
   mutate(Site = "KNZ",
@@ -575,7 +576,10 @@ wetDry <- doDat |>
   )) |> 
   mutate(wetdry_SW = case_when(Site == "SHN" & dateTime >= as_datetime("2024-09-03 16:00:00", tz = "UTC") ~ "dry", T~wetdry_SW)) |> 
   mutate(wetdry_SW = case_when(Site == "KNZ" & dateTime >= ymd_hm("2023-07-02 13:40") & dateTime <= ymd_hm("2023-07-11 23:50")~"dry", T~wetdry_SW)) |> 
-  mutate(wetdry_SW = case_when(Site == "KNZ" & dateTime >= ymd_hm("2023-07-05 04:10") & dateTime <= ymd_hm("2023-07-11 02:20")~"wet", T~wetdry_SW))
+  mutate(wetdry_SW = case_when(Site == "KNZ" & dateTime >= ymd_hm("2023-07-05 04:10") & dateTime <= ymd_hm("2023-07-08 17:00")~"dry", T~wetdry_SW)) |> 
+  mutate(wetdry_SW = case_when(Site == "KNZ" & dateTime >= ymd_hm("2022-08-09 09:50") & dateTime <= ymd_hm("2022-08-20 09:50")~"dry", T~wetdry_SW)) |> 
+  mutate(wetdry_SW = case_when(Site == "YMR" & dateTime >= ymd_hm("2024-07-09 11:50") & dateTime <= ymd_hm("2024-07-15 11:50")~"dry", T~wetdry_SW))
+
 
 doDat <- doDat |> 
   left_join(wetDry |> select(Site, dateTime, wetdry_SW))  |> 
@@ -664,6 +668,842 @@ doDat |>
 
 
 
+```
+
+```{r}
+create_site_year_plots <- function(site_code, year_value, doDat, gpQ, percWet_15, output_dir = NULL) {
+  library(ggplot2)
+  library(dplyr)
+  library(lubridate)
+  library(scales)
+  library(see)
+  library(ggthemes)
+  library(tidyr)
+  library(patchwork)
+
+  site_colors <- c("KNZ" = "#0072B2", "SHN" = "#E69F00", "YMR" = "#CC79A7")
+  site_color <- site_colors[[site_code]]
+
+  do_data <- doDat |>
+    filter(Site == site_code & Year == year_value) |>
+    drop_na(DO.pctsat)
+
+  if (nrow(do_data) == 0 || all(is.na(do_data$dateTime))) {
+    warning(paste("Skipping", site_code, year_value, "- no DO data"))
+    return(NULL)
+  }
+
+  do_data <- do_data |>
+    complete(dateTime = seq(
+      floor_date(min(dateTime, na.rm = TRUE), "10 min"),
+      floor_date(max(dateTime, na.rm = TRUE), "10 min"),
+      by = "10 min"
+    ))
+
+  q_data <- gpQ |>
+    filter(Site == site_code & Year == year_value)
+
+  date_range <- range(do_data$dateTime, na.rm = TRUE)
+
+  max_do <- max(do_data$DO.pctsat, na.rm = TRUE)
+  max_q <- max(q_data$Q_Ls[q_data$Q_Ls > 0], na.rm = TRUE)
+
+  if (!is.finite(max_q) || max_q <= 0) {
+    warning(paste("Skipping", site_code, year_value, "- invalid or missing Q data"))
+    return(NULL)
+  }
+
+  q_to_do_factor <- max_do / log1p(max_q)
+
+  combined_plot <- ggplot() +
+    geom_line(
+      data = q_data,
+      aes(x = dateTime, y = log10(Q_Ls) * q_to_do_factor),
+      linewidth = 1,
+      na.rm = TRUE
+    ) +
+    geom_line(
+      data = do_data,
+      aes(x = dateTime, y = DO.pctsat),
+      color = site_color,
+      linewidth = 1,
+      alpha = 0.3,
+      na.rm = TRUE
+    ) +
+    scale_x_datetime(
+      limits = date_range,
+      date_labels = "%b",
+      date_breaks = "1 month"
+    ) +
+    scale_y_continuous(
+      name = "DO (% Sat)",
+      limits = c(0, NA),
+      sec.axis = sec_axis(
+        ~ . / q_to_do_factor,
+        name = expression("Discharge (L "*s^{-1}*")"),
+        labels = label_number()
+      )
+    ) +
+    theme_few() +
+    theme(
+      axis.title.x = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      text = element_text(size = 18),
+      plot.title = element_text(hjust = 0.5, face = "bold")
+    ) +
+    ggtitle(paste(site_code, year_value))
+
+  percwet_data <- percWet_15 |>
+    filter(watershed == site_code, dateTime >= date_range[1], dateTime <= date_range[2])
+
+  percwet_plot <- ggplot(percwet_data, aes(x = dateTime, y = PercWet)) +
+    geom_line(color = site_color, linewidth = 1, na.rm = TRUE) +
+    scale_x_datetime(
+      limits = date_range,
+      date_labels = "%b",
+      date_breaks = "1 month"
+    ) +
+    scale_y_continuous(
+      name = "Percent Wet",
+      labels = scales::label_percent()
+    ) +
+    theme_few() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      text = element_text(size = 18)
+    )
+
+  final_plot <- combined_plot / percwet_plot + plot_layout(heights = c(2, 1))
+
+  if (!is.null(output_dir)) {
+    filename <- paste0("dualY_DO_Q_and_PercWet_", site_code, "_", year_value, ".png")
+    ggsave(filename = filename,
+           plot = final_plot,
+           path = output_dir,
+           device = "png",
+           width = 25.4,
+           height = 20,
+           units = "cm",
+           dpi = "retina")
+    cat("Saved plot:", file.path(output_dir, filename), "\n")
+  }
+
+  return(final_plot)
+}
+
+
+gpQ2 <- aims_read(input_dir = "~/Dropbox/AIMS/GP_SW-GW_QAQC/Data/Processed", rType = "DISC") |> 
+  rename(dateTime = datetime, Site = siteId) |> 
+  mutate(Site = case_when(Site == "ENM01" ~ "YMR",
+                          Site == "SFM01" ~ "KNZ",
+                          Site == "SHM01" ~ "SHN")) |> 
+  select(Site, dateTime, Q_Ls)
+
+gpPT2 <- aims_read(input_dir = "~/Dropbox/AIMS/GP_SW-GW_QAQC/Data/Processed", rType = "PRES") |> 
+  rename(dateTime = datetime, Site = siteId) |> 
+  mutate(Site = case_when(Site == "ENM01" ~ "YMR",
+                          Site == "SFM01" ~ "KNZ",
+                          Site == "SHM01" ~ "SHN")) |> 
+  select(Site, dateTime, sublocation, waterDepth_m, wetdry) |> 
+   pivot_wider(names_from = sublocation, values_from = c(waterDepth_m, wetdry))
+
+gpQ2 <- gpQ2 |> 
+  full_join(gpPT, by = c("Site", "dateTime")) |> 
+  group_by(Site) |>
+  complete(dateTime = seq(floor_date(min(dateTime), "10 min"), floor_date(max(dateTime), "10 min"), by = "10 min")) |>
+  arrange(dateTime) |>
+  ungroup() |>
+  mutate(wetdry_SW = ifelse(wetdry_SW == "", NA, wetdry_SW)) |> 
+  replace_na(list(Q_Ls = 0, waterDepth_m_SW = 0)) |> 
+  arrange(Site, dateTime) |>  # Ensure chronological order within each Site
+  group_by(Site) |>  # Group by Site
+  fill(wetdry_SW, .direction = "down") |>  # Fill NA values downward
+  ungroup() |> 
+  mutate(wetQf = case_when(
+    (Q_Ls <= 0 & wetdry_SW == "wet") ~ "pooled",
+    Q_Ls > 0 & wetdry_SW == "wet" ~ "flowing",
+    wetdry_SW == "dry" ~ "dry",
+    is.na(wetdry_SW) ~ "no data",
+    TRUE ~ NA  # Keep NA values as NA
+  )) |> 
+  rename(swDepth = waterDepth_m_SW, gwDepth = waterDepth_m_PI) 
+
+gpPercWet <- read_csv(here("Data/gp15minPercWet.csv"))
+
+doDat <- doDat |> 
+  mutate(Year = year(dateTime))
+
+gpQ2 <- gpQ2 |> 
+  mutate(Year = year(dateTime))
+# To create plots for all combinations
+all_combinations <- doDat |>
+  select(Site, Year) |>
+  distinct()
+
+# Create all plots 
+pmap(all_combinations, ~create_site_year_plots(.x, .y, doDat, gpQ2, percWet_15, output_dir = here("Figs/SFS_25")))
+
+```
+
+```{r}
+create_site_year_plots <- function(site_code, year_value, doDat, gpQ, percWet_15, output_dir = NULL) {
+  library(ggplot2)
+  library(dplyr)
+  library(lubridate)
+  library(scales)
+  library(see)
+  library(ggthemes)
+  library(tidyr)
+
+  # Define color palette
+  site_colors <- c("KNZ" = "#0072B2", "SHN" = "#E69F00", "YMR" = "#CC79A7")
+  site_color <- site_colors[[site_code]]
+
+  # Filter and prep DO data
+  do_data <- doDat |>
+    filter(Site == site_code & Year == year_value) |>
+    drop_na(DO.pctsat)
+
+  if (nrow(do_data) == 0 || all(is.na(do_data$dateTime))) {
+    warning(paste("Skipping", site_code, year_value, "- no DO data"))
+    return(NULL)
+  }
+
+  do_data <- do_data |>
+    complete(dateTime = seq(
+      floor_date(min(dateTime, na.rm = TRUE), "10 min"),
+      floor_date(max(dateTime, na.rm = TRUE), "10 min"),
+      by = "10 min"
+    ))
+
+  q_data <- gpQ |>
+    filter(Site == site_code & Year == year_value)
+
+  percwet_data <- percWet_15 |>
+    filter(watershed == site_code) |> 
+    mutate(PercWet = PercWet*100)
+
+  # Determine date range
+  date_range <- range(do_data$dateTime, na.rm = TRUE)
+
+  # Scaling Q to match DO axis
+  max_do <- max(do_data$DO.pctsat, na.rm = TRUE)
+  max_q <- max(q_data$Q_Ls[q_data$Q_Ls > 0], na.rm = TRUE)
+
+  if (!is.finite(max_q) || max_q <= 0) {
+    warning(paste("Skipping", site_code, year_value, "- invalid or missing Q data"))
+    return(NULL)
+  }
+
+  q_to_do_factor <- max_do / log1p(max_q)
+
+  # Plot all three series
+  combined_plot <- ggplot() +
+    # Q line, scaled
+    geom_line(
+      data = q_data,
+      aes(x = dateTime, y = log1p(Q_Ls) * q_to_do_factor),
+      color = "black",
+      linewidth = 1,
+      na.rm = TRUE
+    ) +
+    # DO line
+    geom_line(
+      data = do_data,
+      aes(x = dateTime, y = DO.pctsat),
+      color = site_color,
+      linewidth = 1,
+      alpha = 0.3,
+      na.rm = TRUE
+    ) +
+    # PercWet line
+    geom_line(
+      data = percwet_data,
+      aes(x = dateTime, y = PercWet),
+      color = "firebrick",
+      linewidth = 1,
+      alpha = 0.5,
+      na.rm = TRUE
+    ) +
+    scale_x_datetime(
+      limits = date_range,
+      date_labels = "%b",
+      date_breaks = "1 month"
+    ) +
+    scale_y_continuous(
+      name = "%",
+      limits = c(0, NA),
+      sec.axis = sec_axis(
+        ~ . / q_to_do_factor,
+        name = expression("Discharge (L "*s^{-1}*")"),
+        labels = label_number()
+      )
+    ) +
+    theme_few() +
+    theme(
+      axis.title.x = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      text = element_text(size = 18),
+      plot.title = element_text(hjust = 0.5, face = "bold")
+    ) +
+    ggtitle(paste(site_code, year_value))
+
+  # Save plot if requested
+  if (!is.null(output_dir)) {
+    filename <- paste0("DO_Q_PercWet_", site_code, "_", year_value, ".png")
+    ggsave(filename = filename,
+           plot = combined_plot,
+           path = output_dir,
+           device = "png",
+           width = 25.4,
+           height = 15,
+           units = "cm",
+           dpi = "retina")
+    cat("Saved plot:", file.path(output_dir, filename), "\n")
+  }
+
+  return(combined_plot)
+}
+pmap(all_combinations, ~create_site_year_plots(.x, .y, doDat, gpQ2, percWet_15))
+```
+
+```{r}
+
+create_site_year_plots <- function(site_code, year_value, doDat, gpQ, output_dir = NULL) {
+  library(ggplot2)
+  library(dplyr)
+  library(lubridate)
+  library(scales)
+  library(see)
+  library(ggthemes)
+  library(tidyr)
+
+  # Define color palette
+  site_colors <- c("KNZ" = "#0072B2", "SHN" = "#E69F00", "YMR" = "#CC79A7")
+  site_color <- site_colors[[site_code]]
+
+  # Filter DO and Q data
+  do_data <- doDat |>
+    filter(Site == site_code & Year == year_value) |>
+    drop_na(DO.pctsat)
+
+  if (nrow(do_data) == 0 || all(is.na(do_data$dateTime))) {
+    warning(paste("Skipping", site_code, year_value, "- no DO data"))
+    return(NULL)
+  }
+
+  do_data <- do_data |>
+    complete(dateTime = seq(
+      floor_date(min(dateTime, na.rm = TRUE), "10 min"),
+      floor_date(max(dateTime, na.rm = TRUE), "10 min"),
+      by = "10 min"
+    ))
+
+  q_data <- gpQ |>
+    filter(Site == site_code & Year == year_value)
+
+  # Use DO data for x-axis limits
+  date_range <- range(do_data$dateTime, na.rm = TRUE)
+
+  # Create scaling factor to align swDepth to DO
+  max_do <- max(do_data$DO.pctsat, na.rm = TRUE)
+  max_depth <- max(q_data$swDepth[q_data$swDepth > 0], na.rm = TRUE)
+
+  if (!is.finite(max_depth) || max_depth <= 0) {
+    warning(paste("Skipping", site_code, year_value, "- invalid or missing swDepth"))
+    return(NULL)
+  }
+
+  depth_to_do_factor <- max_do / max_depth
+
+  # Create dual-axis plot
+  combined_plot <- ggplot() +
+    geom_line(
+      data = q_data,
+      aes(x = dateTime, y = swDepth * depth_to_do_factor),
+      linewidth = 1,
+      na.rm = TRUE
+    ) +
+    geom_line(
+      data = do_data,
+      aes(x = dateTime, y = DO.pctsat),
+      color = site_color,
+      linewidth = 1,
+      alpha = 0.4,
+      na.rm = TRUE
+    ) +
+    scale_x_datetime(
+      limits = date_range,
+      date_labels = "%b",
+      date_breaks = "1 month"
+    ) +
+    scale_y_continuous(
+      name = "DO (% Sat)",
+      limits = c(0, NA),
+      sec.axis = sec_axis(
+        ~ . / depth_to_do_factor,
+        name = "Water Depth (m)",
+        labels = label_number()
+      )
+    ) +
+    theme_few() +
+    theme(
+      axis.title.x = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      text = element_text(size = 18),
+      plot.title = element_text(hjust = 0.5, face = "bold")
+    ) +
+    ggtitle(paste(site_code, year_value))
+
+  # Save plot if requested
+  if (!is.null(output_dir)) {
+    filename <- paste0("dualY_DO_depth_", site_code, "_", year_value, ".png")
+    ggsave(filename = filename,
+           plot = combined_plot,
+           path = output_dir,
+           device = "png",
+           width = 25.4,
+           height = 15,
+           units = "cm",
+           dpi = "retina")
+    cat("Saved plot:", file.path(output_dir, filename), "\n")
+  }
+
+  return(combined_plot)
+}
+
+
+gpQ2 <- aims_read(input_dir = "~/Dropbox/AIMS/GP_SW-GW_QAQC/Data/Processed", rType = "DISC") |> 
+  rename(dateTime = datetime, Site = siteId) |> 
+  mutate(Site = case_when(Site == "ENM01" ~ "YMR",
+                          Site == "SFM01" ~ "KNZ",
+                          Site == "SHM01" ~ "SHN")) |> 
+  select(Site, dateTime, Q_Ls)
+
+gpPT2 <- aims_read(input_dir = "~/Dropbox/AIMS/GP_SW-GW_QAQC/Data/Processed", rType = "PRES") |> 
+  rename(dateTime = datetime, Site = siteId) |> 
+  mutate(Site = case_when(Site == "ENM01" ~ "YMR",
+                          Site == "SFM01" ~ "KNZ",
+                          Site == "SHM01" ~ "SHN")) |> 
+  select(Site, dateTime, sublocation, waterDepth_m, wetdry) |> 
+   pivot_wider(names_from = sublocation, values_from = c(waterDepth_m, wetdry))
+
+gpQ2 <- gpQ2 |> 
+  full_join(gpPT, by = c("Site", "dateTime")) |> 
+  group_by(Site) |>
+  complete(dateTime = seq(floor_date(min(dateTime), "10 min"), floor_date(max(dateTime), "10 min"), by = "10 min")) |>
+  arrange(dateTime) |>
+  ungroup() |>
+  mutate(wetdry_SW = ifelse(wetdry_SW == "", NA, wetdry_SW)) |> 
+  replace_na(list(Q_Ls = 0, waterDepth_m_SW = 0)) |> 
+  arrange(Site, dateTime) |>  # Ensure chronological order within each Site
+  group_by(Site) |>  # Group by Site
+  fill(wetdry_SW, .direction = "down") |>  # Fill NA values downward
+  ungroup() |> 
+  mutate(wetQf = case_when(
+    (Q_Ls <= 0 & wetdry_SW == "wet") ~ "pooled",
+    Q_Ls > 0 & wetdry_SW == "wet" ~ "flowing",
+    wetdry_SW == "dry" ~ "dry",
+    is.na(wetdry_SW) ~ "no data",
+    TRUE ~ NA  # Keep NA values as NA
+  )) |> 
+  rename(swDepth = waterDepth_m_SW, gwDepth = waterDepth_m_PI) 
+
+
+doDat <- doDat |> 
+  mutate(Year = year(dateTime))
+
+gpQ2 <- gpQ2 |> 
+  mutate(Year = year(dateTime))
+# To create plots for all combinations
+all_combinations <- doDat |>
+  select(Site, Year) |>
+  distinct()
+
+# Create all plots 
+pmap(all_combinations, ~create_site_year_plots(.x, .y, doDat, gpQ2, output_dir = here("Figs/SFS_25")))
+
+```
+
+```{r}
+
+create_site_year_plots <- function(site_code, year_value, doDat, gpQ, percWet_15, output_dir = NULL) {
+    library(ggplot2)
+    library(dplyr)
+    library(lubridate)
+    library(scales)
+    library(tidyr)
+    library(patchwork)
+    library(see)
+    library(ggthemes)
+    library(cowplot)
+    library(grid)
+    
+    # Define color palette
+    site_color <- "#0072B2"
+    site_names <- c("KNZ" = "Kings Creek", "SHN" = "Shane Creek","YMR" = "Youngmeyer")
+    site_name <- site_names[[site_code]]
+    # Filter DO and Q data
+    do_data <- doDat |>
+        filter(Site == site_code & Year == year_value) |>
+        drop_na(DO.pctsat)
+    
+    if (nrow(do_data) == 0 || all(is.na(do_data$dateTime))) {
+        warning(paste("Skipping", site_code, year_value, "- no DO data"))
+        return(NULL)
+    }
+    
+    do_data <- do_data |>
+        complete(dateTime = seq(
+            floor_date(min(dateTime, na.rm = TRUE), "10 min"),
+            floor_date(max(dateTime, na.rm = TRUE), "10 min"),
+            by = "10 min"
+        ))
+    
+    q_data <- gpQ |>
+        filter(Site == site_code & Year == year_value)
+    
+    percwet_data <- percWet_15 |>
+        filter(watershed == site_code,
+               dateTime >= min(do_data$dateTime, na.rm = TRUE),
+               dateTime <= max(do_data$dateTime, na.rm = TRUE)) |> 
+        mutate(PercWet = PercWet * 100)
+    
+    # Use DO data for date range
+    date_range <- range(do_data$dateTime, na.rm = TRUE)
+    
+    # Create transformation factor to align Q and DO visually
+    max_do <- max(do_data$DO.pctsat, na.rm = TRUE)
+    max_q <- max(q_data$Q_Ls[q_data$Q_Ls > 0], na.rm = TRUE)
+    if (!is.finite(max_q) || max_q <= 0) {
+        warning(paste("Skipping", site_code, year_value, "- invalid or missing Q data"))
+        return(NULL)
+    }
+    q_to_do_factor <- max_do / log1p(max_q)
+    
+    # Main DO + Q dual axis plot
+    # Main DO + Q dual axis plot
+    main_plot <- ggplot() +
+        geom_line(
+            data = q_data,
+            aes(x = dateTime, y = log10(Q_Ls) * q_to_do_factor),
+            linewidth = 1,
+            na.rm = TRUE
+        ) +
+        geom_line(
+            data = do_data,
+            aes(x = dateTime, y = DO.pctsat),
+            color = site_color,
+            linewidth = 1,
+            alpha = 0.5,
+            na.rm = TRUE
+        ) +
+        scale_x_datetime(
+            limits = date_range,
+            date_labels = "%b",
+            date_breaks = "1 month"
+        ) +
+        scale_y_continuous(
+            limits = c(0, NA),
+            sec.axis = sec_axis(
+                ~ . / q_to_do_factor,
+                name = expression("Discharge (L "*s^{-1}*")"),
+                labels = label_number()
+            )
+        ) +
+        theme_few() +
+        theme(
+            axis.title.y.left = element_blank(),  # remove individual y-axis label
+            axis.title.x = element_blank(),
+            axis.text.x = element_blank(),
+            axis.ticks.x = element_blank(),
+            text = element_text(size = 22),
+            plot.title = element_text(hjust = 0.5, face = "bold"),
+    panel.background = element_rect(fill = "transparent", color = NA),
+    plot.background = element_rect(fill = "transparent", color = NA),
+    legend.background = element_rect(fill = "transparent", color = NA),
+    legend.box.background = element_rect(fill = "transparent", color = NA)
+        ) +
+        ggtitle(paste(site_name, year_value))
+    
+    # PercWet + DO plot
+    max_pw <- max(percwet_data$PercWet, na.rm = TRUE)
+    pw_to_do_factor <- max_do / max_pw
+    
+    percwet_plot <- ggplot() +
+        geom_line(
+            data = percwet_data,
+            aes(x = dateTime, y = PercWet * pw_to_do_factor),
+            color = "black",
+            linewidth = 1,
+            na.rm = TRUE,
+            linetype = "dashed"
+        ) +
+        geom_line(
+            data = do_data,
+            aes(x = dateTime, y = DO.pctsat),
+            color = site_color,
+            linewidth = 1,
+            alpha = 0.5,
+            na.rm = TRUE
+        ) +
+        scale_x_datetime(
+            limits = date_range,
+            date_labels = "%b",
+            date_breaks = "1 month"
+        ) +
+        scale_y_continuous(
+            limits = c(0, NA),
+            sec.axis = sec_axis(
+                ~ . / pw_to_do_factor,
+                name = "Network Wet (%)",
+                labels = label_percent(scale = 1)
+            )
+        ) +
+        theme_few() +
+        theme(
+          axis.title.x = element_blank(),
+            axis.title.y.left = element_blank(),  # remove duplicate DO label
+            axis.text.x = element_text(angle = 45, hjust = 1),
+            text = element_text(size = 22),
+    panel.background = element_rect(fill = "transparent", color = NA),
+    plot.background = element_rect(fill = "transparent", color = NA),
+    legend.background = element_rect(fill = "transparent", color = NA),
+    legend.box.background = element_rect(fill = "transparent", color = NA)
+        )
+    
+    # Combine plots
+    stacked <- main_plot / percwet_plot + plot_layout(heights = c(1, 1))
+    
+    # Add shared DO axis label using grid
+    shared_y_label <- grid::textGrob("DO (% Sat)", rot = 90, gp = gpar(fontsize = 22))
+    
+    combined <- cowplot::ggdraw() +
+        cowplot::draw_plot(stacked, x = 0.03, width = 0.97) +  # adjust width to leave room
+        cowplot::draw_grob(shared_y_label, x = 0.02, y = -0.025, hjust = 0.5)
+    
+    # Save plot if requested
+    if (!is.null(output_dir)) {
+        filename <- paste0("DO_Q_PercWet_", site_code, "_", year_value, ".png")
+        ggsave(
+            filename = filename,
+            plot = combined,
+            path = output_dir,
+            device = "png",
+            width = 25.4,
+            height = 20,
+            units = "cm",
+            dpi = "retina",
+            bg = "transparent"
+        )
+        cat("Saved plot:", file.path(output_dir, filename), "\n")
+    }
+    
+    return(combined)
+}
+
+
+
+
+gpQ2 <- aims_read(input_dir = "~/Dropbox/AIMS/GP_SW-GW_QAQC/Data/Processed", rType = "DISC") |> 
+  rename(dateTime = datetime, Site = siteId) |> 
+  mutate(Site = case_when(Site == "ENM01" ~ "YMR",
+                          Site == "SFM01" ~ "KNZ",
+                          Site == "SHM01" ~ "SHN")) |> 
+  select(Site, dateTime, Q_Ls)
+
+gpPT2 <- aims_read(input_dir = "~/Dropbox/AIMS/GP_SW-GW_QAQC/Data/Processed", rType = "PRES") |> 
+  rename(dateTime = datetime, Site = siteId) |> 
+  mutate(Site = case_when(Site == "ENM01" ~ "YMR",
+                          Site == "SFM01" ~ "KNZ",
+                          Site == "SHM01" ~ "SHN")) |> 
+  select(Site, dateTime, sublocation, waterDepth_m, wetdry) |> 
+   pivot_wider(names_from = sublocation, values_from = c(waterDepth_m, wetdry))
+
+gpQ2 <- gpQ2 |> 
+  full_join(gpPT, by = c("Site", "dateTime")) |> 
+  group_by(Site) |>
+  complete(dateTime = seq(floor_date(min(dateTime), "10 min"), floor_date(max(dateTime), "10 min"), by = "10 min")) |>
+  arrange(dateTime) |>
+  ungroup() |>
+  mutate(wetdry_SW = ifelse(wetdry_SW == "", NA, wetdry_SW)) |> 
+  replace_na(list(Q_Ls = 0, waterDepth_m_SW = 0)) |> 
+  arrange(Site, dateTime) |>  # Ensure chronological order within each Site
+  group_by(Site) |>  # Group by Site
+  fill(wetdry_SW, .direction = "down") |>  # Fill NA values downward
+  ungroup() |> 
+  mutate(wetQf = case_when(
+    (Q_Ls <= 0 & wetdry_SW == "wet") ~ "pooled",
+    Q_Ls > 0 & wetdry_SW == "wet" ~ "flowing",
+    wetdry_SW == "dry" ~ "dry",
+    is.na(wetdry_SW) ~ "no data",
+    TRUE ~ NA  # Keep NA values as NA
+  )) |> 
+  rename(swDepth = waterDepth_m_SW, gwDepth = waterDepth_m_PI) 
+
+gpPercWet <- read_csv(here("Data/gp15minPercWet.csv"))
+
+doDat <- doDat |> 
+  mutate(Year = year(dateTime))
+
+gpQ2 <- gpQ2 |> 
+  mutate(Year = year(dateTime))
+# To create plots for all combinations
+all_combinations <- doDat |>
+  select(Site, Year) |>
+  distinct()
+
+
+# Create all plots 
+pmap(all_combinations, ~create_site_year_plots(.x, .y, doDat, gpQ2, gpPercWet, output_dir = here("Figs/SFS_25")))
+```
+
+```{r}
+create_site_year_plots <- function(site_code, year_value, doDat, gpQ, percWet_15, output_dir = NULL) {
+    # Load required libraries for data manipulation
+    library(dplyr)
+    library(lubridate)
+    library(tidyr)
+    
+    # Define site names
+    site_names <- c("KNZ" = "Kings Creek", "SHN" = "Shane Creek", "YMR" = "Youngmeyer")
+    site_name <- site_names[[site_code]]
+    
+    # Filter DO data
+    do_data <- doDat %>%
+        filter(Site == site_code & Year == year_value) %>%
+        drop_na(DO.pctsat)
+    
+    if (nrow(do_data) == 0 || all(is.na(do_data$dateTime))) {
+        warning(paste("Skipping", site_code, year_value, "- no DO data"))
+        return(NULL)
+    }
+    
+    do_data <- do_data %>%
+        complete(dateTime = seq(
+            floor_date(min(dateTime, na.rm = TRUE), "10 min"),
+            floor_date(max(dateTime, na.rm = TRUE), "10 min"),
+            by = "10 min"
+        ))
+    
+    # Filter Q data with maximum discharge limit of 10,000 L/s
+    q_data <- gpQ %>%
+        filter(Site == site_code & Year == year_value) %>%
+        mutate(Q_Ls = pmin(Q_Ls, 10000))  # Cap discharge at 10,000 L/s
+    
+    # Filter PercWet data
+    percwet_data <- percWet_15 %>%
+        filter(watershed == site_code,
+               dateTime >= min(do_data$dateTime, na.rm = TRUE),
+               dateTime <= max(do_data$dateTime, na.rm = TRUE)) %>% 
+        mutate(PercWet = PercWet * 100)
+    
+    # Get date range
+    date_range <- range(do_data$dateTime, na.rm = TRUE)
+    
+    # Validate Q data
+    q_valid <- q_data$Q_Ls[q_data$Q_Ls > 0 & !is.na(q_data$Q_Ls)]
+    if (length(q_valid) == 0) {
+        warning(paste("Skipping", site_code, year_value, "- invalid or missing Q data"))
+        return(NULL)
+    }
+    
+    # Open graphics device if saving to file
+    if (!is.null(output_dir)) {
+        filename <- paste0("DO_Q_PercWet_", site_code, "_", year_value, ".png")
+        png(file.path(output_dir, filename), 
+            width = 25.4, height = 20, units = "cm", res = 300, bg = "transparent")
+    }
+    
+    # Set up layout: 2 rows, 1 column - reduced outer margin
+    par(mfrow = c(2, 1), mar = c(1, 4, 3, 4), oma = c(4, 1, 1, 1))
+    
+    ## First plot: DO + Q
+    
+    # Define colors
+    do_color <- "#0072B2"
+    q_color <- "black"
+    
+    # Plot DO data (left axis)
+    plot(do_data$dateTime, do_data$DO.pctsat,
+         type = "l", col = do_color, lwd = 2,
+         xaxt = "n", yaxt = "n",
+         xlim = date_range,
+         ylim = c(0, max(do_data$DO.pctsat, na.rm = TRUE) * 1.05),
+         xlab = "", ylab = "")
+    
+    # Add left y-axis for DO
+    axis(2, col = do_color, col.axis = do_color, cex.axis = 1.2, las = 1)
+    
+    # Prepare for second y-axis
+    par(new = TRUE)
+    
+    # Plot Q data (right axis) - using log scale
+    plot(q_data$dateTime, q_data$Q_Ls,
+         type = "l", col = q_color, lwd = 2,
+         xaxt = "n", yaxt = "n", log = "y",
+         xlim = date_range,
+         ylim = c(min(q_valid), max(q_valid) * 2),
+         xlab = "", ylab = "", bty = "n")
+    
+    # Add right y-axis for Q with log scale labels
+    log_ticks <- axisTicks(range(log10(q_valid), na.rm = TRUE), log = TRUE)
+    axis(4, at = log_ticks, labels = log_ticks, col = q_color, col.axis = q_color, cex.axis = 1.2, las = 1)
+    mtext(expression("Discharge (L "*s^{-1}*")"), side = 4, line = 4, col = q_color, cex = 1.4)
+    
+    # Add title
+    title(paste(site_name, year_value), cex.main = 1.6, font.main = 2)
+    
+    ## Second plot: DO + PercWet
+    
+    # Reset plotting parameters
+    par(mar = c(4, 4, 1, 4))
+    
+    # Plot DO data (left axis)
+    plot(do_data$dateTime, do_data$DO.pctsat,
+         type = "l", col = do_color, lwd = 2,
+         xaxt = "n", yaxt = "n",
+         xlim = date_range,
+         ylim = c(0, max(do_data$DO.pctsat, na.rm = TRUE) * 1.05),
+         xlab = "", ylab = "")
+    
+    # Add left y-axis for DO
+    axis(2, col = do_color, col.axis = do_color, cex.axis = 1.2, las = 1)
+    
+    # Prepare for second y-axis
+    par(new = TRUE)
+    
+    # Plot PercWet data (right axis)
+    plot(percwet_data$dateTime, percwet_data$PercWet,
+         type = "l", col = q_color, lwd = 2, lty = 2,
+         xaxt = "n", yaxt = "n",
+         xlim = date_range,
+         ylim = c(0, max(percwet_data$PercWet, na.rm = TRUE) * 1.05),
+         xlab = "", ylab = "", bty = "n")
+    
+    # Add right y-axis for PercWet
+    axis(4, col = q_color, col.axis = q_color, cex.axis = 1.2, las = 1)
+    mtext("Network Wet (%)", side = 4, line = 4, col = q_color, cex = 1.4)
+    
+    # Add x-axis for both plots
+    axis(1, at = seq(date_range[1], date_range[2], by = "month"),
+         labels = format(seq(date_range[1], date_range[2], by = "month"), "%b"),
+         cex.axis = 1.2, las = 1)
+    
+    # Add shared y-axis label for DO - moved closer to plot
+    mtext(expression("DO"[{"% Sat"}]), side = 2, outer = TRUE, line = -1, cex = 1.4, col = do_color)
+    
+    # Close graphics device if saving
+    if (!is.null(output_dir)) {
+        dev.off()
+        cat("Saved plot:", file.path(output_dir, filename), "\n")
+    }
+    
+    # Reset plotting parameters
+    par(mfrow = c(1, 1), mar = c(5, 4, 4, 2) + 0.1, oma = c(0, 0, 0, 0))
+}
+# Create all plots 
+pmap(all_combinations, ~create_site_year_plots(.x, .y, doDat, gpQ2, gpPercWet, output_dir = here("Figs/SFS_25")))
 ```
 
 ## Calc DO Metrics
@@ -791,7 +1631,8 @@ doMetrics <- doMetrics |>
   group_by(Site) |> 
   arrange(Date) |>
   mutate(across(where(is.numeric), ~zoo::na.approx(.x, na.rm = F, maxgap = 2))) |> 
-  ungroup()
+  ungroup() |> 
+  filter(flowState != "dry")
 
 doMetrics |>
   ggplot(aes(Date, avgDO.pctsat, color = flowState)) +
@@ -807,6 +1648,7 @@ doMetrics |>
   ggplot(aes(DOSat.exc, avgDO.pctsat)) +
   geom_line() +
   theme_few() +
+  ylim(0, 100) +
   theme(axis.title.x = element_blank(),
         axis.text.x = element_text(angle = 45, hjust = 1))+
   facet_wrap(~Site, scales = "free")
@@ -857,10 +1699,6 @@ doMetrics |>
   theme(axis.title.x = element_blank(),
         axis.text.x = element_text(angle = 45, hjust = 1))+
   facet_wrap(~Site, scales = "free")
-
-
-doMetrics <- doMetrics |> 
-  filter(flowState != "dry")
 ```
 
 ## DO Plots
@@ -874,6 +1712,39 @@ doMetrics <- doMetrics |>
 
 #doMet |> 
 #  write_csv("~/Desktop/DOMetrics.csv")
+doDates <- doMetrics |>
+  filter(!is.na(avgDO.pctsat)) |>
+  group_by(Site, Year) |>
+  summarise(
+    first_date = min(Date),
+    last_date = max(Date),
+    .groups = "drop"
+  ) |> 
+  mutate(WinterStart_preY = as.Date(paste0(as.integer(as.character(Year))-1, "-12-01")),
+         WinterStart = as.Date(paste0(as.integer(as.character(Year)), "-12-01"))) |> 
+  mutate(WinterStart = case_when(Site == "YMR" & Year == "2021"~ as_date("2021-12-20"), T~WinterStart),
+         WinterStart_preY = case_when(Site == "YMR" & Year == "2022"~ as_date("2021-12-20"), T~WinterStart_preY))
+
+knzDO24 <- doMetrics |>
+  filter(Site == "KNZ" & Year == "2024") |> 
+  ggplot(aes(Date, avgDO.pctsat)) +
+  see::geom_point2(size = 3, alpha = 0.8, color = "#0077BB") +
+  ylab("DO (% Sat)") +
+  theme_few() +
+  # geom_rect(data = doDates,
+  #           aes(xmin = WinterStart_preY, xmax = first_date, ymin = -Inf, ymax = Inf),
+  #           inherit.aes = FALSE,
+  #           fill = "#7FA4C2", alpha = 0.5) +
+  # geom_rect(data = doDates,
+  #           aes(xmin = last_date, xmax = WinterStart, ymin = -Inf, ymax = Inf),
+  #           inherit.aes = FALSE,
+  #           fill = "#AF7E56", alpha = 0.5) +
+  #scale_x_date(labels = date_format("%b '%y")) +
+  #xlim(as_date("2021-06-01"), as_date("2024-12-01"))+
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+
 
 doMetrics |>
   filter(flowState %in% c("flowing", "pooled")) |> 
@@ -1067,9 +1938,7 @@ plan(multisession)  # Enable parallelization
 dailyQ <- dailyQ |> 
   group_split(Site) |> 
   future_map_dfr(~ .x |> 
-                   mutate(across(c(minDepth, maxDepth, Depth_1d), 
-                                 ~ bestNormalize(.x)$x.t, 
-                                 .names = "{.col}_norm"),  # Normalization
+                   mutate(
                           across(c(minDepth, maxDepth, Depth_1d), 
                                  ~ rescale(.x),  # Min-max scaling from 0 to 1
                                  .names = "{.col}_scaled"), 
@@ -1097,6 +1966,146 @@ dailyQ |>
   theme(axis.title.x = element_blank(),
         axis.text.x = element_text(angle = 45, hjust = 1))+
   facet_wrap(~Site, scales = "free")
+
+
+knzDepth24 <- dailyQ |> 
+  mutate(Year = year(Date)) |> 
+  filter(Site == "KNZ" & Year == "2024") |> 
+  ggplot(aes(Date, Depth_1d)) +
+  geom_line() +
+  theme_few() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) 
+
+cowplot::plot_grid(knzDO24, knzDepth24, ncol = 1) 
+```
+
+```{r}
+create_site_year_plots <- function(site_code, year_value, doMetrics, dailyQ, output_dir = NULL) {
+  library(ggplot2)
+  library(dplyr)
+  library(lubridate)
+  library(scales)
+  library(see)
+  library(ggthemes)
+  
+  # Define color palette
+  site_colors <- c("KNZ" = "#0072B2", "SHN" = "#E69F00", "YMR" = "#CC79A7")
+  site_color <- site_colors[[site_code]]
+  
+  # Filter DO and Q data
+  do_data <- doMetrics |>
+    filter(Site == site_code & Year == year_value)
+  
+  q_data <- dailyQ |>
+    mutate(Year = year(Date)) |>
+    filter(Site == site_code & Year == year_value)
+  
+  # Calculate shared x and y range
+  date_range <- range(do_data$Date, na.rm = TRUE)
+  
+  # Create transformation factor to align Q and DO visually
+  max_do <- max(do_data$avgDO.pctsat, na.rm = TRUE)
+  max_q <- max(q_data$Q_1d, na.rm = TRUE)
+  q_to_do_factor <- max_do / log10(max_q)
+
+  # Create dual-axis plot
+  combined_plot <- ggplot() +
+    geom_line(data = q_data, aes(x = Date, y = log10(Q_1d) * q_to_do_factor),
+              color = "gray40", linewidth = 1, na.rm = TRUE) +
+    see::geom_point2(data = do_data, aes(x = Date, y = avgDO.pctsat),
+                     color = site_color, size = 3, alpha = 0.8, na.rm = TRUE) +
+    scale_x_date(limits = date_range, date_labels = "%b", date_breaks = "1 month") +
+    scale_y_continuous(
+      name = "DO (% Sat)",
+      limits = c(0, NA),  # Set lower limit to 0, upper limit auto-calculated
+      sec.axis = sec_axis(~ . / q_to_do_factor, name = expression("Discharge (L "*s^{-1}*")"), 
+                          labels = label_number())
+    ) +
+    theme_few() +
+    theme(
+      axis.title.x = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      #axis.title.y.left = element_text(color = site_color),
+      #axis.text.y.left = element_text(color = site_color),
+      #axis.title.y.right = element_text(color = "gray40"),
+      #axis.text.y.right = element_text(color = "gray40"),
+      text = element_text(size = 18),
+      plot.title = element_text(hjust = 0.5, face = "bold")
+    ) +
+    ggtitle(paste(site_code, year_value))
+  
+  # Save plot if requested
+  if (!is.null(output_dir)) {
+    filename <- paste0("dualY_DO_Q_", site_code, "_", year_value, ".png")
+    ggsave(filename = filename,
+           plot = combined_plot,
+           path = output_dir,
+           device = "png",
+           width = 25.4,
+           height = 15,
+           units = "cm",
+           dpi = "retina")
+    cat("Saved plot:", file.path(output_dir, filename), "\n")
+  }
+
+  return(combined_plot)
+}
+
+
+# To create plots for all combinations
+all_combinations <- doMetrics |>
+  select(Site, Year) |>
+  distinct()
+
+# Create all plots 
+pmap(all_combinations, ~create_site_year_plots(.x, .y, doMetrics, dailyQ, output_dir = here("Figs/SFS_25")))
+
+# Create DO plot
+do_exc <- doMetrics |>
+  group_by(Site) |> 
+  mutate(DO_exc = calc_exceedance_prob(avgDO.pctsat)) |> 
+  ggplot(aes(DO_exc, avgDO.pctsat, color = Site)) +
+  geom_line()+
+  scale_color_manual(values =  okabeIto)+
+  labs(x = "Exceedance Probability",
+       y = "DO Saturation") +
+  theme_few() +
+  scale_x_continuous(labels = label_percent(), limits = c(0, 1), expand = c(0, 0)) +
+  scale_y_continuous(labels = label_percent(scale = 1)) +
+  theme(
+    text = element_text(size = 18),          # overall text size
+    legend.text = element_text(size = 16),   # legend entries
+    legend.title = element_blank(),  # legend title
+    axis.title = element_text(size = 18),    # axis titles
+    axis.text = element_text(size = 16),     # axis tick labels
+    legend.position = "bottom",
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+do_exc
+
+# Create DO plot
+q_exc <- dailyQ |>
+  group_by(Site) |> 
+  mutate(Q_exc = calc_exceedance_prob(Q_1d, rm.zero = T)) |> 
+  ggplot(aes(Q_exc, Q_1d, color = Site)) +
+  geom_line()+
+  scale_color_manual(values =  okabeIto)+
+  labs(x = "Exceedance Probability",
+       y = "Discharge") +
+  theme_few() +
+  scale_x_continuous(labels = label_percent(), limits = c(0, 1), expand = c(0, 0)) +
+  scale_y_continuous(labels = label_percent(scale = 1)) +
+  theme(
+    text = element_text(size = 18),          # overall text size
+    legend.text = element_text(size = 16),   # legend entries
+    legend.title = element_blank(),  # legend title
+    axis.title = element_text(size = 18),    # axis titles
+    axis.text = element_text(size = 16),     # axis tick labels
+    legend.position = "bottom",
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+q_exc
 ```
 
 ## PPT

@@ -70,6 +70,12 @@ mutate(Site = case_when(Site == "PRM01" ~ "PRF",
   filter(!(Site == "WHR" & sublocation == "SW" & 
              dateTime %in% as_datetime(c("2022-09-20 08:30:00", "2023-06-17 08:45:00")))) |> 
   pivot_wider(names_from = sublocation, values_from = c(waterDepth_m, wetdry)) |> 
+  group_by(Site) |>
+  complete(dateTime = seq(floor_date(min(dateTime), "15 min"), floor_date(max(dateTime), "15 min"), by = "15 min")) |>
+  arrange(dateTime) |>
+  mutate(across(where(is.numeric), ~ na.approx(.x, na.rm = F, maxgap = 10))) |>
+  filter(minute(dateTime) %% 15 == 0) |>
+  mutate(waterDepth_m_SW = ifelse(waterDepth_m_SW < 0, 0, waterDepth_m_SW)) |>
   rename(swDepth = waterDepth_m_SW, gwDepth = waterDepth_m_PI) |> 
   mutate(head_gradient = (gwDepth-swDepth))
 
@@ -118,12 +124,7 @@ plan(multisession)  # Enable parallelization
 dailyQ <- dailyQ |> 
   group_split(Site) |> 
   future_map_dfr(~ .x |> 
-                   mutate(across(c(minDepth, maxDepth, Depth_1d), 
-                                 ~ bestNormalize(.x)$x.t, 
-                                 .names = "{.col}_norm"),  # Normalization
-                          across(c(minDepth, maxDepth, Depth_1d), 
-                                 ~ rescale(.x),  # Min-max scaling from 0 to 1
-                                 .names = "{.col}_scaled"), 
+                   mutate( 
                           excProb = calc_exceedance_prob(Q_1d)),
                  .options = furrr_options(seed = TRUE), 
                  .progress = FALSE) |> 
@@ -525,6 +526,7 @@ dailyPPT[, (paste0("PPT_", window_sizes, "d")) :=
 
 ```{r}
 ptSTICs <- sePT |> 
+  ungroup() |> 
   rename(SuperSensor = wetdry_SW) |> 
   mutate(siteId = case_when(Site == "PRF" ~ "PRM01",
                           Site == "TAL" ~ "TLM01",
@@ -545,7 +547,10 @@ stics <- list.files(here("Data/SE/STICs"), full.names = T) |>
   bind_rows() |> 
   select(-project, -rType, -SN, -rep) |> 
   rename(dateTime = datetime) |> 
-  filter(siteId %in% seSites$siteId & qual_rating != "poor") |> 
+  filter(
+    siteId %in% seSites$siteId,
+    !((grepl("D", QAQC) | qual_rating == "poor") & !siteId %in% c("WHM08", "WHM09"))
+  ) |> 
   mutate(dateTime = ymd_hms(dateTime),
          wetdry = case_when(
     wetdry %in% c("dry", "0") ~ 0,
@@ -614,8 +619,8 @@ daily_presAbs <- stics |>
   ) |>
   filter(!is.na(Site)) |>
   group_by(Site, siteId, date) |>
-  summarise(wetdry = get_mode(wetdry), .groups = "drop") |>
-  split(~Site, drop = TRUE) |> 
+  summarise(wetdry = calc_mode(wetdry), .groups = "drop") |>
+  split(~Site, drop = T) |> 
   lapply(\(df) {
     df |>
       select(date, siteId, wetdry) |>
@@ -624,7 +629,11 @@ daily_presAbs <- stics |>
         values_from = wetdry
       )
   })
+# Convert the list to a single dataframe with watershed column
+sePresAbs <- bind_rows(daily_presAbs, .id = "watershed")
 
+# Write to CSV
+write_csv(sePresAbs, here("Data/STICs/SE_DailyPresAbs.csv"))
 daily_presAbs_clean <- map(daily_presAbs, stics_not_na)
 doParallel::registerDoParallel(cores = nCores)
 daily_presAbs_filled <- map(daily_presAbs_clean, STIC.RFimpute_parallel)

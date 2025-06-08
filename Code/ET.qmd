@@ -1,0 +1,177 @@
+---
+title: "STICs"
+author: "CLB"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+#| echo: false
+
+library(tidyverse)
+library(tidygraph)
+library(data.table)
+library(ggthemes)
+library(here)
+library(sf)
+library(streamDAG)
+library(furrr)
+library(future)
+library(riverdist)
+library(sfnetworks)
+library(gganimate)
+source(here("Code/paths+packages.R"))
+library(mapview)
+library(cli)
+library(whitebox)
+wbt_init(exe_path = "~/WBT/whitebox_tools")
+# EPSG for NAD83 / UTM zone 14N
+UTM_14N <- 26914
+source(here("Code/AIMS_DAGs.R"))
+source(here("Code/Functions/aims.R"))
+source(here("Code/Functions/stic_StreamDAG.R"))
+```
+
+# Streams and Sites
+
+```{r}
+# knzS <- st_read("~/Desktop/AIMS_GreatPlains.gpkg", layer = "Streams") |> 
+#   st_transform(crs = 4326)
+
+# Load sites
+gpSites <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Sites") |> 
+  filter(watershed %in% c("KNZ", "SHN", "YMR")) |> 
+  st_transform(crs = 4326) |> 
+  mutate(
+    lon = st_coordinates(geom)[, "X"],
+    lat  = st_coordinates(geom)[, "Y"]
+  ) 
+
+seSites <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_SouthEast.gpkg", layer = "sites") |> 
+  filter(!sublocation == "HW") |> 
+  st_transform(4326) |>
+  mutate(
+    lon = st_coordinates(geom)[, 1],
+    lat = st_coordinates(geom)[, 2]
+  ) 
+
+mwSites <- st_read("~/Dropbox/AIMS/GIS/Results/GBJ.gpkg", layer = "Sites") |> 
+  st_transform(4326)
+
+```
+
+```{r}
+# First identify common columns we want to keep
+common_cols <- intersect(
+  names(gpSites), 
+  c("siteId", "slope", "twi", "drainage_area_sqkm", "outlet_dist_m", 
+    "elev_m", "watershed", "geom", "lon", "lat")
+)
+
+# Process seSites to match gpSites structure
+seSites <- seSites |>
+  mutate(
+    elev_m = elevation,
+    slope = slope_point,
+    outlet_dist_m = distance_from_outlet,
+    drainage_area_sqkm = drainage_area_m / 1000000  # Convert m² to km²
+  ) |>
+  # Select only the columns we want to keep
+  select(all_of(common_cols))
+
+# Process gpSites to match same column selection
+gpSites <- gpSites |>
+  select(all_of(common_cols))
+
+# Combine the two data frames
+allSites <- bind_rows(gpSites, seSites)
+
+# Add missing columns to mwSites, filled with NA
+mwSites <- mwSites |>
+  mutate(
+    slope = NA_real_,
+    twi = NA_real_,
+    drainage_area_sqkm = NA_real_,
+    outlet_dist_m = NA_real_,
+    elev_m = NA_real_,
+    watershed = as.character(watershed),  # ensure type match
+    lon = st_coordinates(geom)[, 1],
+    lat = st_coordinates(geom)[, 2]
+  ) |>
+  select(all_of(common_cols))  # enforce column order
+
+# Bind all sites together
+allSites <- bind_rows(allSites, mwSites)
+allSites <- allSites |> 
+  filter(siteId %in% c("SFM01", "SHM01", "ENM01", "TLM01", "WHM01", "PRM01", "GJ1"))
+```
+
+# NASA Power
+
+```{r}
+library(nasapower)
+
+get_et <- function(lat, lon, siteId, start_date, end_date) {
+  tryCatch({
+    et_data <- get_power(
+      community = "ag",
+      lonlat = c(lon, lat),
+      pars = c("EVPTRNS"),
+      dates = c(start_date, end_date)
+    )
+    et_data |>
+      mutate(siteId = siteId)
+  }, error = function(e) {
+    message("Error for site ", siteId, ": ", e$message)
+    return(NULL)
+  })
+}
+
+```
+
+## 
+
+```{r}
+start_date <- as_date("2021-01-01")
+end_date <- as_date("2025-01-01")
+
+
+et_all <- allSites |>
+  st_drop_geometry() |>
+  mutate(data = pmap(list(lat, lon, siteId),
+                     ~ get_et(..1, ..2, ..3, start_date, end_date))) |>
+  select(data) |>
+  unnest(cols = c(data))
+
+
+et_all <- et_all |> 
+  mutate(
+    ET_mm_day = EVPTRNS * 0.408,
+    siteId = case_when(
+    siteId == "SFM01" ~ "KNZ",
+    siteId == "SHM01" ~ "SHN",
+    siteId == "ENM01" ~ "YMR",
+    siteId == "WHM01" ~ "WHR",
+    siteId == "TLM01" ~ "TAL",
+    siteId == "PRM01" ~ "PRF",
+    siteId == "GJ1" ~ "GBJ",
+    TRUE ~ siteId  # keep other values unchanged
+  )) |> 
+  select(Date = YYYYMMDD, Site = siteId, ET_mm_day)
+```
+
+```{r}
+et_all |> 
+  write_csv(here("Data/nasaET.csv"))
+et_all |>
+  ggplot(aes(x = Date, y = ET_mm_day)) +
+  geom_line() +
+  facet_wrap(~ Site, scales = "free_y") +
+  labs(
+    title = "Daily Evapotranspiration by Site",
+    x = "Date",
+    y = "ET (mm/day)"
+  ) +
+  theme_few()
+```
