@@ -20,6 +20,7 @@ library(cowplot)
 library(ggExtra)
 library(piecewiseSEM)
 library(easystats)
+library(glmmTMB)
 set.seed(4) # For reproducibility
 gpSites <- c("#1b9e77", "#d95f02", "#7570b3")
 ```
@@ -89,7 +90,7 @@ streamLight <- read_csv(here("Data/streamLight/predLight/all_sites_results.csv")
 
 nasaET <- read_csv(here("Data/nasaET.csv"))
 # Load GP
-gpDat <- fread(here("Data/GP_dailyData.csv")) |>
+gpDat <- read_csv(here("Data/GP_dailyData.csv")) |>
   dplyr::select(
     -minDO.obs, -maxDO.obs, -avgDO.obs, -DO.hyp, -DO.amp,
     -probHyp, -dayProbConc, -nightProbConc, -NHR_obs,
@@ -99,7 +100,7 @@ gpDat <- fread(here("Data/GP_dailyData.csv")) |>
   left_join(streamLight, by = c("Site", "Date"))
 
 # Load SE
-seDat <- fread(here("Data/SE_dailyData.csv")) |>
+seDat <- read_csv(here("Data/SE_dailyData.csv")) |>
   dplyr::select(
     -minDO.obs, -maxDO.obs, -avgDO.obs, -DO.hyp, -DO.amp,
     -probHyp, -dayProbConc, -nightProbConc, -NHR_obs
@@ -164,13 +165,16 @@ rm(streamLight, gpDat, seDat, flowThresh, flowObs)
 sticAC <- read_csv(here("Data/STICs/streamDAG_metrics.csv")) |> 
   rename(Date = date, Site = watershed) |> 
   filter(Site %in% c("KNZ", "SHN", "YMR", "TAL", "WHR", "PRF")) |> 
-  select(Site, Date, PercWet_1d = percent_network_wet, upstream_length = active_upstream_length, a_cent_weighted) |> 
+  select(Site, Date, PercWet_1d = percent_network_wet, upstream_length = active_upstream_length, a_cent_weighted, a_cent) |> 
   mutate(upstream_length = ifelse(is.na(upstream_length), 0, upstream_length))
 
+# Kmeans Clusters
+k_clust <- read_csv(here("Data/k_means_clusters.csv"))
 
 allDat <- allDat |> 
-  left_join(sticAC) |> 
-  mutate(Q_1d = ifelse(is.na(Q_1d), 0, Q_1d))
+  full_join(sticAC) |> 
+  mutate(Q_1d = ifelse(is.na(Q_1d), 0, Q_1d)) |> 
+  full_join(k_clust)
 
 ```
 
@@ -244,6 +248,14 @@ suppressMessages(lapply(numeric_vars, \(var) {
 # Close the PDF
 dev.off()
 
+
+allDat |> 
+  ggplot(aes(PercWet_1d, avgDO.pctsat))+
+  geom_point()+
+  stat_poly_line()+
+  stat_poly_eq()+
+  theme_base() +
+  facet_wrap(~Site, scales = "free")
 ```
 
 ## Autocorrelation
@@ -409,6 +421,257 @@ dev.off()
 
 ```
 
+# Rand Forest
+
+```{r}
+clust_col <- c("1" = "#0077BB", "2" = "#E69F00", "3" = "#BBBB00")
+
+rf_vars <- c(
+  "ET_mm_day",
+  "avgPar", "PPT_14d",
+  "water.temp",
+  "upstream_length",
+  "PercWet",
+  "excProb",
+  "Depth",
+  "a_cent",
+  "a_cent_weighted",
+  "headGradient",
+  "DOSat.exc",
+  "DOpctsat.amp",
+  "avgDO.pctsat"
+)
+rf_dat <- allDat |>
+  rename_with(~ str_remove(.x, "_1d")) |>
+  # rename(PPT_tot = PPT) |>
+  # dplyr::select(Site, Date, avgDO.pctsat, all_of(rf_vars), cluster) |>
+  filter(Site %in% c("KNZ", "SHN", "YMR")) |>
+  drop_na(DOSat.exc, avgDO.pctsat) |>
+  select(-c(NHR_sat, nightProbSat, dayProbSat, dMinDO.pctsat, dDOpctsat.amp, probHypSat, DOSat.slope, sdDO.pctsat, cvDO.pctsat, DOSat.hyp, minDO.pctsat, maxDO.pctsat, maxPar, starts_with("DOY"), minQ, maxQ, thresh, starts_with("head")))
+rf_dat |>
+  select(cluster, avgDO.pctsat, DOSat.exc, DOpctsat.amp) |>
+  pivot_longer(
+    cols = c(avgDO.pctsat, DOSat.exc, DOpctsat.amp),
+    names_to = "variable",
+    values_to = "value"
+  ) |> 
+  ggplot(aes(x = factor(cluster), y = value, fill = factor(cluster))) +
+  geom_boxplot() +
+  facet_wrap(~ variable, scales = "free_y") +
+  scale_fill_manual(values = clust_col) +
+  labs(x = "Cluster", y = "Value", fill = "Cluster") +
+  theme_minimal()
+
+
+rf_model <- randomForest(clusters ~ ., data = scaledData |> dplyr::select(all_of(c("clusters", flow_vars, precip_vars, depth_vars, stic_vars, delta_vars, network_vars, "waterYear", "Season"))), importance = TRUE)
+varImpPlot(rf_model)
+
+# Extract variable importance
+var_imp_df <- importance(rf_model) |>
+  as.data.frame() |>
+  tibble::rownames_to_column(var = "Variable") |>
+  arrange(desc(MeanDecreaseGini))
+
+# Plot variable importance
+ggplot(var_imp_df, aes(x = reorder(Variable, MeanDecreaseGini), y = MeanDecreaseGini)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  theme_few() +
+  labs(title = "Variable Importance For Clusters",
+       x = "Predictor Variables",
+       y = "Importance") +
+  theme(legend.position = "none") ->p 
+p
+  ggsave(filename = "ClusterVarImportance.png", plot = p, path = here("Figs/"), device = "png", width = 25.4, height = 14.2875, units = "cm", dpi = "retina")
+
+```
+
+```{r}
+library(caret)
+set.seed(123)
+rf_dat <- rf_dat |> 
+  mutate(cluster = factor(cluster)) |> 
+  select(-avgDO.pctsat, -DOSat.exc, -DOpctsat.amp) |> 
+  arrange(Site, Date) |>
+  group_by(Site) |>
+  mutate(across(
+    where(is.numeric),
+    ~ na.approx(.x, x = Date, maxgap = 7, na.rm = FALSE),
+    .names = "{.col}"
+  )) |>
+  ungroup() |> 
+  filter(if_all(where(is.numeric), ~ !is.na(.x)))
+
+
+# 1. Subset predictors and remove character/factor columns
+predictors <- rf_dat |>
+  select(where(is.numeric))
+
+# 2. Remove highly correlated variables
+cor_matrix <- cor(predictors, use = "complete.obs")
+high_cor <- findCorrelation(cor_matrix, cutoff = 0.7)
+predictors_filtered <- predictors[, -high_cor]
+
+# 3. Recursive Feature Elimination (RFE)
+control <- rfeControl(functions = rfFuncs, method = "cv", number = 5)
+
+set.seed(123)
+rfe_result <- rfe(
+  x = predictors_filtered,
+  y = rf_dat$cluster,
+  sizes = c(5, 10, 15, 20, 23),
+  rfeControl = control
+)
+
+# Keep only selected predictors
+selected_vars <- predictors_filtered |>
+  select(all_of(predictors(rfe_result)))
+
+library(tidymodels)
+library(randomForest)
+
+# Combine predictors with response
+rf_ready <- rf_dat |>
+  select(Site, cluster) |>
+  bind_cols(selected_vars)
+
+# Create a model training function
+train_rf_site <- function(df) {
+  rf_model <- randomForest(
+    cluster ~ .,
+    data = df |> select(-Site),
+    importance = TRUE
+  )
+  rf_model
+}
+
+# Train models per Site
+rf_models <- rf_ready |>
+  group_split(Site) |>
+  setNames(unique(rf_ready$Site)) |>
+  lapply(train_rf_site)
+
+# 1. Extract importance as a tidy tibble
+library(tidytext)
+importance_long <- rf_models |>
+  lapply(function(model) {
+    importance(model, type = 1) |>
+      as.data.frame() |>
+      rownames_to_column("Variable")
+  }) |>
+  bind_rows(.id = "Site") |>
+  group_by(Site) |>
+  mutate(Variable = reorder_within(Variable, MeanDecreaseAccuracy, Site)) |>
+  ungroup()
+
+ggplot(importance_long, aes(x = Variable, y = MeanDecreaseAccuracy)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  facet_wrap(~ Site, scales = "free_y") +
+  scale_x_reordered() +
+  labs(
+    title = "Top Variable Importance by Site (Random Forest)",
+    x = "Variable (ordered within Site)",
+    y = "Mean Decrease in Accuracy"
+  ) +
+  theme_minimal()
+# data_split <- initial_split(rf_dat, prop = 0.8, strata = cluster)
+# train_data <- training(data_split)
+# test_data  <- testing(data_split)
+# 
+# rec <- recipe(cluster ~ ., data = train_data) |>
+#   step_rm(Date) |> 
+#   step_normalize(all_numeric_predictors()) |>
+#   step_dummy(Site, one_hot = TRUE) 
+# 
+# rf_spec <- rand_forest(
+#   mtry = tune(),
+#   trees = tune(),
+#   min_n = tune()
+# ) |>
+#   set_mode("classification") |>
+#   set_engine("ranger",
+#     importance = "permutation",
+#     num.threads = parallel::detectCores() - 1
+#   )
+# 
+# wf <- workflow() |>
+#   add_recipe(rec) |>
+#   add_model(rf_spec)
+# 
+# cv_folds <- vfold_cv(train_data, v = 5, strata = cluster)
+# 
+# rf_grid <- grid_random(
+#   mtry(range = c(2L, 33L)),           # All predictors
+#   min_n(range = c(2L, 10L)),
+#   size = 30
+# )
+# # rf_grid <- grid_regular(
+# #   mtry(range = c(2L, 20L)),
+# #   min_n(range = c(2L, 10L)),
+# #   levels = 5
+# # )
+# 
+# rf_grid <- grid_space_filling(
+#   mtry(range = c(3L, 20L)),
+#   min_n(range = c(2L, 15L)),
+#   size = 40,  # Try 40 combinations of parameters
+#   trees(range = c(300, 900))
+#   )
+# 
+# rf_tuned <- tune_grid(
+#   wf,
+#   resamples = cv_folds,
+#   grid = rf_grid,
+#   metrics = metric_set(accuracy, kap, roc_auc)
+# )
+# 
+# best_params <- select_best(rf_tuned, metric = "accuracy")
+# final_rf <- finalize_workflow(wf, best_params)
+# rf_fit <- fit(final_rf, data = train_data)
+# 
+# 
+# 
+# # Evaluate 
+# rf_preds <- predict(rf_fit, test_data) |> 
+#   bind_cols(predict(rf_fit, test_data, type = "prob")) |>
+#   bind_cols(test_data |> select(cluster))
+# 
+# # Precision by class
+# precision_multiclass <- rf_preds |>
+#   yardstick::precision(truth = cluster, estimate = .pred_class)
+# 
+# # Recall by class
+# recall_multiclass <- rf_preds |>
+#   yardstick::recall(truth = cluster, estimate = .pred_class)
+# 
+# # F1 by class
+# f1_multiclass <- rf_preds |>
+#   yardstick::f_meas(truth = cluster, estimate = .pred_class)
+# 
+# 
+# rf_preds |> conf_mat(truth = cluster, estimate = .pred_class)
+# rf_preds |> conf_mat(cluster, .pred_class) |> autoplot(type = "heatmap")
+# 
+# rf_fit |> 
+#   extract_fit_parsnip() |>
+#   vip::vip()
+# 
+# # ROC curves
+# rf_preds |> 
+#   roc_curve(truth = cluster, .pred_1, .pred_2, .pred_3) |> 
+#   autoplot()
+# 
+# # PR curves
+# rf_preds |> 
+#   pr_curve(truth = cluster, .pred_1, .pred_2, .pred_3) |> 
+#   autoplot()
+# rf_preds |> roc_auc(truth = cluster, 
+#                     .pred_1, .pred_2, .pred_3,
+#                     estimator = "macro_weighted")
+
+```
+
 # Piecewise SEM
 
 ```{r}
@@ -560,6 +823,7 @@ semDat |>
     strip.text = element_text(face = "bold")
   ) +
   facet_wrap(~waterYear, ncol = 1)
+
 ```
 
 ```{r}
@@ -570,12 +834,12 @@ semDat <- allDat |>
   filter(Site %in% c("KNZ", "SHN", "YMR")) |>
   drop_na(DOSat.exc, avgDO.pctsat)
 
-semStd <- semDat |>
+std_dat <- semDat |>
   datawizard::standardize(select = -c(DOpctsat.amp, DOSat.exc))
 
 semDat |>
   select(all_of(sem_vars)) |>
-  mutate(log_upstream_length = log1p(upstream_length)) |> 
+  #mutate(log_upstream_length = log1p(upstream_length)) |> 
   pivot_longer(cols = everything(), names_to = "variable", values_to = "value") |>
   ggplot(aes(x = value)) +
   geom_histogram(bins = 30, fill = "steelblue", color = "white") +
@@ -584,7 +848,7 @@ semDat |>
   labs(title = "Distributions of SEM Variables", x = NULL, y = "Count")
 
 
-semStd |>
+std_dat |>
   select(all_of(sem_vars)) |>
   pivot_longer(cols = everything(), names_to = "variable", values_to = "value") |>
   ggplot(aes(x = value)) +
@@ -598,7 +862,7 @@ semDat |>
   geom_histogram(bins = 30, fill = "steelblue", color = "white") +
   theme_modern() +
   labs(title = "Distributions of Upstream Length", x = NULL, y = "Count")
-semStd |>
+std_dat |>
   ggplot(aes(x = upstream_length)) +
   geom_histogram(bins = 30, fill = "steelblue", color = "white") +
   theme_modern() +
@@ -608,10 +872,10 @@ semStd |>
 # glmmTMB
 
 ```{r}
-library(glmmTMB)
-semStd <- semStd |>
-  drop_na()
 
+semStd <- std_dat |>
+  drop_na() 
+#### if doing just lm, how does var importance change by site
 # Biology
 ET_mm_day <- glmmTMB(
   ET_mm_day ~ PPT_14d + avgPar + (1| Site) + (1 | Date),
@@ -705,11 +969,11 @@ plots
 #single_sem <- model_list |> lapply(function(m) summary(psem(m)))
 
 #Generate and store the check_model plots in a list
-plot_list <- model_list |> lapply(check_model)
-#plot_list |> lapply(print)
-pdf(here("Figs/sem_model_diagnostics.pdf"), width = 11, height = 8.5)
-invisible(plot_list |> lapply(print))
-dev.off()
+# plot_list <- model_list |> lapply(check_model)
+# #plot_list |> lapply(print)
+# pdf(here("Figs/sem_model_diagnostics.pdf"), width = 11, height = 8.5)
+# invisible(plot_list |> lapply(print))
+# dev.off()
 
 ```
 
@@ -740,6 +1004,620 @@ plot_sem_graph(pruned_summary, file = here("Figs/SEM/pruned_fit_sem.png"))
 plot_psem_chord(pruned_mod, var_domains, domain_colors, var_labels, file = here("Figs/SEM/pruned_fit_sem_chord.png"))
 
 
+```
+
+## SEM by site
+
+```{r}
+library(nlme)
+std_dat <- allDat |>
+  filter(Site %in% c("KNZ", "SHN", "YMR")) |>
+  arrange(Site, Date) |> 
+  rename_with(~ str_remove(.x, "_1d")) |> 
+  rename(PPT_tot = PPT) |> 
+  dplyr::select(Site, Date, avgDO.pctsat, all_of(vars), PPT_14d, ET_mm_day) |> 
+  drop_na(DOSat.exc, avgDO.pctsat) |> 
+  group_by(Site) |> 
+  datawizard::standardize(select = -c(DOpctsat.amp, DOSat.exc, avgDO.pctsat)) |> 
+  ungroup() |> 
+  drop_na()
+
+
+# Biology
+##### Check vars for eachs site, make sure one is not all NA or something 
+
+cor_struct <- corCAR1(form = ~ Date | Site)
+ET_mm_day <- gls(ET_mm_day ~ PPT_14d + avgPar, data = std_dat, correlation = cor_struct)
+water.temp <- gls(water.temp ~ avgPar + PPT_14d + ET_mm_day, data = std_dat, correlation = cor_struct)
+upstream_length <- gls(upstream_length ~ water.temp + avgPar + PPT_14d + ET_mm_day, data = std_dat, correlation = cor_struct)
+PercWet <- gls(PercWet ~ water.temp + avgPar + PPT_14d + ET_mm_day, data = std_dat, correlation = cor_struct)
+excProb <- gls(excProb ~ avgPar + water.temp + PPT_14d + upstream_length + PercWet + ET_mm_day, data = std_dat, correlation = cor_struct)
+headGradient <- gls(headGradient ~ avgPar + water.temp + excProb + PPT_14d + PercWet + ET_mm_day, data = std_dat, correlation = cor_struct)
+avgDO.pctsat <- gls(avgDO.pctsat ~ water.temp + avgPar + excProb + headGradient + upstream_length + PercWet + PPT_14d + ET_mm_day, data = std_dat, correlation = cor_struct, control =  glsControl(opt = "optim") )
+DOpctsat.amp <- gls(DOpctsat.amp ~ water.temp + avgPar + excProb + headGradient + upstream_length + PercWet + PPT_14d + ET_mm_day, data = std_dat, correlation = cor_struct)
+
+model_list <- list(
+  ET_mm_day = ET_mm_day,
+  water.temp = water.temp,
+  upstream_length = upstream_length,
+  PercWet = PercWet,
+  excProb = excProb,
+  headGradient = headGradient,
+  avgDO.pctsat = avgDO.pctsat,
+  DOpctsat.amp = DOpctsat.amp
+)
+
+
+
+
+
+is_singular <- model_list |> lapply(check_singularity) |> bind_rows()
+
+plots <- Map(function(name, model) {
+  model_parameters(model) |>
+    plot() +
+    ggtitle(name)
+}, names(model_list), model_list)
+
+# Display all plots
+plots
+plot_list <- model_list |> lapply(check_model)
+#plot_list |> lapply(print)
+pdf(here("Figs/model_diagnostics.pdf"), width = 11, height = 8.5)
+invisible(plot_list |> lapply(print))
+dev.off()
+
+
+```
+
+```{r}
+# Check ACF of residuals for each model
+library(forecast)
+library(TSA)
+
+# For all models at once
+acf_plots <- Map(function(name, model) {
+  par(mfrow = c(1, 1))
+  acf(residuals(model, type = "normalized"), main = paste("ACF -", name))
+  #pacf(residuals(model, type = "normalized"), main = paste("PACF -", name))
+}, names(model_list), model_list)
+
+# Test different correlation structures for the models
+test_correlation_structures <- function(formula_obj, data, model_name) {
+  cli::cli_h1("Testing correlation structures for {.strong {model_name}}")
+  
+  # Extract formula from existing model
+  formula_str <- paste(deparse(formula_obj$call$model), collapse = " ")
+  formula_parsed <- as.formula(formula_str)
+  
+  models <- list()
+  
+  cli::cli_alert_info("Fitting CAR(1) model...")
+  models$CAR1 <- tryCatch({
+    model <- gls(formula_parsed, data = data, correlation = corCAR1(form = ~ Date | Site))
+    cli::cli_alert_success("CAR(1) fit successfully.")
+    model
+  }, error = function(e1) {
+    cli::cli_alert_warning("CAR(1) fit failed: {e1$message}")
+    cli::cli_alert_info("Retrying CAR(1) with {.code opt = 'optim'}...")
+    
+    tryCatch({
+      model <- gls(formula_parsed, data = data,
+                   correlation = corCAR1(form = ~ Date | Site),
+                   control = glsControl(opt = "optim"))
+      cli::cli_alert_success("CAR(1) fit successfully with {.code opt = 'optim'}.")
+      model
+    }, error = function(e2) {
+      cli::cli_alert_danger("CAR(1) retry failed: {e2$message}")
+      NULL
+    })
+  })
+  
+  # Try ARMA structures
+  arma_structures <- list(
+    ARMA11 = list(p = 1, q = 1),
+    ARMA21 = list(p = 2, q = 1),
+    AR2    = list(p = 2, q = 0),
+    AR3    = list(p = 3, q = 0),
+    AR22   = list(p = 2, q = 2),
+    AR31   = list(p = 3, q = 1),
+    AR4    = list(p = 4, q = 0)
+  )
+  
+  for (name in names(arma_structures)) {
+    p <- arma_structures[[name]]$p
+    q <- arma_structures[[name]]$q
+    cli::cli_alert_info("Fitting {name} (p = {p}, q = {q})...")
+    try({
+      models[[name]] <- gls(formula_parsed, data = data,
+                            correlation = corARMA(form = ~ Date | Site, p = p, q = q))
+      cli::cli_alert_success("{name} fit successfully.")
+    }, silent = TRUE)
+  }
+  
+  # Compare AIC values
+  cli::cli_h2("Model comparison by AIC")
+  aic_values <- sapply(models, function(m) if (!is.null(m)) AIC(m) else NA)
+  aic_values <- aic_values[!is.na(aic_values)]
+  print(sort(aic_values))
+  
+  # Test autocorrelation in best model
+  best_model_name <- names(which.min(aic_values))
+  best_model <- models[[best_model_name]]
+  resids <- residuals(best_model, type = "normalized")
+  lb_test <- Box.test(resids, lag = 10, type = "Ljung-Box")
+  
+  cli::cli_alert_success("Best model: {.strong {best_model_name}} (AIC = {round(min(aic_values), 2)})")
+  cli::cli_alert_info("Ljung-Box p-value: {round(lb_test$p.value, 4)}")
+  if (lb_test$p.value < 0.05) {
+  cli::cli_alert_warning("Ljung-Box test suggests residual autocorrelation (p = {round(lb_test$p.value, 4)})")
+  }
+  
+  return(list(
+    models = models,
+    best_model = best_model_name,
+    best_aic = min(aic_values),
+    ljung_box_p = lb_test$p.value
+  ))
+}
+
+mod_names <- c("ET_mm_day", "water.temp", "upstream_length", "PercWet", "excProb", "headGradient", "avgDO.pctsat", "DOpctsat.amp")
+
+correlation_tests <- list()
+for(model_name in mod_names) {
+  correlation_tests[[model_name]] <- test_correlation_structures(
+    model_list[[model_name]], std_dat, model_name
+  )
+}
+summary_df <- lapply(names(correlation_tests), function(name) {
+  res <- correlation_tests[[name]]
+  data.frame(
+    model = name,
+    best_structure = res$best_model,
+    AIC = res$best_aic,
+    LjungBox_p = res$ljung_box_p
+  )
+}) |> do.call(rbind, args = _)
+summary_df$sig_cor <- summary_df$LjungBox_p < 0.05
+
+
+# Excellent fits
+ET_mm_day <- gls(ET_mm_day ~ PPT_14d + avgPar,
+  data = std_dat,
+  correlation = corARMA(form = ~Date|Site, p = 2, q = 1)
+)
+# Marginal but usable
+water.temp <- gls(water.temp ~ avgPar + PPT_14d + ET_mm_day,
+  data = std_dat,
+  correlation = corARMA(form = ~Date|Site, p = 2, q = 2)
+)
+
+upstream_length <- gls(upstream_length ~ water.temp + avgPar + PPT_14d + ET_mm_day,
+  data = std_dat,
+  correlation = corARMA(form = ~Date|Site, p = 3, q = 0)
+)
+
+PercWet <- gls(PercWet ~ water.temp + avgPar + PPT_14d + ET_mm_day,
+  data = std_dat,
+  correlation = corARMA(form = ~Date|Site, p = 4, q = 0)
+)
+#Sus
+excProb <- gls(excProb ~ avgPar + water.temp + PPT_14d + upstream_length + PercWet + ET_mm_day,
+  data = std_dat, correlation = corARMA(form = ~Date|Site, p = 4, q = 0)
+)
+#Sus
+headGradient <- gls(
+  headGradient ~ avgPar + water.temp + excProb + PPT_14d + PercWet + ET_mm_day,
+  data = std_dat,
+  correlation = corARMA(form = ~Date|Site, p = 3, q = 1)
+)
+avgDO.pctsat <- gls(
+  avgDO.pctsat ~ water.temp + avgPar + excProb + headGradient +
+    upstream_length + PercWet + PPT_14d + ET_mm_day,
+  data = std_dat,
+  correlation = corARMA(form = ~Date|Site, p = 4, q = 0)
+)
+
+DOpctsat.amp <- gls(
+  DOpctsat.amp ~ water.temp + avgPar + excProb + headGradient +
+    upstream_length + PercWet + PPT_14d + ET_mm_day,
+  data = std_dat,
+  correlation = corARMA(form = ~Date|Site, p = 1, q = 1)
+)
+
+final_models <- list( 
+  ET_mm_day = ET_mm_day,
+  water.temp = water.temp,
+  upstream_length = upstream_length,
+  PercWet = PercWet,
+  excProb = excProb,
+  headGradient = headGradient,
+  avgDO.pctsat = avgDO.pctsat,
+  DOpctsat.amp = DOpctsat.amp
+  )
+
+
+plots <- Map(function(name, model) {
+  model_parameters(model) |>
+    plot() +
+    ggtitle(name)
+}, names(final_models), final_models)
+
+# Display all plots
+plots
+plot_list <- final_models |> lapply(check_model)
+#plot_list |> lapply(print)
+pdf(here("Figs/all_model_diagnostics_cor.pdf"), width = 11, height = 8.5)
+invisible(plot_list |> lapply(print))
+dev.off()
+
+# For all models at once
+acf_plots <- Map(function(name, model) {
+  par(mfrow = c(1, 2))
+  acf(residuals(model, type = "normalized"), main = paste("ACF -", name))
+  pacf(residuals(model, type = "normalized"), main = paste("PACF -", name))
+}, names(final_models), final_models)
+
+
+sem <- psem(
+  ET_mm_day,
+  water.temp,
+  upstream_length,
+  PercWet,
+  excProb,
+  headGradient,
+  avgDO.pctsat,
+  DOpctsat.amp,
+  data = std_dat)
+
+semGroup <- multigroup(
+  sem,
+  group = "Site"
+)
+
+sem_summary <- summary(sem, standardize = "none")
+plot_sem_graph(sem_summary, file = here("Figs/SEM/lme_all_fit_sem.png"))
+plot_psem_chord(sem, var_domains, domain_colors, var_labels, file = here("Figs/SEM/lme_all_fit_sem_chord.png"))
+```
+
+```{r}
+library(rEDM)
+
+run_ccm_full <- function(data,
+                         outcomes = c("DOpctsat.amp", "avgDO.pctsat"),
+                         exclude_cols = c("Site", "Date", "DOY", "waterYear"),
+                         lags = c(0, 1, 2, -1, -2),
+                         lib_sizes = c(20, 100, 10),
+                         n_samples = 100,
+                         verbose = TRUE) {
+  
+  library(dplyr)
+  library(rEDM)
+  
+  all_sites <- unique(data$Site)
+  results <- list()
+  
+  for (site in all_sites) {
+    site_data <- data |>
+      filter(Site == site) |>
+      arrange(Date)
+    
+    predictors <- setdiff(names(site_data), c(outcomes, exclude_cols))
+    
+    for (response in outcomes) {
+      y <- site_data[[response]]
+      y_sd <- suppressWarnings(sd(y, na.rm = TRUE))
+      if (is.null(y) || all(is.na(y)) || sum(!is.na(y)) < 10 || is.na(y_sd) || y_sd == 0) next
+
+      
+      # Build a small two-column data frame: time + response
+      embed_data <- site_data |>
+        select(Date, all_of(response)) |>
+        na.omit()
+      
+      # Use EmbedDimension to get the best E
+      simplex_out <- tryCatch({
+        EmbedDimension(
+          dataFrame = embed_data,
+          columns = response,
+          target = response,
+          lib = paste(1, nrow(embed_data)),
+          pred = paste(1, nrow(embed_data)),
+          maxE = 10,
+          verbose = verbose
+        )
+      }, error = function(e) NULL)
+      
+      if (!is.null(simplex_out)) {
+        best_E <- simplex_out[which.max(simplex_out$rho), "E"]
+      }
+      
+      for (predictor in predictors) {
+        x <- site_data[[predictor]]
+        x_sd <- suppressWarnings(sd(x, na.rm = TRUE))
+        if (is.null(x) || all(is.na(x)) || sum(!is.na(x)) < 10 || is.na(x_sd) || x_sd == 0) next
+
+        
+        ccm_input <- site_data |>
+          select(Date, all_of(c(predictor, response))) |>
+          na.omit() 
+        
+        if (nrow(ccm_input) < best_E + max(lib_sizes)) next
+        
+        for (tp_val in lags) {
+          try_result <- tryCatch({
+            ccm_out <- CCM(
+              dataFrame = ccm_input,
+              E = best_E,
+              Tp = tp_val,
+              columns = predictor,
+              target = response,
+              libSizes = paste(lib_sizes, collapse = " "),
+              sample = n_samples,
+              random = TRUE,
+              seed = 0,
+              includeData = TRUE,
+              verbose = verbose
+            )
+            
+            rho_df <- ccm_out$Combo_rho |>
+              rename(lib_size = LibSize,
+                     rho_pred_from_target = rho_1,
+                     rho_pred_from_predictor = rho_2) |>
+              mutate(Site = site,
+                     Outcome = response,
+                     Predictor = predictor,
+                     TP = tp_val,
+                     E = best_E)
+            
+            return(rho_df)
+          }, error = function(e) NULL)
+          
+          if (!is.null(try_result)) {
+            results[[length(results) + 1]] <- try_result
+            if (verbose) cat("✓", site, response, predictor, "TP =", tp_val, "\n")
+          }
+        }
+      }
+    }
+  }
+  
+  if (length(results) == 0) return(tibble())
+  bind_rows(results)
+}
+
+
+ccm_results <- run_ccm_full(std_dat, lags = c(0, 1, 2, -1, -2), verbose = TRUE)
+ccm_results |>
+  filter(lib_size == max(lib_size)) |>
+  arrange(desc(rho_mean)) |>
+  print(n = 20)
+
+
+
+ccm_summary_df |>
+  filter(Predictor %in% c("avgPar", "PPT_tot")) |>
+  ggplot(aes(x = lib_size, y = rho_mean, color = Predictor)) +
+  geom_line() +
+  facet_grid(Site ~ Outcome) +
+  labs(title = "CCM: Cross Map Skill vs Library Size")
+```
+
+```{r}
+knz_dat <- allDat |>
+  filter(Site %in% c("KNZ")) |>
+  arrange(Date) |> 
+  rename_with(~ str_remove(.x, "_1d")) |> 
+  rename(PPT_tot = PPT) |> 
+  dplyr::select(Site, Date, avgDO.pctsat, all_of(vars), PPT_14d, ET_mm_day) |> 
+  drop_na(DOSat.exc, avgDO.pctsat) |> 
+  datawizard::standardize(select = -c(DOpctsat.amp, DOSat.exc)) |> 
+  drop_na()
+# Excellent fits
+ET_mm_day <- gls(ET_mm_day ~ PPT_14d + avgPar,
+  data = knz_dat,
+  correlation = corARMA(form = ~Date, p = 2, q = 1)
+)
+# Marginal but usable
+water.temp <- gls(water.temp ~ avgPar + PPT_14d + ET_mm_day,
+  data = knz_dat,
+  correlation = corARMA(form = ~Date, p = 2, q = 2)
+)
+
+upstream_length <- gls(upstream_length ~ water.temp + avgPar + PPT_14d + ET_mm_day,
+  data = knz_dat,
+  correlation = corARMA(form = ~Date, p = 2, q = 1)
+)
+
+PercWet <- gls(PercWet ~ water.temp + avgPar + PPT_14d + ET_mm_day,
+  data = knz_dat,
+  correlation = corARMA(form = ~Date, p = 2, q = 0)
+)
+#Sus
+excProb <- gls(excProb ~ avgPar + water.temp + PPT_14d + upstream_length + PercWet + ET_mm_day,
+  data = knz_dat, correlation = corARMA(form = ~Date, p = 3, q = 2)
+)
+#Sus
+headGradient <- gls(
+  headGradient ~ avgPar + water.temp + excProb + PPT_14d + PercWet + ET_mm_day,
+  data = knz_dat,
+  correlation = corARMA(form = ~Date, p = 4, q = 1)
+)
+avgDO.pctsat <- gls(
+  avgDO.pctsat ~ water.temp + avgPar + excProb + headGradient +
+    upstream_length + PercWet + PPT_14d + ET_mm_day,
+  data = knz_dat,
+  correlation = corARMA(form = ~Date, p = 3, q = 0)
+)
+
+DOpctsat.amp <- gls(
+  DOpctsat.amp ~ water.temp + avgPar + excProb + headGradient +
+    upstream_length + PercWet + PPT_14d + ET_mm_day,
+  data = knz_dat,
+  correlation = corARMA(form = ~Date, p = 3, q = 0)
+)
+
+final_models <- list( 
+  ET_mm_day = ET_mm_day,
+  water.temp = water.temp,
+  upstream_length = upstream_length,
+  PercWet = PercWet,
+  excProb = excProb,
+  headGradient = headGradient,
+  avgDO.pctsat = avgDO.pctsat,
+  DOpctsat.amp = DOpctsat.amp
+  )
+
+
+plots <- Map(function(name, model) {
+  model_parameters(model) |>
+    plot() +
+    ggtitle(name)
+}, names(final_models), final_models)
+
+# Display all plots
+plots
+plot_list <- final_models |> lapply(check_model)
+#plot_list |> lapply(print)
+pdf(here("Figs/knz_model_diagnostics_cor.pdf"), width = 11, height = 8.5)
+invisible(plot_list |> lapply(print))
+dev.off()
+
+# For all models at once
+acf_plots <- Map(function(name, model) {
+  par(mfrow = c(1, 2))
+  acf(residuals(model, type = "normalized"), main = paste("ACF -", name))
+  pacf(residuals(model, type = "normalized"), main = paste("PACF -", name))
+}, names(final_models), final_models)
+
+
+
+knz_sem <- psem(
+  ET_mm_day,
+  water.temp,
+  upstream_length,
+  PercWet,
+  excProb,
+  headGradient,
+  avgDO.pctsat,
+  DOpctsat.amp,
+  PercWet %~~% upstream_length,
+  data = knz_dat
+)
+
+knz_sem_summary <- summary(knz_sem, standardize = "none")
+knz_sem_summary
+plot_sem_graph(knz_sem_summary, file = here("Figs/SEM/knz_all_fit_sem.png"))
+plot_psem_chord(knz_sem, var_domains, domain_colors, var_labels, file = here("Figs/SEM/knz_all_fit_sem_chord.png"))
+```
+
+```{r}
+
+shn_dat <- allDat |>
+  filter(Site %in% c("SHN")) |>
+  arrange(Date) |> 
+  rename_with(~ str_remove(.x, "_1d")) |> 
+  rename(PPT_tot = PPT) |> 
+  dplyr::select(Site, Date, avgDO.pctsat, all_of(vars), PPT_14d, ET_mm_day) |> 
+  drop_na(DOSat.exc, avgDO.pctsat) |> 
+  datawizard::standardize(select = -c(DOpctsat.amp, DOSat.exc)) |> 
+  drop_na()
+# Excellent fits
+ET_mm_day <- gls(ET_mm_day ~ PPT_14d + avgPar,
+  data = shn_dat,
+  correlation = corARMA(form = ~Date, p = 2, q = 1)
+)
+# Marginal but usable
+water.temp <- gls(water.temp ~ avgPar + PPT_14d + ET_mm_day,
+  data = shn_dat,
+  correlation = corARMA(form = ~Date, p = 2, q = 2)
+)
+
+upstream_length <- gls(upstream_length ~ water.temp + avgPar + PPT_14d + ET_mm_day,
+  data = shn_dat,
+  correlation = corARMA(form = ~Date, p = 2, q = 1)
+)
+
+PercWet <- gls(PercWet ~ water.temp + avgPar + PPT_14d + ET_mm_day,
+  data = shn_dat,
+  correlation = corARMA(form = ~Date, p = 2, q = 0)
+)
+#Sus
+excProb <- gls(excProb ~ avgPar + water.temp + PPT_14d + upstream_length + PercWet + ET_mm_day,
+  data = shn_dat, correlation = corARMA(form = ~Date, p = 3, q = 2)
+)
+#Sus
+headGradient <- gls(
+  headGradient ~ avgPar + water.temp + excProb + PPT_14d + PercWet + ET_mm_day,
+  data = shn_dat,
+  correlation = corARMA(form = ~Date, p = 4, q = 1)
+)
+avgDO.pctsat <- gls(
+  avgDO.pctsat ~ water.temp + avgPar + excProb + headGradient +
+    upstream_length + PercWet + PPT_14d + ET_mm_day,
+  data = shn_dat,
+  correlation = corARMA(form = ~Date, p = 3, q = 0)
+)
+
+DOpctsat.amp <- gls(
+  DOpctsat.amp ~ water.temp + avgPar + excProb + headGradient +
+    upstream_length + PercWet + PPT_14d + ET_mm_day,
+  data = shn_dat,
+  correlation = corARMA(form = ~Date, p = 3, q = 0)
+)
+
+final_models <- list( 
+  ET_mm_day = ET_mm_day,
+  water.temp = water.temp,
+  upstream_length = upstream_length,
+  PercWet = PercWet,
+  excProb = excProb,
+  headGradient = headGradient,
+  avgDO.pctsat = avgDO.pctsat,
+  DOpctsat.amp = DOpctsat.amp
+  )
+
+
+plots <- Map(function(name, model) {
+  model_parameters(model) |>
+    plot() +
+    ggtitle(name)
+}, names(final_models), final_models)
+
+# Display all plots
+plots
+plot_list <- final_models |> lapply(check_model)
+#plot_list |> lapply(print)
+pdf(here("Figs/shn_model_diagnostics_cor.pdf"), width = 11, height = 8.5)
+invisible(plot_list |> lapply(print))
+dev.off()
+
+# For all models at once
+acf_plots <- Map(function(name, model) {
+  par(mfrow = c(1, 2))
+  acf(residuals(model, type = "normalized"), main = paste("ACF -", name))
+  pacf(residuals(model, type = "normalized"), main = paste("PACF -", name))
+}, names(final_models), final_models)
+
+
+
+shn_sem <- psem(
+  ET_mm_day,
+  water.temp,
+  upstream_length,
+  PercWet,
+  excProb,
+  headGradient,
+  avgDO.pctsat,
+  DOpctsat.amp,
+  PercWet %~~% upstream_length,
+  data = shn_dat
+)
+
+shn_sem_summary <- summary(shn_sem, standardize = "none")
+shn_sem_summary
+plot_sem_graph(shn_sem_summary, file = here("Figs/SEM/shn_all_fit_sem.png"))
+plot_psem_chord(shn_sem, var_domains, domain_colors, var_labels, file = here("Figs/SEM/shn_all_fit_sem_chord.png"))
 ```
 
 ## W/ Depth

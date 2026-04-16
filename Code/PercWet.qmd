@@ -25,12 +25,23 @@ source(here("Code/paths+packages.R"))
 library(mapview)
 library(cli)
 library(whitebox)
-wbt_init(exe_path = "~/WBT/whitebox_tools")
+
 # EPSG for NAD83 / UTM zone 14N
 UTM_14N <- 26914
 source(here("Code/AIMS_DAGs.R"))
 source(here("Code/Functions/aims.R"))
 source(here("Code/Functions/stic_StreamDAG.R"))
+
+theme_set(
+  theme_few() +
+  theme(text = element_text(size = 20),          # overall text size
+    legend.text = element_text(size = 20),   # legend entries
+    legend.title = element_text(size = 20),  # legend title
+    axis.title = element_text(size = 20),    # axis titles
+    axis.text = element_text(size = 20),     # axis tick labels
+    plot.title = element_text(size = 20, hjust = 0.5),
+    legend.position = "bottom")
+)
 ```
 
 # Streams and Sites
@@ -42,7 +53,9 @@ source(here("Code/Functions/stic_StreamDAG.R"))
 gpStreams <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Streams", quiet = T) |> 
   filter(watershed %in% c("KNZ", "SHN", "YMR")) |> 
   st_transform(crs = 4326)
-
+gpSheds <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Watersheds", quiet = T) |> 
+  filter(watershed %in% c("KNZ", "SHN", "YMR")) |> 
+  st_transform(crs = 4326)
 # Load sites
 gpSites <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Sites") |> 
   filter(watershed %in% c("KNZ", "SHN", "YMR")) |> 
@@ -52,7 +65,7 @@ gpSites <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "
     lat  = st_coordinates(geom)[, "Y"]
   ) 
 
-seSites <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_SouthEast.gpkg", layer = "sites") |> 
+seSites <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_SouthEast.gpkg", layer = "Sites") |> 
   filter(!sublocation == "HW") |> 
   st_transform(4326) |>
   mutate(
@@ -60,42 +73,30 @@ seSites <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_SouthEast.gpkg", layer = "si
     lat = st_coordinates(geom)[, 2]
   ) 
 
-seStreams <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_SouthEast.gpkg", layer = "streams") |> 
+seStreams <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_SouthEast.gpkg", layer = "Streams") |> 
+  st_transform(4326)
+seSheds <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_SouthEast.gpkg", layer = "Watersheds") |> 
   st_transform(4326)
 
-
-mwSites <- st_read("~/Dropbox/AIMS/GIS/Results/GBJ.gpkg", layer = "Sites") |> 
+mwSites <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_MountainWest.gpkg", layer = "Sites") |> 
+  st_transform(4326) |> 
+  mutate(
+    lon = st_coordinates(geom)[, 1],
+    lat = st_coordinates(geom)[, 2]
+  ) 
+mwStreams <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_MountainWest.gpkg", layer = "Streams") |> 
   st_transform(4326)
-mwStreams <- st_read("~/Dropbox/AIMS/GIS/Results/GBJ.gpkg", layer = "Streams") |> 
+mwSheds <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_MountainWest.gpkg", layer = "Watersheds") |> 
   st_transform(4326)
 
-mapview(mwSites, map.types = "Esri.WorldImagery") +
-  mapview(mwStreams) +
-  mapview(mwSites,color = "green")
-
-data("AIMS.node.coords")
-
-mwSDsites <- AIMS.node.coords |> 
-  mutate(watershed = case_when(
-    startsWith(site, "D") ~ "DRC",
-    startsWith(site, "G") ~ "GBJ",
-    startsWith(site, "J") ~ "JDR",
-    TRUE ~ NA_character_  
-  )) |> 
-  drop_na(watershed) |> 
-  select(siteId = Object.ID, piezo, lat, long, watershed) |> 
-   st_as_sf(coords = c("long", "lat"), crs = 4326)
+allSheds <- bind_rows(gpSheds, mwSheds, seSheds)
 ```
 
 ```{r}
-# First identify common columns we want to keep
-common_cols <- intersect(
-  names(gpSites), 
-  c("siteId", "slope", "twi", "drainage_area_sqkm", "outlet_dist_m", 
-    "elev_m", "watershed", "geom", "lon", "lat")
-)
+#### Get common cols ####
+common_cols <- c("siteId", "slope", "twi", "drainage_area_sqkm", "outlet_dist_m", "elev_m", "watershed", "lon", "lat")
 
-# Process seSites to match gpSites structure
+# SE
 seSites <- seSites |>
   mutate(
     elev_m = elevation,
@@ -105,13 +106,16 @@ seSites <- seSites |>
   ) |>
   # Select only the columns we want to keep
   select(all_of(common_cols))
+  
 
-# Process gpSites to match same column selection
-gpSites <- gpSites |>
-  select(all_of(common_cols))
+# Merge GP and MW, all have same cols, then drop and merge with SE
+allSites <- gpSites |>
+  st_drop_geometry() |> 
+  full_join(mwSites |> st_drop_geometry()) |> 
+  select(all_of(common_cols)) |> 
+  full_join(seSites |> st_drop_geometry()) |> 
+  st_as_sf(coords = c("lon", "lat"), crs = 4326)
 
-# Combine the two data frames
-allSites <- bind_rows(gpSites, seSites)
 
 # Combine streams
 allStreams <- list(
@@ -120,23 +124,14 @@ allStreams <- list(
   mwStreams |> select(watershed)) |> 
   bind_rows()
 
-# Add missing columns to mwSites, filled with NA
-mwSites <- mwSites |>
-  mutate(
-    slope = NA_real_,
-    twi = NA_real_,
-    drainage_area_sqkm = NA_real_,
-    outlet_dist_m = NA_real_,
-    elev_m = NA_real_,
-    watershed = as.character(watershed),  # ensure type match
-    lon = st_coordinates(geom)[, 1],
-    lat = st_coordinates(geom)[, 2]
-  ) |>
-  select(all_of(common_cols))  # enforce column order
-
-# Bind all sites together
-allSites <- bind_rows(allSites, mwSites)
-
+allStreams |> 
+  st_transform(5070) |> #NAD83 / Conus Albers
+  mutate(length_m = st_length(geom)) |>
+  group_by(watershed) |>
+  summarize(total_length_m = sum(length_m)) |>
+  mutate(total_length_km = as.numeric(total_length_m) / 1000) |>
+  st_drop_geometry() #|> 
+  #write_csv("~/Desktop/AIMS_StreamLengths.csv")
 ```
 
 # STICs
@@ -156,35 +151,29 @@ suppressWarnings(rm(gpSites, gpStreams, common_cols, seSites, seStreams, gpPresA
 ## MW STICs
 
 ```{r}
-mwStics <- read_csv(here("Data/MW/STICs/allmergedgjformatted_2022_2023_2024_version0.csv")) |> 
-  select(SiteID:qual_rating) |> 
+
+mwStics <- list.files(here("Data/MW/STICs"), full.names = TRUE, recursive = TRUE) |>
+  # Only keep files in folders that end with _combined
+  lapply(\(file) {
+    read_csv(file, col_types = cols(.default = col_character()))
+  }) |> 
+  bind_rows() |>
   rename(dateTime = datetime) |>
   filter(qual_rating != "poor") |>
+  select(dateTime, siteId = SiteID, wetdry) |>
   mutate(
     wetdry = case_when(
     wetdry %in% c("dry", "0") ~ 0,
     wetdry %in% c("wet", "1") ~ 1,
-    TRUE ~ NA_real_)) |> 
-  select(dateTime, siteId = SiteID, wetdry) |> 
-  mutate(watershed = case_when(
+    TRUE ~ NA_real_),
+    watershed = case_when(
     startsWith(siteId, "D") ~ "DRC",
     startsWith(siteId, "G") ~ "GBJ",
     startsWith(siteId, "J") ~ "JDR",
     TRUE ~ NA_character_  
-  ))
-
-gbjSites <- read_csv(here("Data/MW/STICs/allmergedgjformatted_2022_2023_2024_version0.csv")) |> 
-  select(siteId = SiteID, lat, long) |> 
-  distinct(siteId, lat, long) |> 
-  group_by(siteId) |>
-  summarise(
-    lat = mean(lat, na.rm = TRUE),
-    long = mean(long, na.rm = TRUE),
-    .groups = "drop"
-  ) |> 
-  mutate(watershed = "GBJ") |> 
-  write_csv("~/Dropbox/AIMS/GIS/scratch/gbjsites.csv")
-
+  )) |> 
+  mutate(dateTime = parse_date_time(dateTime, orders = c("ymd HM", "ymd HMS"), tz = "UTC")) |> 
+  drop_na(dateTime)
 
 daily_presAbsMW <- mwStics |>
   mutate(
@@ -205,21 +194,77 @@ daily_presAbsMW <- mwStics |>
 daily_presAbsMW <- bind_rows(daily_presAbsMW, .id = "watershed") |> 
   drop_na(date) |> 
   mutate(GJ8 = coalesce(GJ8, GJ8b)) |> 
-  select(-GJ8b)
+  select(-GJ8b) |> 
+  write_csv(here("Data/STICs/MW_DailyPresAbs.csv"))
 
 
 presAbs <- presAbs |> 
   bind_rows(daily_presAbsMW) |> 
   arrange(watershed, date)
 
+avgPercWet <- presAbs |>
+  pivot_longer(
+    cols = -c(watershed, date),
+    names_to = "siteId",
+    values_to = "wet"
+  ) |>
+  group_by(watershed, siteId) |>
+  summarise(
+    avg_pct_wet = mean(wet == 1, na.rm = TRUE) * 100,
+    avg_pct_dry = mean(wet == 0, na.rm = TRUE) * 100,
+    total = avg_pct_wet + avg_pct_dry,
+    .groups = "drop"
+  )
+  
 allSites <- allSites |> 
-  filter(!(watershed %in% c("DRC", "JDR")))
+  left_join(avgPercWet |> select(watershed, siteId, avg_pct_wet), by = c("watershed", "siteId"))
 
-allStreams <- allStreams |> 
-  filter(!(watershed %in% c("DRC", "JDR")))
+n_stics <- allSites |>
+  st_drop_geometry() |> 
+  distinct(siteId, watershed) |> 
+  group_by(watershed) |>
+  summarise(n_sites = n()) |> 
+  write_csv(here("Data/n_stics.csv"))
+# allSites <- allSites |> 
+#   filter(!(watershed %in% c("DRC")))
+# 
+# allStreams <- allStreams |> 
+#   filter(!(watershed %in% c("DRC")))
+# 
+# presAbs <- presAbs |> 
+#   filter(!(watershed %in% c("DRC")))
+```
 
-presAbs <- presAbs |> 
-  filter(!(watershed %in% c("DRC", "JDR")))
+# Map
+
+```{r}
+aims_map <- mapview(allSheds,
+  layer.name = "Watersheds",
+  color = "#444444",
+  col.regions = "#91D1C280",
+  lwd = 2,
+  alpha.regions = 0.4,
+  legend = FALSE,
+  zcol = "watershed",
+  map.types = "Esri.WorldImagery",
+  popup = leafpop::popupTable(allSheds, zcol = c("watershed", "area_sqkm"), row.numbers = FALSE, feature.id = FALSE)
+) +
+  mapview(allStreams,
+    layer.name = "Streams",
+    legend = FALSE,
+    lwd = 3,
+    color = "#1F305E"
+  ) +
+  mapview(allSites,
+    layer.name = "Sites",
+    zcol = "siteId",
+    legend = FALSE,
+    col.regions = "#AB4433",
+    popup = leafpop::popupTable(allSites, zcol = c("siteId", "avg_pct_wet", "elev_m", "drainage_area_sqkm", "outlet_dist_m"), row.numbers = FALSE, feature.id = FALSE)
+  )
+
+aims_map
+mapshot(aims_map, url = "~/Dropbox/AIMS/GIS/aims_map.html", title = "AIMS Map")
 ```
 
 # Stream Distance
@@ -240,7 +285,7 @@ get_watershed_lengths <- function(watershed_name, sites, streams) {
     watershed_name %in% c("SHN", "KNZ", "YMR") ~ 26914, # NAD83/UTM zone 14N
     watershed_name %in% c("PRF", "TAL", "WHR") ~ 26916, # NAD83/UTM zone 16N
     watershed_name %in% c("GBJ") ~ 26912, # NAD83/UTM zone 12N
-    watershed_name %in% c("JDR", "DRC") ~ 26911, # NAD83/UTM zone 12N
+    watershed_name %in% c("JDR", "DRC") ~ 26911, # NAD83/UTM zone 11N
     TRUE ~ NA_integer_
   )
   
@@ -295,10 +340,17 @@ all_arc_lengths <- watersheds |>
   set_names() |>  # Name list by watershed
   map(\(w) get_watershed_lengths(w, allSites, allStreams)) |> 
   compact()  # Drop NULLs
+
+stream_lengths <- all_arc_lengths |>
+  lapply(\(df) df |>
+    separate(Arc, into = c("from", "to"), sep = "->", remove = TRUE)
+  )
+write_rds(stream_lengths, here("Data/all_stream_lengths.rds"))
 ```
 
 ```{r}
 #| include: false
+
 
 # Clean stic data
 nestPresAbs <- presAbs |> 
@@ -336,7 +388,7 @@ nestPresAbs_filled <- nestPresAbs |>
   )
 
 # Remove dropped STICs from network and reconnect
-aimsNets <- imap(aimsNets, \(net, wshed) {
+aimsNets <- imap(aimsNets_full, \(net, wshed) {
   # Start watershed processing
   cli_h1("Processing watershed: {.field {wshed}}")
   # Extract watershed data
@@ -377,45 +429,748 @@ aimsNets <- imap(aimsNets, \(net, wshed) {
   cli_alert_success("Successfully processed {.field {wshed}}")
   return(filtered_net)
 })
-```
 
-```{r}
-reconnect_and_remove_nodes_tidy <- function(graph, keep_nodes) {
-  g <- as.igraph(graph)
-
-  # Set node names to siteId before manipulating
-  site_ids <- graph |> activate("nodes") |> pull(siteId)
-  V(g)$name <- site_ids
-
-  remove_nodes <- setdiff(V(g)$name, keep_nodes)
-
-  for (v in remove_nodes) {
-    if (!v %in% V(g)$name) next
-
-    upstream <- igraph::neighbors(g, v, mode = "in")$name
-    downstream <- igraph::neighbors(g, v, mode = "out")$name
-
-    if (length(upstream) > 0 && length(downstream) > 0) {
-      new_edges <- expand.grid(from = upstream, to = downstream, stringsAsFactors = FALSE)
-      for (i in seq_len(nrow(new_edges))) {
-        from <- new_edges$from[i]
-        to <- new_edges$to[i]
-        if (from != to && !are_adjacent(g, from, to)) {
-          g <- add_edges(g, c(from, to))
-        }
-      }
-    }
-
-    g <- delete_vertices(g, v)
-  }
-  graph_out <- as_sfnetwork(g)
-  return(graph_out)
+scaled_arc_lengths <-list()
+for (site in unique(presAbs$watershed)) {
+  tempNet <- aimsNets[[site]]
+  edge_keys <- attributes(E(tempNet))$vname
+  arc_lengths <- all_arc_lengths[[site]]
+  
+  # Prepare lookup for edge weights
+      arc_lengths <- arc_lengths |>
+        mutate(Arc_key = gsub("->", "|", Arc)) 
+      
+  length_sub <- arc_lengths$Length[match(edge_keys, arc_lengths$Arc_key)]
+  
+  scaled_lengths <- scale(length_sub/1000, center = FALSE) #meters to km
+  
+  scaled_arc_lengths[[site]][["Arc"]] <- arc_lengths$Arc[match(edge_keys, arc_lengths$Arc_key)]
+  scaled_arc_lengths[[site]][["scaled_lengths"]] <- scaled_lengths
+  scaled_arc_lengths[[site]][["Length"]] <- length_sub
+  scaled_arc_lengths[[site]][["watershed"]] <- site
 }
+# Convert to a nested tibble by watershed
+scaled_arc_lengths <- scaled_arc_lengths |>
+  imap(\(x, watershed) {
+    tibble(
+      Arc = x$Arc,
+      Length = x$Length,
+      scaled_lengths = as.numeric(x$scaled_lengths)
+    ) |>
+      mutate(watershed = watershed)
+  }) |>
+  bind_rows() |>
+  group_by(watershed) |>
+  nest()
+
+all_stics <- map(aimsNets, ~ vertex_attr(.x, "name")) |> 
+  unlist() |> 
+  unique() |> 
+  (\(x) tibble(siteId = x))()
+all_stics |> write_csv(here("Data/STICs/stics_for_doRegimes.csv"))
 ```
 
-# TidyNetworks
+## Check for dupes
 
 ```{r}
+date_dups <- nestPresAbs_filled |>
+  mutate(
+    dup_dates = map(data, \(df) {
+      df |>
+        count(date) |>
+        filter(n > 1)
+    })
+  )
+
+# View duplicate date counts per watershed
+date_dups |>
+  select(watershed, dup_dates)
+
+date_dups |>
+  mutate(n_dups = map_int(dup_dates, nrow)) |>
+  select(watershed, n_dups)
+```
+
+# All StreamDAG Metrics
+
+Have to use "weight" not "weights", Maggi used weights in the KNZ code, Ken uses weight everywhere except in global metrics example
+
+```{r}
+sink_nodes <- list(
+  KNZ = "SFM01",
+  SHN = "SHM01",
+  YMR = "ENM01",
+  PRF = "PRM01",
+  TAL = "TLM01",
+  WHR = "WHM01",
+  GBJ = "GJ1",
+  JDR = "JD1",
+  DRC = "DC6"
+)
+
+# Set up parallel processing
+plan(multisession)
+
+# Compute metrics per watershed with upstream metrics
+streamDAG_Metrics <- nestPresAbs_filled |> 
+  mutate(
+    metrics = future_map2(watershed, data, \(wshed, df) {
+      # Get network and sink node for this watershed
+      net <- aimsNets[[wshed]]
+      sink <- sink_nodes[[wshed]]
+      arc_lengths <- scaled_arc_lengths |> filter(watershed == wshed) |> unnest(col = data) 
+      #arc_lengths <- all_arc_lengths[[wshed]]
+      
+      # Get all node names from the network
+      all_nodes <- V(net)$name
+      total_nodes <- length(all_nodes)
+      
+      # Prepare lookup for edge weights
+      arc_lengths <- arc_lengths |>
+        mutate(Arc_key = gsub("->", "|", Arc))
+      
+      # Compute metrics for each day
+      metric_df <- future_map(1:nrow(df), \(i) {
+        tryCatch({
+          # Get wet nodes (value = 1) and present nodes (non-NA)
+          node_values <- df[i, -which(names(df) == "date")]
+          wet_nodes_count <- sum(node_values == 1, na.rm = TRUE)
+          present_nodes_count <- sum(!is.na(node_values))
+          
+          # Calculate percent_network_wet
+          percent_network_wet <- ifelse(present_nodes_count > 0, 
+                              (wet_nodes_count/present_nodes_count)*100, 
+                              0)
+          # Convert from factors to characters to numeric
+          pa_vect <- node_values[1, ] |>
+            as.character() |>
+            as.numeric()
+          
+          # Set the names
+          names(pa_vect) <- colnames(node_values)
+          pa_vect <- pa_vect - 1
+          # Create temporary graph for this day
+          temp_graph <- delete.nodes.pa(
+            net, 
+            node_values,
+            na.response = "treat.as.1"
+          )
+          
+          # Skip if graph is empty
+          if (vcount(temp_graph) == 0) {
+            return(tibble(
+              date = df$date[i],
+              icsl = NA_real_,
+              #intact_to_sink = NA_real_,
+              a_cent_weighted = NA_real_,
+              a_cent = NA_real_,
+              harary = NA_real_,
+              active_upstream_length = 0,
+              present_nodes = present_nodes_count,
+              total_nodes = total_nodes,
+              #percent_upstream_wet = 0,
+              percent_network_wet = percent_network_wet
+            ))
+          }
+          
+          edge_keys <- attributes(E(temp_graph))$vname
+          length_scaled <- arc_lengths$scaled_lengths[match(edge_keys, arc_lengths$Arc_key)]
+          lengths_m <- arc_lengths$Length[match(edge_keys, arc_lengths$Arc_key)]
+          
+          # Total active network length
+          active_network_length <- sum(lengths_m)
+          
+          # Calculate upstream metrics
+          if (sink %in% V(temp_graph)$name) {
+            E(temp_graph)$weight <- lengths_m
+            upstream_nodes <- subcomponent(temp_graph, sink, mode = "in")
+            upstream_subgraph <- induced_subgraph(temp_graph, upstream_nodes)
+            active_upstream_length <- size.intact.to.sink(temp_graph, sink = sink)
+            #active_upstream_length <- sum(E(upstream_subgraph)$weight, na.rm = TRUE)
+            wet_nodes_upstream <- vcount(upstream_subgraph)
+          } else {
+            #active_upstream_length <- 0
+            wet_nodes_upstream <- 0
+            active_upstream_length <- 0
+          }
+          # Set edge weights
+          E(temp_graph)$weight <- length_scaled
+          wet_nodes_all <- vcount(temp_graph)
+          # Calculate all metrics
+          tibble(
+            date = df$date[i],
+            icsl = ICSL(temp_graph, lengths = lengths_m),
+            active_upstream_length = active_upstream_length,
+            a_cent_weighted = mean(alpha_centrality(temp_graph), na.rm = TRUE),
+            a_cent = mean(alpha_centrality(temp_graph, weights = NA), na.rm = TRUE),
+            harary = harary(temp_graph),
+            wet_upstream_nodes = wet_nodes_upstream,
+            wet_network_nodes = wet_nodes_all,
+            present_nodes = present_nodes_count,
+            total_nodes = total_nodes,
+            percent_network_wet = percent_network_wet,
+            active_network_length_m = active_network_length
+          )
+          
+        }, error = function(e) {
+          message("Error for ", wshed, " on ", df$date[i], ": ", e$message)
+          tibble(
+            date = df$date[i],
+            icsl = NA_real_,
+            #intact_to_sink = NA_real_,
+            a_cent_weighted = NA_real_,
+            a_cent = NA_real_,
+            harary = NA_real_,
+            active_upstream_length = NA_real_,
+            present_nodes = NA_real_,
+            total_nodes = total_nodes,
+            percent_network_wet = NA_real_
+          )
+        })
+      }, .options = furrr_options(seed = TRUE), .progress = TRUE) |> 
+        bind_rows()
+      
+      # Format final output
+      metric_df |>
+        pivot_longer(cols = -c(date, wet_upstream_nodes, wet_network_nodes, present_nodes, 
+                             total_nodes, percent_network_wet), 
+                     names_to = "metric", values_to = "value") |>
+        #mutate(metric = recode(metric, !!!metric_names)) |> 
+        pivot_wider(names_from = metric, values_from = value) 
+    }, .options = furrr_options(seed = TRUE), .progress = TRUE)
+  ) |> 
+  select(-data) |> 
+  unnest(metrics)
+
+
+streamDAG_Metrics <- streamDAG_Metrics |> 
+  group_by(watershed) |>
+  mutate(
+    a_cent_scaled = as.numeric(scale(a_cent)),
+    a_cent_weighted_scaled = as.numeric(scale(a_cent_weighted))
+  ) |>
+  ungroup() |> 
+  select(watershed, date, total_nodes, present_nodes, wet_upstream_nodes, wet_network_nodes, 
+         percent_network_wet, active_upstream_length, active_network_length_m, icsl, harary, a_cent, a_cent_scaled, 
+         a_cent_weighted, a_cent_weighted_scaled) |> 
+  write_csv(here("Data/STICs/streamDAG_metrics.csv"))
+
+streamDAG_Metrics |> 
+  filter(watershed %in% c("WHR", "TAL", "PRF")) |> 
+  write_csv(here("Data/STICs/streamDAG_metrics_SouthEast.csv"))
+  #write_csv(here("Data/STICs/streamDAG_metrics_connectivityPaper.csv"))
+# Reset parallel processing
+plan(sequential)
+```
+
+```{r}
+# First reshape the data to long format for plotting
+streamDAG_Metrics_long <- streamDAG_Metrics |>
+  pivot_longer(
+    cols = -c(watershed, date),
+    names_to = "Metric",
+    values_to = "Value"
+  ) |> 
+  mutate(watershed = forcats::fct_relevel(watershed, 
+                               "KNZ", "SHN", "YMR",  # Left column
+                               "TAL", "WHR", "PRF", 
+                               "GBJ", "DRC", "JDR")) # Right column
+
+# Create faceted plot
+streamDAG_Metrics_long |> 
+  filter(Metric == "a_cent") |> 
+ggplot(aes(x = date, y = Value, color = watershed)) +
+  geom_line(alpha = 0.8, linewidth = 0.7) +
+  facet_wrap(~watershed, ncol = 2, dir = "v", scales = "free") +
+  scale_color_manual(values = okabeIto) +
+  labs(
+    title = "Global Unweighted Alpha Centrality",
+    x = "",
+    y = "Alpha Centrality",
+    color = ""
+  ) +
+  theme_few() +
+  theme(
+    legend.position = "none") +
+  scale_x_date(date_labels = "%b %Y") +
+  scale_y_continuous(labels = scales::label_number(accuracy = 0.1)) -> p
+p
+ggsave("gu_ac.png", p, here("Figs/STICs"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = "retina")
+
+streamDAG_Metrics_long |> 
+  filter(Metric == "a_cent_weighted") |> 
+ggplot(aes(x = date, y = Value, color = watershed)) +
+  geom_line(alpha = 0.8, linewidth = 0.7) +
+  facet_wrap(~watershed, ncol = 2, dir = "v", scales = "free") +
+  scale_color_manual(values = okabeIto) +
+  labs(
+    title = "Global Weighted Alpha Centrality",
+    x = "",
+    y = "Alpha Centrality",
+    color = ""
+  ) +
+  theme_few() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold", size = 10),
+    legend.position = "none",
+    panel.grid.minor = element_blank()
+  ) +
+  scale_x_date(date_labels = "%b %Y") +
+  scale_y_continuous(labels = scales::label_number(accuracy = 0.1)) ->p 
+p
+ggsave("gw_ac.png", p, here("Figs/STICs"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = "retina")
+
+streamDAG_Metrics_long |> 
+  filter(Metric == "a_cent_scaled") |> 
+ggplot(aes(x = date, y = Value, color = watershed)) +
+  geom_line(alpha = 0.8, linewidth = 0.7) +
+  facet_wrap(~watershed, ncol = 2, dir = "v", scales = "free") +
+  scale_color_manual(values = okabeIto) +
+  labs(
+    title = "Global Unweighted Alpha Centrality (Scaled)",
+    x = "",
+    y = "Alpha Centrality",
+    color = ""
+  ) +
+  theme_few() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold", size = 10),
+    legend.position = "none",
+    panel.grid.minor = element_blank()
+  ) +
+  scale_x_date(date_labels = "%b %Y") +
+  scale_y_continuous(labels = scales::label_number(accuracy = 0.1)) -> p
+p
+ggsave("gus_ac.png", p, here("Figs/STICs"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = "retina")
+
+streamDAG_Metrics_long |> 
+  filter(Metric == "a_cent_weighted_scaled") |> 
+ggplot(aes(x = date, y = Value, color = watershed)) +
+  geom_line(alpha = 0.8, linewidth = 0.7) +
+  facet_wrap(~watershed, ncol = 2, dir = "v", scales = "free") +
+  scale_color_manual(values = okabeIto) +
+  labs(
+    title = "Global Weighted Alpha Centrality (Scaled)",
+    x = "",
+    y = "Alpha Centrality",
+    color = ""
+  ) +
+  theme_few() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold", size = 10),
+    legend.position = "none",
+    panel.grid.minor = element_blank()
+  ) +
+  scale_x_date(date_labels = "%b %Y") +
+  scale_y_continuous(labels = scales::label_number(accuracy = 0.1)) -> p
+p
+ggsave("gws_ac.png", p, here("Figs/STICs"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = "retina")
+
+streamDAG_Metrics_long |> 
+  filter(Metric %in% c("icsl", "a_cent_weighted", "a_cent", "harary")) |> 
+  # group_by(watershed, Metric) |>
+  #   dplyr::mutate(across(where(is.numeric), ~ (. - mean(., na.rm = TRUE)) / sd(., na.rm = TRUE), .names = "{.col}")) |>
+  #   ungroup() |>
+ggplot(aes(x = date, y = Value, color = Metric)) +
+  geom_line(alpha = 0.8, linewidth = 0.7) +
+  facet_grid(Metric~watershed, scales = "free") +
+  scale_color_manual(values = okabeIto) +
+  labs(
+    x = "",
+    y = "",
+    color = ""
+  ) +
+  theme_few() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold", size = 10),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  ) +
+  scale_x_date(date_labels = "%b %Y") +
+  scale_y_continuous(labels = scales::label_number(accuracy = 0.1)) 
+
+streamDAG_Metrics_long |> 
+  filter(Metric %in% c("present_nodes", "wet_nodes", "total_nodes", "active_upstream_length", "active_network_length_m", "percent_upstream_wet", "percent_network_wet")) |> 
+ggplot(aes(x = date, y = Value, color = Metric)) +
+  geom_line(alpha = 0.8, linewidth = 0.7) +
+  facet_grid(Metric~watershed, scales = "free") +
+  scale_color_manual(values = okabeIto) +
+  labs(
+    x = "",
+    y = "",
+    color = ""
+  ) +
+  theme_few() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold", size = 10),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  ) +
+  scale_x_date(date_labels = "%b %Y") +
+  scale_y_continuous(labels = scales::comma) -> p
+p
+ggsave("Nodes.png", p, here("Figs/STICs"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = "retina")
+```
+
+# StreamDAG Metrics - Connectivity Paper
+
+```{r}
+# Define the date ranges for each watershed
+connectivity_dates <- data.frame(
+  watershed = c("KNZ", "TAL", "GBJ", "PRF", "YMR", "JDR"),
+  start_date = as.Date(c("2022-06-22", "2023-02-01", "2022-04-22", "2023-03-09", "2022-03-25", "2023-03-22")),
+  end_date = as.Date(c("2022-09-01", "2023-12-31", "2022-09-07", "2023-06-12", "2022-08-04", "2023-07-17"))
+) |> 
+  mutate(start_wy = calcWaterYear(start_date),
+         end_wy = calcWaterYear(end_date),
+         Year = year(start_date))
+
+# Filter the data
+filt_presAbs <- presAbs  |> 
+  left_join(connectivity_dates, by = "watershed") |> 
+  filter(year(date) == Year) |> 
+  select(-start_date, -end_date, -start_wy, -end_wy, -Year)
+
+# Clean stic data
+nestPresAbs_filt <- filt_presAbs |> 
+  nest(data = -watershed) |> 
+  mutate(
+    data = map2(data, watershed, ~ {
+      # Trim leading/trailing NA rows
+      trimmed <- trim_na_rows(.x)
+      # Then drop columns that are all NA (except date)
+      cleaned <- select(trimmed, date, where(~ !all(is.na(.))))
+      # Add watershed column to the cleaned data
+      cleaned$watershed <- .y
+      # Process STICs and automatically print the summary
+      result <- stics_not_na(presAbs = cleaned, percThresh = 0.5, watershed = .y)
+      # Ensure watershed column is preserved in the result
+      if (!"watershed" %in% names(result)) {
+        result$watershed <- .y
+      }
+      return(result)
+    })
+  )
+
+doParallel::registerDoParallel(cores = nCores)
+
+# Gap fill 
+nestPresAbs_filt_filled <- nestPresAbs_filt |> 
+  mutate(
+    data = map(data, ~ {
+      # Remove watershed column if it exists
+      if ("watershed" %in% names(.)) {
+        . <- select(., -watershed)
+      }
+      STIC.RFimpute_parallel(.)
+    })
+  )
+
+# Remove dropped STICs from network and reconnect
+aimsNets <- imap(aimsNets_full, \(net, wshed) {
+  # Start watershed processing
+  cli_h1("Processing watershed: {.field {wshed}}")
+  # Extract watershed data
+  wshed_data <- nestPresAbs_filt_filled |> 
+    filter(watershed == wshed) |> 
+    pull(data) |> 
+    first()
+  # Get nodes to keep (excluding date)
+  keep_nodes <- names(wshed_data)[names(wshed_data) != "date"]
+  original_nodes <- igraph::V(net)$name
+  # 1. Check for missing expected nodes
+  missing_in_net <- setdiff(keep_nodes, original_nodes)
+  if (length(missing_in_net) > 0) {
+    cli_alert_warning(paste(
+      "{.val {length(missing_in_net)}} nodes in data but not in network:",
+      "{.val {missing_in_net}}"
+    ))
+  }
+  # 2. Check for extra nodes in network
+  extra_in_net <- setdiff(original_nodes, keep_nodes)
+  cli_ul()
+  cli_li("Nodes being removed: {.val {length(extra_in_net)}}")
+  # 3. Actual nodes that will be kept
+  actual_keep <- intersect(keep_nodes, original_nodes)
+  cli_li("Nodes being kept: {.val {length(actual_keep)}}/{.val {length(keep_nodes)}}")
+  # 4. Edge counts
+  cli_li("Original edges: {.val {igraph::ecount(net)}}")
+  # Process network
+  filtered_net <- reconnect_and_remove_nodes(net, actual_keep)
+  cli_li("Filtered edges: {.val {igraph::ecount(filtered_net)}}")
+  cli_end()
+  # 5. Verify final node set
+  final_nodes <- igraph::V(filtered_net)$name
+  if (!setequal(final_nodes, actual_keep)) {
+    cli_alert_danger("Critical error: Final nodes don't match expected set")
+    stop("Node mismatch in watershed ", wshed)
+  }
+  cli_alert_success("Successfully processed {.field {wshed}}")
+  return(filtered_net)
+})
+
+scaled_arc_lengths <-list()
+for (site in unique(presAbs$watershed)) {
+  tempNet <- aimsNets[[site]]
+  edge_keys <- attributes(E(tempNet))$vname
+  arc_lengths <- all_arc_lengths[[site]]
+  
+  # Prepare lookup for edge weights
+      arc_lengths <- arc_lengths |>
+        mutate(Arc_key = gsub("->", "|", Arc)) 
+      
+  length_sub <- arc_lengths$Length[match(edge_keys, arc_lengths$Arc_key)]
+  
+  scaled_lengths <- scale(length_sub/1000, center = FALSE) #meters to km
+  
+  scaled_arc_lengths[[site]][["Arc"]] <- arc_lengths$Arc[match(edge_keys, arc_lengths$Arc_key)]
+  scaled_arc_lengths[[site]][["scaled_lengths"]] <- scaled_lengths
+  scaled_arc_lengths[[site]][["Length"]] <- length_sub
+  scaled_arc_lengths[[site]][["watershed"]] <- site
+}
+# Convert to a nested tibble by watershed
+scaled_arc_lengths <- scaled_arc_lengths |>
+  imap(\(x, watershed) {
+    tibble(
+      Arc = x$Arc,
+      Length = x$Length,
+      scaled_lengths = as.numeric(x$scaled_lengths)
+    ) |>
+      mutate(watershed = watershed)
+  }) |>
+  bind_rows() |>
+  group_by(watershed) |>
+  nest()
+
+all_stics_connectivity <- map(aimsNets, ~ vertex_attr(.x, "name")) |> 
+  unlist() |> 
+  unique() |> 
+  (\(x) tibble(siteId = x))()
+all_stics_connectivity |> write_csv(here("Data/STICs/stics_for_connectivity.csv"))
+```
+
+```{r}
+date_dups <- nestPresAbs_filt_filled |>
+  mutate(
+    dup_dates = map(data, \(df) {
+      df |>
+        count(date) |>
+        filter(n > 1)
+    })
+  )
+
+# View duplicate date counts per watershed
+date_dups |>
+  select(watershed, dup_dates)
+
+date_dups |>
+  mutate(n_dups = map_int(dup_dates, nrow)) |>
+  select(watershed, n_dups)
+```
+
+```{r}
+sink_nodes <- list(
+  KNZ = "SFM01",
+  SHN = "SHM01",
+  YMR = "ENM01",
+  PRF = "PRM01",
+  TAL = "TLM01",
+  WHR = "WHM01",
+  GBJ = "GJ1",
+  JDR = "JD1",
+  DRC = "DC6"
+)
+# Set up parallel processing
+plan(multisession)
+
+# Compute metrics per watershed with upstream metrics
+streamDAG_Metrics_Connectivity <- nestPresAbs_filt_filled |> 
+  mutate(
+    metrics = future_map2(watershed, data, \(wshed, df) {
+      # Get network and sink node for this watershed
+      net <- aimsNets[[wshed]]
+      sink <- sink_nodes[[wshed]]
+      arc_lengths <- scaled_arc_lengths |> filter(watershed == wshed) |> unnest(col = data) 
+      #arc_lengths <- all_arc_lengths[[wshed]]
+      
+      # Get all node names from the network
+      all_nodes <- V(net)$name
+      total_nodes <- length(all_nodes)
+      
+      # Prepare lookup for edge weights
+      arc_lengths <- arc_lengths |>
+        mutate(Arc_key = gsub("->", "|", Arc))
+      
+      # Compute metrics for each day
+      metric_df <- future_map(1:nrow(df), \(i) {
+        tryCatch({
+          # Get wet nodes (value = 1) and present nodes (non-NA)
+          node_values <- df[i, -which(names(df) == "date")]
+          wet_nodes_count <- sum(node_values == 1, na.rm = TRUE)
+          present_nodes_count <- sum(!is.na(node_values))
+          
+          # Calculate percent_network_wet
+          percent_network_wet <- ifelse(present_nodes_count > 0, 
+                              (wet_nodes_count/present_nodes_count)*100, 
+                              0)
+          # Convert from factors to characters to numeric
+          pa_vect <- node_values[1, ] |>
+            as.character() |>
+            as.numeric()
+          
+          # Set the names
+          names(pa_vect) <- colnames(node_values)
+          pa_vect <- pa_vect - 1
+          # Create temporary graph for this day
+          temp_graph <- delete.nodes.pa(
+            net, 
+            node_values,
+            na.response = "treat.as.1"
+          )
+          
+          # Skip if graph is empty
+          if (vcount(temp_graph) == 0) {
+            return(tibble(
+              date = df$date[i],
+              icsl = NA_real_,
+              #intact_to_sink = NA_real_,
+              a_cent_weighted = NA_real_,
+              a_cent = NA_real_,
+              harary = NA_real_,
+              active_upstream_length = 0,
+              present_nodes = present_nodes_count,
+              total_nodes = total_nodes,
+              #percent_upstream_wet = 0,
+              percent_network_wet = percent_network_wet
+            ))
+          }
+          
+          edge_keys <- attributes(E(temp_graph))$vname
+          length_scaled <- arc_lengths$scaled_lengths[match(edge_keys, arc_lengths$Arc_key)]
+          lengths_m <- arc_lengths$Length[match(edge_keys, arc_lengths$Arc_key)]
+          
+          # Total active network length
+          active_network_length <- sum(lengths_m)
+          
+          # Calculate upstream metrics
+          if (sink %in% V(temp_graph)$name) {
+            E(temp_graph)$weight <- lengths_m
+            upstream_nodes <- subcomponent(temp_graph, sink, mode = "in")
+            upstream_subgraph <- induced_subgraph(temp_graph, upstream_nodes)
+            active_upstream_length <- size.intact.to.sink(temp_graph, sink = sink)
+            #active_upstream_length <- sum(E(upstream_subgraph)$weight, na.rm = TRUE)
+            wet_nodes_upstream <- vcount(upstream_subgraph)
+          } else {
+            #active_upstream_length <- 0
+            wet_nodes_upstream <- 0
+            active_upstream_length <- 0
+          }
+          # Set edge weights
+          E(temp_graph)$weight <- length_scaled
+          wet_nodes_all <- vcount(temp_graph)
+          # Calculate all metrics
+          tibble(
+            date = df$date[i],
+            icsl = ICSL(temp_graph, lengths = lengths_m),
+            active_upstream_length = active_upstream_length,
+            a_cent_weighted = mean(alpha_centrality(temp_graph), na.rm = TRUE),
+            a_cent = mean(alpha_centrality(temp_graph, weights = NA), na.rm = TRUE),
+            harary = harary(temp_graph),
+            wet_upstream_nodes = wet_nodes_upstream,
+            wet_network_nodes = wet_nodes_all,
+            present_nodes = present_nodes_count,
+            total_nodes = total_nodes,
+            percent_network_wet = percent_network_wet,
+            active_network_length_m = active_network_length
+          )
+          
+        }, error = function(e) {
+          message("Error for ", wshed, " on ", df$date[i], ": ", e$message)
+          tibble(
+            date = df$date[i],
+            icsl = NA_real_,
+            #intact_to_sink = NA_real_,
+            a_cent_weighted = NA_real_,
+            a_cent = NA_real_,
+            harary = NA_real_,
+            active_upstream_length = NA_real_,
+            present_nodes = NA_real_,
+            total_nodes = total_nodes,
+            percent_network_wet = NA_real_
+          )
+        })
+      }, .options = furrr_options(seed = TRUE), .progress = TRUE) |> 
+        bind_rows()
+      
+      # Format final output
+      metric_df |>
+        pivot_longer(cols = -c(date, wet_upstream_nodes, wet_network_nodes, present_nodes, 
+                             total_nodes, percent_network_wet), 
+                     names_to = "metric", values_to = "value") |>
+        #mutate(metric = recode(metric, !!!metric_names)) |> 
+        pivot_wider(names_from = metric, values_from = value) 
+    }, .options = furrr_options(seed = TRUE), .progress = TRUE)
+  ) |> 
+  select(-data) |> 
+  unnest(metrics)
+
+streamDAG_Metrics_Connectivity <- streamDAG_Metrics_Connectivity |> 
+  group_by(watershed) |>
+  mutate(
+    a_cent_scaled = as.numeric(scale(a_cent)),
+    a_cent_weighted_scaled = as.numeric(scale(a_cent_weighted))
+  ) |>
+  ungroup() |> 
+  select(watershed, date, total_nodes, present_nodes, wet_upstream_nodes, wet_network_nodes, 
+         percent_network_wet, active_upstream_length, icsl, harary, a_cent, a_cent_scaled, 
+         a_cent_weighted, a_cent_weighted_scaled) |> 
+  write_csv(here("Data/STICs/streamDAG_metrics_connectivityPaper.csv"))
+# Reset parallel processing
+plan(sequential)
+```
+
+# Graveyard
+
+## TidyNetworks
+
+```{r}
+# reconnect_and_remove_nodes_tidy <- function(graph, keep_nodes) {
+#   g <- as.igraph(graph)
+# 
+#   # Set node names to siteId before manipulating
+#   site_ids <- graph |> activate("nodes") |> pull(siteId)
+#   V(g)$name <- site_ids
+# 
+#   remove_nodes <- setdiff(V(g)$name, keep_nodes)
+# 
+#   for (v in remove_nodes) {
+#     if (!v %in% V(g)$name) next
+# 
+#     upstream <- igraph::neighbors(g, v, mode = "in")$name
+#     downstream <- igraph::neighbors(g, v, mode = "out")$name
+# 
+#     if (length(upstream) > 0 && length(downstream) > 0) {
+#       new_edges <- expand.grid(from = upstream, to = downstream, stringsAsFactors = FALSE)
+#       for (i in seq_len(nrow(new_edges))) {
+#         from <- new_edges$from[i]
+#         to <- new_edges$to[i]
+#         if (from != to && !are_adjacent(g, from, to)) {
+#           g <- add_edges(g, c(from, to))
+#         }
+#       }
+#     }
+# 
+#     g <- delete_vertices(g, v)
+#   }
+#   graph_out <- as_sfnetwork(g)
+#   return(graph_out)
+# }
+
 # sink_nodes <- list(
 #   KNZ = "SFM01",
 #   SHN = "SHM01",
@@ -504,9 +1259,7 @@ reconnect_and_remove_nodes_tidy <- function(graph, keep_nodes) {
 #         )
 #     })
 #   )
-```
 
-```{r}
 # plan(multisession)
 # 
 # jdrDat <- get.AIMS.data("jd_full")
@@ -655,9 +1408,7 @@ reconnect_and_remove_nodes_tidy <- function(graph, keep_nodes) {
 #   ) #|> 
 # #write_csv(here("Data/STICs/alpha_centrality_GP-SE.csv"))
 # plan(sequential)
-```
 
-```{r}
 # 
 # all_metrics |> 
 #   group_by(date, watershed) |> 
@@ -732,270 +1483,6 @@ reconnect_and_remove_nodes_tidy <- function(graph, keep_nodes) {
 #   scale_y_continuous(labels = scales::label_number(accuracy = 0.1))
 
 ```
-
-# streamDAG Global Metrics
-
-Have to use "weight" not "weights", Maggi used weights in the KNZ code, Ken uses weight everywhere except in global metrics example
-
-```{r}
-sink_nodes <- list(
-  KNZ = "SFM01",
-  SHN = "SHM01",
-  YMR = "ENM01",
-  PRF = "PRM01",
-  TAL = "TLM01",
-  WHR = "WHM01",
-  GBJ = "GJ1"
-)
-
-# Set up parallel processing
-plan(multisession)
-
-# Compute metrics per watershed with upstream metrics
-streamDAG_Metrics <- nestPresAbs_filled |> 
-  mutate(
-    metrics = future_map2(watershed, data, \(wshed, df) {
-      # Get network and sink node for this watershed
-      net <- aimsNets[[wshed]]
-      sink <- sink_nodes[[wshed]]
-      arc_lengths <- all_arc_lengths[[wshed]]
-      
-      # Get all node names from the network
-      all_nodes <- V(net)$name
-      total_nodes <- length(all_nodes)
-      
-      # Prepare lookup for edge weights
-      arc_lengths <- arc_lengths |>
-        mutate(Arc_key = gsub("->", "|", Arc))
-      
-      # Compute metrics for each day
-      metric_df <- future_map(1:nrow(df), \(i) {
-        tryCatch({
-          # Get wet nodes (value = 1) and present nodes (non-NA)
-          node_values <- df[i, -which(names(df) == "date")]
-          wet_nodes_count <- sum(node_values == 1, na.rm = TRUE)
-          present_nodes_count <- sum(!is.na(node_values))
-          
-          # Calculate percent_network_wet
-          percent_network_wet <- ifelse(present_nodes_count > 0, 
-                              (wet_nodes_count/present_nodes_count)*100, 
-                              0)
-          # Convert from factors to characters to numeric
-          pa_vect <- node_values[1, ] |>
-            as.character() |>
-            as.numeric()
-          
-          # Set the names
-          names(pa_vect) <- colnames(node_values)
-          pa_vect <- pa_vect - 1
-          # Create temporary graph for this day
-          temp_graph <- delete.nodes.pa(
-            net, 
-            node_values,
-            na.response = "treat.as.1"
-          )
-          
-          # Skip if graph is empty
-          if (vcount(temp_graph) == 0) {
-            return(tibble(
-              date = df$date[i],
-              icsl = NA_real_,
-              #intact_to_sink = NA_real_,
-              a_cent_weighted = NA_real_,
-              a_cent = NA_real_,
-              harary = NA_real_,
-              active_upstream_length = 0,
-              present_nodes = present_nodes_count,
-              total_nodes = total_nodes,
-              #percent_upstream_wet = 0,
-              percent_network_wet = percent_network_wet
-            ))
-          }
-          
-          # Set edge weights (convert m to km)
-          edge_keys <- attributes(E(temp_graph))$vname
-          length_sub <- arc_lengths$Length[match(edge_keys, arc_lengths$Arc_key)]
-          E(temp_graph)$weight <- length_sub/1000
-          
-          # Calculate upstream metrics
-          if (sink %in% V(temp_graph)$name) {
-            upstream_nodes <- subcomponent(temp_graph, sink, mode = "in")
-            upstream_subgraph <- induced_subgraph(temp_graph, upstream_nodes)
-            #active_upstream_length <- sum(E(upstream_subgraph)$weight, na.rm = TRUE)
-            wet_nodes_upstream <- vcount(upstream_subgraph)
-          } else {
-            #active_upstream_length <- 0
-            wet_nodes_upstream <- 0
-          }
-          wet_nodes_all <- vcount(temp_graph)
-          # Calculate all metrics
-          tibble(
-            date = df$date[i],
-            icsl = ICSL(temp_graph, lengths = length_sub),
-            active_upstream_length = size.intact.to.sink(temp_graph, sink = sink),
-            a_cent_weighted = mean(alpha_centrality(temp_graph), na.rm = TRUE),
-            a_cent = mean(alpha_centrality(temp_graph, weights = NA), na.rm = TRUE),
-            harary = harary(temp_graph),
-            #active_upstream_length = active_upstream_length,
-            wet_upstream_nodes = wet_nodes_upstream,
-            wet_network_nodes = wet_nodes_all,
-            present_nodes = present_nodes_count,
-            total_nodes = total_nodes,
-            # percent_upstream_wet = ifelse(present_nodes_count > 0, 
-            #                         (wet_nodes_upstream/present_nodes_count)*100, 
-            #                         0),
-            percent_network_wet = percent_network_wet
-          )
-          
-        }, error = function(e) {
-          message("Error for ", wshed, " on ", df$date[i], ": ", e$message)
-          tibble(
-            date = df$date[i],
-            icsl = NA_real_,
-            #intact_to_sink = NA_real_,
-            a_cent_weighted = NA_real_,
-            a_cent = NA_real_,
-            harary = NA_real_,
-            active_upstream_length = NA_real_,
-            present_nodes = NA_real_,
-            total_nodes = total_nodes,
-            #percent_upstream_wet = NA_real_,
-            percent_network_wet = NA_real_
-          )
-        })
-      }, .options = furrr_options(seed = TRUE), .progress = TRUE) |> 
-        bind_rows()
-      
-      # Format final output
-      metric_df |>
-        pivot_longer(cols = -c(date, wet_upstream_nodes, wet_network_nodes, present_nodes, 
-                             total_nodes, percent_network_wet), 
-                     names_to = "metric", values_to = "value") |>
-        #mutate(metric = recode(metric, !!!metric_names)) |> 
-        pivot_wider(names_from = metric, values_from = value) 
-    }, .options = furrr_options(seed = TRUE), .progress = TRUE)
-  ) |> 
-  select(-data) |> 
-  unnest(metrics)
-
-
-streamDAG_Metrics <- streamDAG_Metrics |> 
-  group_by(watershed) |>
-  mutate(
-    a_cent_scaled = as.numeric(scale(a_cent)),
-    a_cent_weighted_scaled = as.numeric(scale(a_cent_weighted))
-  ) |>
-  ungroup() |> 
-  select(watershed, date, total_nodes, present_nodes, wet_upstream_nodes, wet_network_nodes, 
-         percent_network_wet, active_upstream_length, icsl, harary, a_cent, a_cent_scaled, 
-         a_cent_weighted, a_cent_weighted_scaled) |> 
-  write_csv(here("Data/STICs/streamDAG_metrics.csv"))
-# Reset parallel processing
-plan(sequential)
-```
-
-```{r}
-# First reshape the data to long format for plotting
-streamDAG_Metrics_long <- streamDAG_Metrics |>
-  pivot_longer(
-    cols = -c(watershed, date),
-    names_to = "Metric",
-    values_to = "Value"
-  ) |> 
-  mutate(watershed = forcats::fct_relevel(watershed, 
-                               "KNZ", "SHN", "YMR",  # Left column
-                               "TAL", "WHR", "PRF")) # Right column
-
-# Create faceted plot
-streamDAG_Metrics_long |> 
-  filter(Metric == "a_cent") |> 
-ggplot(aes(x = date, y = Value, color = watershed)) +
-  geom_line(alpha = 0.8, linewidth = 0.7) +
-  facet_wrap(~watershed, ncol = 2, dir = "v") +
-  scale_color_manual(values = okabeIto) +
-  labs(
-    x = "",
-    y = "Global Unweighted Alpha Centrality",
-    color = ""
-  ) +
-  theme_few() +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1),
-    strip.text = element_text(face = "bold", size = 10),
-    legend.position = "none",
-    panel.grid.minor = element_blank()
-  ) +
-  scale_x_date(date_labels = "%b %Y") +
-  scale_y_continuous(labels = scales::label_number(accuracy = 0.1)) 
-
-streamDAG_Metrics_long |> 
-  filter(Metric == "a_cent_weighted") |> 
-ggplot(aes(x = date, y = Value, color = watershed)) +
-  geom_line(alpha = 0.8, linewidth = 0.7) +
-  facet_wrap(~watershed, ncol = 2, dir = "v", scales = "free_y") +
-  scale_color_manual(values = okabeIto) +
-  labs(
-    x = "",
-    y = "Global Weighted Alpha Centrality",
-    color = ""
-  ) +
-  theme_few() +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1),
-    strip.text = element_text(face = "bold", size = 10),
-    legend.position = "none",
-    panel.grid.minor = element_blank()
-  ) +
-  scale_x_date(date_labels = "%b %Y") +
-  scale_y_continuous(labels = scales::label_number(accuracy = 0.1)) 
-
-streamDAG_Metrics_long |> 
-  filter(Metric %in% c("icsl", "a_cent_weighted", "a_cent", "harary")) |> 
-  group_by(watershed, Metric) |>
-    dplyr::mutate(across(where(is.numeric), ~ (. - mean(., na.rm = TRUE)) / sd(., na.rm = TRUE), .names = "{.col}")) |>
-    ungroup() |>
-ggplot(aes(x = date, y = Value, color = Metric)) +
-  geom_line(alpha = 0.8, linewidth = 0.7) +
-  facet_grid(Metric~watershed, scales = "free_y") +
-  scale_color_manual(values = okabeIto) +
-  labs(
-    x = "",
-    y = "",
-    color = ""
-  ) +
-  theme_few() +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1),
-    strip.text = element_text(face = "bold", size = 10),
-    legend.position = "bottom",
-    panel.grid.minor = element_blank()
-  ) +
-  scale_x_date(date_labels = "%b %Y") +
-  scale_y_continuous(labels = scales::label_number(accuracy = 0.1)) 
-
-streamDAG_Metrics_long |> 
-  filter(Metric %in% c("present_nodes", "wet_nodes", "total_nodes", "active_upstream_length", "percent_upstream_wet", "percent_network_wet")) |> 
-ggplot(aes(x = date, y = Value, color = Metric)) +
-  geom_line(alpha = 0.8, linewidth = 0.7) +
-  facet_grid(Metric~watershed, scales = "free_y") +
-  scale_color_manual(values = okabeIto) +
-  labs(
-    x = "",
-    y = "",
-    color = ""
-  ) +
-  theme_few() +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1),
-    strip.text = element_text(face = "bold", size = 10),
-    legend.position = "bottom",
-    panel.grid.minor = element_blank()
-  ) +
-  scale_x_date(date_labels = "%b %Y") +
-  scale_y_continuous(labels = scales::comma)
-```
-
-## Scaling Weights before Calc
 
 ```{r}
 sink_nodes <- list(

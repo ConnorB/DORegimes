@@ -50,3 +50,8 @@ rsconnect/
 
 # Data directory and contents
 Data/
+.positai
+Results/
+
+# DEMs
+*.tif

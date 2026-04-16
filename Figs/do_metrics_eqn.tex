@@ -1,0 +1,24 @@
+\begin{table}[t]
+\fontsize{12.0pt}{14.0pt}\selectfont
+\begin{tabular*}{\linewidth}{@{\extracolsep{\fill}}lc}
+\toprule
+Metric name & {\bfseries Equation} \\ 
+\midrule\addlinespace[2.5pt]
+Mean DO & $$\overline{DO}_{\text{day}} = \frac{1}{n_d} \sum_{t=1}^{n_d} DO_{t,d}$$ \\ 
+Minimum DO & $$DO_{\min,d} = \min_t(DO_{t,d})$$ \\ 
+Maximum DO & $$DO_{\max,d} = \max_t(DO_{t,d})$$ \\ 
+Amplitude & $$DO_{\text{amp},d} = \max_t(DO_{t,d}) - \min_t(DO_{t,d})$$ \\ 
+Exceedance probability & $$P_{\text{exc},d} = \frac{r_d}{N + 1}$$ \\ 
+Probability of hypoxia & $$P_{\text{hypoxia},d} = \frac{1}{n_d} \sum_{t=1}^{n_d}
+      \begin{cases}
+        1, & \text{if } DO_{t,d} < DO_{\text{hyp}} \\
+        0, & \text{otherwise}
+      \end{cases}$$ \\ 
+Night hypoxia ratio & $$R_{\text{hypoxia},d} = \frac{P_{\text{hypoxia, night},d}}{P_{\text{hypoxia, day},d}}$$ \\ 
+\bottomrule
+\end{tabular*}
+\begin{minipage}{\linewidth}
+Table 2. \(DO_{t,d}\) is the dissolved oxygen observation at time \(t\) on day \(d\); \(n_d\) is the number of valid observations per day; \(\overline{DO}_d\) is the daily mean DO; \(r_d\) is the rank of \(\overline{DO}_d\) (1 = highest); \(N\) is the total number of days; \(DO_{\text{hyp}}\) is the hypoxia threshold; and \(P_{\text{hypoxia, night},d}\) and \(P_{\text{hypoxia, day},d}\) are the daily probabilities of hypoxia during nighttime and daytime, respectively.\\
+\end{minipage}
+\end{table}
+

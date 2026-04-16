@@ -39,7 +39,7 @@ library(neonUtilities)
 library(vegan)
 library(RColorBrewer)
 library(furrr)
-
+library(sf)
 # Project Specific
 
 #### Options ------------------------------------------------------------

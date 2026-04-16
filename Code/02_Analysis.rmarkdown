@@ -1,0 +1,3983 @@
+---
+title: "DO Regimes"
+author: "CLB"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+library(here)
+source(here("Code/paths+packages.R"))
+library(preMetabolizer)
+library(furrr)
+library(PerformanceAnalytics)
+library(corrr)
+library(cluster)
+library(factoextra)
+library(beepr)
+library(glue)
+library(cowplot)
+library(ggExtra)
+library(caret)
+library(randomForest)
+library(gganimate)
+library(gt)
+set.seed(4) # For reproducibility
+gpSites <- c("#1b9e77", "#d95f02", "#7570b3")
+cluster_colors <- c("1" = "#0072B2","2" = "#009E73","3" = "#E69F00")
+#cluster_colors <- c("1" = "#4A6B7C","2" = "#5A7A5A","3" = "#B8834A")
+
+# site_colors <- tibble(Site = c("JDR", "GBJ", "KNZ", "SHN", "YMR", "WHR", "PRF", "TAL"),
+#                       color = c("#0072B2", "#E69F00", "#CC79A7", "#009E73", "#56B4E9", "#D55E00", "#F0E442", "#999999"))
+# site_colors <- tibble(Site = c("JDR", "GBJ", "KNZ", "SHN", "YMR", "WHR", "PRF", "TAL"),
+#                       color = c("#006475", "#56CFD8", "#613921", "#F2C27B", "#A77652", "#345022", "#5A6C0A", "#83A102"))
+site_colors <- tibble(
+    Site = c("JDR", "GBJ", "KNZ", "SHN", "YMR", "WHR", "PRF", "TAL"),
+    color = c("#006475", "#56CFD8", "#613921", "#F2C27B", "#A77652", "#345022", "#5A6C0A", "#83A102")
+  )
+```
+
+```{r}
+theme_set(
+  theme_bw() +
+  theme(text = element_text(size = 20),          # overall text size
+    legend.text = element_text(size = 20),   # legend entries
+    legend.title = element_text(size = 20),  # legend title
+    axis.title.x = element_text(size = 20, face = "bold"),    # axis titles
+    axis.title.y = element_text(size = 20, face = "bold"),    # axis titles
+    axis.text = element_text(size = 20),     # axis tick labels
+    plot.title = element_text(size = 20, hjust = 0.5, face = "bold"),
+    legend.position = "bottom",
+    plot.tag = element_text(size = 20, face = "bold"),
+    strip.background = element_blank())
+)
+```
+
+# Load Data
+
+```{r}
+
+gpSheds <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Watersheds", quiet = T) |> 
+  filter(watershed %in% c("KNZ", "SHN", "YMR")) |> 
+  st_transform(crs = 4326)
+seSheds <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_SouthEast.gpkg", layer = "Watersheds") |> 
+  st_transform(4326) 
+mwSheds <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_MountainWest.gpkg", layer = "Watersheds") |> 
+  st_transform(4326) |> 
+  filter(watershed != "DRC")
+
+all_sheds <- gpSheds |> 
+  bind_rows(seSheds) |> 
+  bind_rows(mwSheds) |> 
+  rename(Site = watershed) |>
+  st_transform(5070) |> 
+  st_point_on_surface() |>
+  st_transform(4326) |> 
+  mutate(lon = st_coordinates(geom)[, 1],
+         lat = st_coordinates(geom)[, 2]) |>
+  st_drop_geometry()
+
+gpStreams <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Streams", quiet = T) |> 
+  filter(watershed %in% c("KNZ", "SHN", "YMR")) |> 
+  st_transform(crs = 4326)
+seStreams <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_SouthEast.gpkg", layer = "Streams", quiet = T) |> 
+  mutate(length_m = units::drop_units(st_length(geom))) |> 
+  st_transform(4326)
+mwStreams <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_MountainWest.gpkg", layer = "Streams", quiet = T) |> 
+  st_transform(4326) |> 
+  filter(watershed != "DRC")
+
+stream_lengths <- gpStreams |> 
+  bind_rows(seStreams) |> 
+  bind_rows(mwStreams) |> 
+  st_drop_geometry() |> 
+  select(Site = watershed, length_m) |> 
+  group_by(Site) |>
+  summarise(total_length_m = sum(length_m, na.rm = TRUE))
+
+site_meta <- all_sheds |>
+  full_join(stream_lengths) |>
+  full_join(site_colors) |>
+  as_tibble() |>
+  select(Site, color, area_sqkm, total_length_m, lon, lat) |>
+  mutate(Site = fct_reorder(Site, lon),
+         shape = c(1, 0, 12, 2, 3, 8, 6, 11))
+
+rm(gpSheds, gpStreams, seSheds, seStreams, mwSheds, mwStreams, stream_lengths, all_sheds, site_colors, okabeIto, gpSites, distColors)
+```
+
+```{r}
+streamLight <- read_csv(here("Data/streamLight/predLight/all_sites_results.csv")) |> 
+  rename(Site = Site_ID) |> 
+  mutate(
+    Date = as_date(local_time),
+    Site = case_when(
+    Site == "SFM01" ~ "KNZ",
+    Site == "SHM01" ~ "SHN",
+    Site == "ENM01" ~ "YMR",
+    TRUE ~ Site  # keep other values unchanged
+  )) |> 
+    group_by(Site, Date) |>
+  summarise(maxPar = max(PAR_surface, na.rm = TRUE),
+            avgPar = mean(PAR_surface, na.rm = TRUE),
+            .groups = "drop")
+
+modisET <- read_csv(here("Data/ET/MODIS_Daily_ET.csv")) |> 
+  filter(Site != "DRC")
+
+gpDat <- read_csv(here("Data/GP_dailyData.csv")) |>
+  select(-c(minDO.obs, maxDO.obs, avgDO.obs, DO.hyp, DO.amp, probHyp,
+            dayProbConc, nightProbConc, NHR_obs, dPercCon, wetdry_SW,
+            PercWet_1d, dPercWet_1d, ICSL, IntactStreamLength, AlphaCentrality,
+            Harary, upstream_length, percentConnected, PercWet_7d, PercWet_14d,
+            PercWet_30d, PercWet_60d, dPercWet_7d, dPercWet_14d, dPercWet_30d,
+            dPercWet_60d, DOY, DOSat.hyp, cvDO.pctsat, sdDO.pctsat,
+            DOSat.slope, dDOpctsat.amp, dMinDO.pctsat, dayProbSat,
+            nightProbSat, NHR_sat)) |>
+  mutate(Date = as_date(Date)) |>
+  left_join(streamLight, by = c("Site", "Date"))
+
+seDat <- read_csv(here("Data/SE_dailyData.csv")) |>
+  select(-c(minDO.obs, maxDO.obs, avgDO.obs, DO.hyp, DO.amp, probHyp,
+            dayProbConc, nightProbConc, NHR_obs, DOSat.hyp,
+             cvDO.pctsat, sdDO.pctsat,
+            DOSat.slope, dDOpctsat.amp, dMinDO.pctsat, dayProbSat,
+            nightProbSat, NHR_sat)) |>
+  mutate(Date = as_date(Date))
+
+jdrDat <- read_csv(here("Data/JDR_dailyData.csv")) |> 
+  select(-c(minDO.obs, maxDO.obs, avgDO.obs, DO.hyp, DO.amp, probHyp,
+            dayProbConc, nightProbConc, NHR_obs, DOSat.hyp,
+             cvDO.pctsat, sdDO.pctsat,
+            DOSat.slope, dDOpctsat.amp, dMinDO.pctsat, dayProbSat,
+            nightProbSat, NHR_sat)) |>
+  mutate(Date = as_date(Date))
+
+gbjDat <- read_csv(here("Data/GBJ_dailyData.csv")) |> 
+  select(-c(minDO.obs, maxDO.obs, avgDO.obs, DO.hyp, DO.amp, probHyp, 
+            dayProbConc, nightProbConc, NHR_obs, DOSat.hyp,
+             dayProbSat, 
+            nightProbSat, NHR_sat)) |> 
+  mutate(Date = as_date(Date)) 
+
+
+allDat <- gpDat |> 
+  bind_rows(seDat) |> 
+  bind_rows(jdrDat) |> 
+  bind_rows(gbjDat) |> 
+  full_join(modisET) |> 
+  select(-c(excProb, DOSat.exc, minDepth, maxDepth, minQ, maxQ, cvDO.pctsat, DOSat.slope, dDOpctsat.amp, sdDO.pctsat, dMinDO.pctsat)) |> 
+  mutate(waterYear = as.factor(calcWaterYear(Date)),
+         Season = as.factor(get_season(Date)),
+         Date = as.Date(Date),
+         DOY = as.numeric(format(Date, "%j"))
+         ) |> 
+  select(-totalDO) |> 
+    group_by(Site) |> 
+    mutate(excProb = calc_exceedance_prob(Q_1d, rm.zero = T) * 100,
+           DOSat.exc = calc_exceedance_prob(avgDO.pctsat, rm.zero = T)) |> 
+    ungroup() |> 
+  mutate(excProb = case_when(is.na(excProb) ~ 0, T ~ excProb))
+
+## New Alpha centrality
+sticAC <- read_csv(here("Data/STICs/streamDAG_metrics.csv")) |> 
+  rename(Date = date, Site = watershed) |> 
+  filter(Site != "DRC") |> 
+  select(Site, Date, active_upstream_length, active_network_length_m,  percent_network_wet, a_cent, a_cent_weighted) |> 
+  mutate(active_upstream_length = case_when(is.na(active_upstream_length) ~ 0, T~ active_upstream_length),
+         percent_network_wet = case_when(is.na(percent_network_wet) ~ 0, T~ percent_network_wet),
+         active_network_length_m = case_when(is.na(active_network_length_m) ~ 0, T~ active_network_length_m))
+
+allDat <- allDat |> 
+  full_join(sticAC)
+
+# Fill NAs in ASDN with 0 only if between dry periods
+allDat <- allDat |>
+  arrange(Site, Date) |>
+  group_by(Site) |>
+  mutate(
+    prev_non_na = zoo::na.locf(active_network_length_m, na.rm = FALSE),
+    next_non_na = zoo::na.locf(active_network_length_m, fromLast = TRUE, na.rm = FALSE),
+    active_network_length_m =
+      ifelse(
+        is.na(active_network_length_m) &
+          prev_non_na == 0 &
+          next_non_na == 0,
+        0,
+        active_network_length_m
+      )
+  ) |>
+  select(-prev_non_na, -next_non_na) |>
+  ungroup()
+
+# Define the variables you want to calculate rolling averages for
+vars_to_roll <- c("active_upstream_length", "active_network_length_m", 
+                  "percent_network_wet", "a_cent", "a_cent_weighted", "avgPar", "water.temp")
+
+# Define rolling window sizes
+window_sizes <- c(7, 14, 30, 60)
+
+# List of variables to compute rolling means for
+vars <- list(
+ # active_upstream_length = "active_upstream_length", 
+#  active_network_length_m = "active_network_length_m",
+#  percent_network_wet = "percent_network_wet",
+#  a_cent = "a_cent",
+#  a_cent_weighted = "a_cent_weighted",
+  avgPar = "avgPar",
+  water.temp = "water.temp"
+)
+allDat <- allDat |>
+  group_by(Site) |>
+  arrange(Date)
+setDT(allDat)
+# Generate rolling means for each variable and window size
+for (var in names(vars)) {
+  prefix <- vars[[var]]  # Get the appropriate prefix for the variable
+  allDat[, (paste0(prefix, "_", window_sizes, "d")) := 
+              lapply(window_sizes, function(w) frollmean(get(var), n = w, align = "right", na.rm = TRUE)),
+           by = Site]
+}
+
+dailyDat <- allDat |>
+  filter(Date >= "2021-03-26")
+rm(streamLight, gpDat, seDat, gbjDat, jdrDat, modisET, window_sizes, vars)
+
+n_days <- dailyDat |>
+  group_by(Site) |>
+  summarise(
+    n_days_avgDO = sum(!is.na(avgDO.pctsat)),
+    n_days_upstream = sum(!is.na(active_upstream_length)),
+    mean_perc_wet = mean(percent_network_wet, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+site_meta <- site_meta |>
+  mutate(name = case_when(
+    Site %in% c("KNZ", "SHN", "YMR") ~ c("GP-1", "GP-2", "GP-3")[match(Site, c("KNZ", "SHN", "YMR"))],
+    Site %in% c("TAL", "PRF", "WHR") ~ c("EF-1", "EF-2", "EF-3")[match(Site, c("TAL", "PRF", "WHR"))],
+    Site %in% c("GBJ", "JDR") ~ c("ND-1", "ND-2")[match(Site, c("GBJ", "JDR"))],
+    TRUE ~ NA_character_
+  )) |> 
+  mutate(name = factor(name, levels = c("GP-1", "GP-2", "GP-3",
+                                        "EF-1", "EF-2", "EF-3",
+                                        "ND-1", "ND-2")))
+
+site_info <- site_meta |> 
+  left_join(n_days) |> 
+  mutate(n_years = n_days_upstream/365.25,
+         Region = case_when(
+    Site %in% c("KNZ","SHN", "YMR") ~ "Great Plains",
+    Site %in% c("TAL","WHR", "PRF") ~ "Eastern Temperate Forests" ,
+    Site %in% c("GBJ", "JDR") ~ "North American Deserts"
+    )) |> 
+  arrange(name)
+
+total <- site_info |> 
+  summarise(n_days = sum(n_days_upstream))
+
+
+n_stics <- read_csv(here("Data/n_stics.csv")) |> 
+  rename(Site = watershed)
+
+site_info <- site_info |> 
+  left_join(n_stics)
+
+site_info |> 
+  mutate(area_sqkm = case_when(Site == "GBJ" ~ 16.20, T~ area_sqkm)) |> 
+  select(Watershed = name, Region, km2 = area_sqkm, n_days_upstream, n_sites, mean_perc_wet) |>
+  gt() |> 
+  fmt_number(
+    columns = c(km2, mean_perc_wet),
+    decimals = 2
+  ) |> 
+  fmt_number(
+    columns = c(n_days_upstream),
+    decimals = 0
+  ) |> 
+  cols_label(
+    km2 =  "Area ({{km^2}})",
+    n_days_upstream = "# of Days",
+    mean_perc_wet = "Average % Wet",
+    n_sites = "# of STICs"
+  ) |>
+  cols_align(
+    align = "center",
+    columns = -Watershed 
+  ) |> 
+  gtsave(here("Figs/site_info.png"), zoom = 6, vwidth = 2000, vheight = 1200)
+
+```
+
+## Add Name to DailyDat
+
+```{r}
+dailyDat <- dailyDat |> 
+  left_join(site_meta |> select(Site, name))
+```
+
+# Exceedance Probability
+
+```{r}
+#| warning: false
+#| message: false
+
+
+# Discharge Exceedance Prob
+qExcProb <- dailyDat |>
+  ggplot(aes(x = excProb, y = Q_1d, color = name)) +
+  geom_line(na.rm = TRUE, linewidth = 2) +
+  scale_y_continuous(
+    trans = "log10",
+    labels = label_number(big.mark = ",")
+  ) +
+  scale_x_continuous(labels = label_percent(accuracy = 1, scale = 1)) +
+  scale_color_manual(
+    values = setNames(site_meta$color, site_meta$name),
+    breaks = levels(site_meta$name)
+  ) +
+  labs(
+    tag = "A",
+    x = "Discharge Exceedance Probability",
+    y = bquote(bold("Discharge ("*L~s^{-1}*")"))
+  ) +
+  guides(color = guide_legend(title = NULL))
+qExcProb
+
+# DO Exceedance Prob
+doExcProb <- dailyDat |>
+  ggplot(aes(x = DOSat.exc, y = avgDO.pctsat, color = name)) +
+  geom_line(na.rm = TRUE, linewidth = 2) +
+  geom_hline(yintercept = 50, linetype = "dashed", color = "grey60", linewidth = 1.5) +
+  scale_color_manual(
+    values = setNames(site_meta$color, site_meta$name),
+    breaks = levels(site_meta$name)
+  ) +
+  scale_x_continuous(labels = label_percent(accuracy = 1, scale = 100)) +
+  scale_y_continuous(
+    breaks = c(0, 25, 50, 75, 100),
+  ) +
+  labs(
+    tag = "B",
+    x = expression(bold("DO"["% Sat"] ~ "Exceedance Probability")),
+    y = expression(bold("\nDaily Mean DO"["% Sat"]))
+  ) +
+  guides(color = guide_legend(title = NULL))
+doExcProb
+ggsave(filename = "doExcProb.png",plot = doExcProb, path = here("Figs/"),device = "png",width = 20,height = 20,units = "cm", dpi = 600)
+
+
+# Extract the legend from one of the plots
+legend <- get_legend(
+  qExcProb + 
+    guides(
+      color = guide_legend(
+        title = NULL,
+        nrow = 1,      # put all items in one row
+        byrow = TRUE
+      )
+    ) +
+     theme(
+      text = element_text(size = 20),          # overall text size
+      legend.text = element_text(size = 20),   # legend entries
+      legend.position = "bottom",
+      legend.box = "horizontal",
+      legend.justification = "center",
+      legend.margin = ggplot2::margin(t = 0, r = 0, b = 0, l = 0),
+      legend.box.margin = ggplot2::margin(0, 0, 0, 0)
+    )
+)
+plot(legend)
+# Remove legends from the individual plots
+qExcProb_noleg <- qExcProb + theme(legend.position = "none")
+doExcProb_noleg <- doExcProb + theme(legend.position = "none")
+                             
+# Combine the two plots
+plots <- plot_grid(
+  qExcProb_noleg, doExcProb_noleg,
+  #labels = c("A", "B"),
+  ncol = 2,
+  align = "hv",
+  axis = "lb"
+)
+
+# Add the shared legend underneath
+combined_plot <- plot_grid(
+  plots, legend,
+  ncol = 1,
+  align = "v",
+  rel_heights = c(1, 0.1),  # adjust space for the legend,
+  label_size = 0 
+)
+
+combined_plot
+ggsave(filename = "excProb.png",plot = combined_plot, path = here("Figs/"),device = "png",width = 40,height = 20,units = "cm", dpi = 600)
+
+#rm(doExcProb, qExcProb, combined_plot)
+```
+
+## Equation Table
+
+```{r}
+# Define the table data
+eq_table <- tibble(
+  Metric = c(
+    "Mean DO",
+    "Minimum DO",
+    "Maximum DO",
+    "Amplitude",
+    "Exceedance probability",
+    "Probability of hypoxia",
+    "Night hypoxia ratio"
+  ),
+  
+  Equation = c(
+    # Daily mean
+    "$$\\overline{DO}_{\\text{day}} = \\frac{1}{n_d} \\sum_{t=1}^{n_d} DO_{t,d}$$",
+    # Daily min
+    "$$DO_{\\min,d} = \\min_t(DO_{t,d})$$",
+    # Daily max
+    "$$DO_{\\max,d} = \\max_t(DO_{t,d})$$",
+    # Daily amplitude
+    "$$DO_{\\text{amp},d} = \\max_t(DO_{t,d}) - \\min_t(DO_{t,d})$$",
+    # Exceedance probability
+    "$$P_{\\text{exc},d} = \\frac{r_d}{N + 1}$$",
+    # Daily probability of hypoxia
+    "$$P_{\\text{hypoxia},d} = \\frac{1}{n_d} \\sum_{t=1}^{n_d}
+      \\begin{cases}
+        1, & \\text{if } DO_{t,d} < DO_{\\text{hyp}} \\\\
+        0, & \\text{otherwise}
+      \\end{cases}$$",
+    # Night hypoxia ratio
+    "$$R_{\\text{hypoxia},d} = \\frac{P_{\\text{hypoxia, night},d}}{P_{\\text{hypoxia, day},d}}$$"
+  ),
+  Temporal_Scale = c(
+    "Daily",
+    "Daily",
+    "Daily",
+    "Daily",
+    "Across Days",
+    "Daily",
+    "Daily"
+  )
+)
+
+# Build the gt table
+footnote_text <- paste0(
+  "Table 2. $DO_{t,d}$ is the dissolved oxygen observation at time $t$ on day $d$; $n_d$ is the number of valid observations per day; $\\overline{DO}_d$ is the daily mean DO; $r_d$ is the rank of $\\overline{DO}_d$ (1 = highest); $N$ is the total number of days; $DO_{\\text{hyp}}$ is the hypoxia threshold; and $P_{\\text{hypoxia, night},d}$ and $P_{\\text{hypoxia, day},d}$ are the daily probabilities of hypoxia during nighttime and daytime, respectively."
+)
+
+do_eq_table <- eq_table |>
+  select(-Temporal_Scale) |> 
+  gt() |>
+  fmt_markdown(columns = "Equation") |>
+  cols_label(
+    Metric = "Metric",
+    Equation = "Equation",
+  ) |>
+  #tab_header(title = "Equations for Daily Dissolved Oxygen Metrics") |>
+  #tab_source_note(source_note = md(footnote_text)) |> 
+  # tab_options(
+  #   data_row.padding = px(1),             # tighten vertical spacing
+  #   column_labels.padding = px(2),        # tighten header padding
+  #   table_body.hlines.width = px(0.5),    # thin horizontal lines
+  #   table_body.border.bottom.width = px(0.5),
+  # ) |>
+  cols_align(align = "left", columns = Metric) |>
+  cols_align(align = "center", columns = Equation) #|> 
+  #tab_source_note(source_note = md(footnote_text)) |> 
+  #   tab_style(
+  #   style = cell_text(weight = "bold"),    # 👈 bold font weight
+  #   locations = cells_column_labels(columns = c(Metric, Equation))
+  # ) 
+do_eq_table |> 
+  gtsave(here("Figs/do_metrics_eqn.png"))
+
+
+do_eq_rtf <- do_eq_table
+  
+do_eq_table |> 
+  gtsave(filename = here("Figs/do_metrics_eqn.rtf"))
+```
+
+# ASDN
+
+```{r}
+p <- dailyDat |>
+  mutate(name = factor(name, levels = levels(site_meta$name))) |>
+  ggplot(aes(
+    x = Date,
+    y = active_network_length_m / 1000,
+    color = percent_network_wet
+  )) +
+  geom_point(size = 3, alpha = 0.8) +
+  facet_wrap(~name, scales = "free_y", ncol = 2) +
+  scale_x_date(labels = date_format("%b '%y")) +
+  scale_color_viridis_c(option = "plasma", na.value = "grey70", direction = -1) +
+  labs(
+    x = "",
+    y = "ASDN (km)",
+    color = "% Network Wet"
+  ) 
+p
+ggsave(filename = "ASDN.png", plot = p, path = here("Figs/Misc/"), device = "png", width = 40, height = 20, units = "cm", dpi = 600)
+
+p <- dailyDat |>
+  mutate(name = factor(name, levels = levels(site_meta$name))) |>
+  group_by(Site) |> 
+  mutate(asdn = (active_network_length_m / max(active_network_length_m, na.rm = TRUE)) * 100) |> 
+  ungroup() |> 
+  ggplot(aes(x = percent_network_wet, y = asdn)) +
+  geom_point(aes(color = name), alpha = 0.7, size = 2.5, na.rm = TRUE) +
+  scale_color_manual(
+    values = setNames(site_meta$color, site_meta$name),
+    breaks = levels(site_meta$name)
+  ) +
+  scale_x_continuous(labels = label_percent(accuracy = 1, scale = 1)) +
+  scale_y_continuous(labels = label_percent(accuracy = 1, scale = 1)) +
+  facet_wrap(~name, scales = "fixed", ncol = 2) +
+  labs(x = "Network Wet", y = "ASDN", color = "Watershed")
+p
+ggsave(filename = "percWet_ASDN.png", plot = p, path = here("Figs/Misc/"), device = "png", width = 40, height = 20, units = "cm", dpi = 600)
+
+
+dailyDat |>
+  mutate(name = factor(name, levels = levels(site_meta$name))) |>
+  group_by(Site) |> 
+  mutate(asdn = (active_network_length_m / max(active_network_length_m, na.rm = TRUE)) * 100) |> 
+  ungroup() |> 
+  ggplot(aes(
+    x = Date,
+    y =  asdn,
+    color = a_cent_weighted
+  )) +
+  geom_point(size = 3, alpha = 0.8) +
+  facet_wrap(~name, scales = "free_y", ncol = 2) +
+  scale_x_date(labels = date_format("%b '%y")) +
+  scale_color_viridis_c(option = "plasma", na.value = "grey70", direction = -1) +
+  labs(
+    x = "",
+    y = "ASDN (%)",
+    color = "Alpha Centrality (Weighted)"
+  ) -> p
+p
+ggsave(filename = "a_cent_asdn.png", plot = p, path = here("Figs/Misc/"), device = "png", width = 40, height = 20, units = "cm", dpi = 600)
+
+dailyDat |>
+  mutate(name = factor(name, levels = levels(site_meta$name))) |>
+  group_by(Site) |> 
+  mutate(asdn = (active_network_length_m / max(active_network_length_m, na.rm = TRUE)) * 100) |> 
+  ungroup() |> 
+  ggplot(aes(
+    x = Date,
+    y =  a_cent_weighted,
+    color = percent_network_wet,
+  )) +
+  geom_point(size = 3, alpha = 0.8) +
+  facet_wrap(~name, scales = "free_y", ncol = 2) +
+  scale_x_date(labels = date_format("%b '%y")) +
+  scale_color_viridis_c(option = "plasma", na.value = "grey70", direction = -1) +
+  labs(
+    x = "",
+    y = "Alpha Centrality (Weighted)",
+    color = "Network Wet"
+  ) -> p
+p
+ggsave(filename = "a_cent_perc_wet.png", plot = p, path = here("Figs/Misc/"), device = "png", width = 40, height = 20, units = "cm", dpi = 600)
+
+```
+
+# DO Metrics PCA
+
+```{r}
+var_labels <- c(
+  avgDO.pctsat   = "Mean",
+  DOpctsat.amp   = "Amplitude",
+  DOSat.exc      = "Exceedence Probability",
+  probHypSat     = "Probability of Hypoxia",
+  minDO.pctsat   = "Min",
+  maxDO.pctsat   = "Max"
+)
+
+# Prepare PCA data
+pca_data <- dailyDat |>
+  select(name, Date, avgDO.pctsat, DOpctsat.amp, DOSat.exc, probHypSat, minDO.pctsat, maxDO.pctsat) |>
+  mutate(probHypSat = case_when(is.nan(probHypSat) ~ 0, TRUE ~ probHypSat))
+
+# Create and fit PCA recipe
+pca_recipe <- recipe(~., data = pca_data) |>
+  update_role(name, Date, new_role = "Id") |>
+  step_naomit(all_predictors()) |>
+  step_normalize(all_predictors()) |>
+  step_pca(all_predictors(), id = "PCA")
+
+do_pca <- prep(pca_recipe)
+
+# Extract PCA loadings for biplot (PC1–PC3, wide form)
+loadings <- do_pca |>
+  tidy(id = "PCA") |>
+  filter(component %in% c("PC1", "PC2", "PC3")) |>
+  pivot_wider(names_from = component, values_from = value) |>
+  mutate(var_label = recode(terms, !!!var_labels))
+
+# Calculate arrow scale for biplot
+pca_scores <- juice(do_pca)
+
+arrow_scale <- min(
+  (max(pca_scores$PC1) - min(pca_scores$PC1) / (max(pca_scores$PC1) - min(pca_scores$PC1))),
+  (max(pca_scores$PC2) - min(pca_scores$PC2) / (max(pca_scores$PC2) - min(pca_scores$PC2)))
+) * 2
+
+loadings <- loadings |>
+  mutate(across(where(is.numeric), ~ . * arrow_scale))
+
+# Extract variance explained
+var_explained <- do_pca |>
+  tidy(id = "PCA", type = "variance") |>
+  filter(terms == "percent variance") |>
+  arrange(component)
+
+eigvals <- do_pca |>
+  tidy(id = "PCA", type = "variance") |>
+  filter(terms == "variance") |>
+  mutate(sig = value > 1)
+
+pc1_label <- paste0(
+  "PC1 (",
+  round(var_explained |> filter(component == 1) |> pull(value), 1),
+  "%)"
+)
+
+pc2_label <- paste0(
+  "PC2 (",
+  round(var_explained |> filter(component == 2) |> pull(value), 1),
+  "%)"
+)
+
+# -------------------------------------------------------------------
+# NEW: Table of eigenvalues, % explained, and loadings for PCs with
+#      eigenvalues > 1
+# -------------------------------------------------------------------
+
+# Combine eigenvalues and percent variance
+pc_table <- eigvals |>
+  select(component, eigenvalue = value, sig) |>
+  left_join(
+    var_explained |>
+      select(component, pct_explained = value),
+    by = "component"
+  ) |>
+  filter(eigenvalue > 1)
+
+# Long table: one row per variable per retained PC
+pca_table <- do_pca |>
+  tidy(id = "PCA") |>
+  # component is "PC1", "PC2", ...; make numeric to join to pc_table
+  mutate(component_num = as.integer(gsub("PC", "", component))) |>
+  inner_join(pc_table, by = c("component_num" = "component")) |>
+  mutate(
+    var_label = recode(terms, !!!var_labels)
+  ) |>
+  select(
+    component,                 # "PC1", "PC2", ...
+    eigenvalue,
+    pct_explained,
+    term = terms,
+    var_label,
+    loading = value
+  ) |>
+  arrange(component, desc(abs(loading)))
+
+# pca_table now has eigenvalues, % explained and loadings
+# for all PCs with eigenvalues > 1.
+# -------------------------------------------------------------------
+
+# Scree plot
+do_pca |>
+  tidy(id = "PCA", type = "variance") |>
+  filter(terms == "percent variance") |>
+  ggplot(aes(x = factor(component), y = value)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = paste0(round(value, 1), "%")),
+            vjust = -0.5, size = 3) +
+  labs(
+    title = "Scree Plot",
+    x = "Principal Component",
+    y = "Percent Variance Explained"
+  )
+
+# Variable contribution plot
+do_pca |>
+  tidy(id = "PCA") |>
+  mutate(
+    Direction = if_else(value > 0, "Positive", "Negative"),
+    terms = tidytext::reorder_within(terms, abs(value), component)
+  ) |>
+  filter(component %in% c("PC1", "PC2", "PC3", "PC4")) |>
+  ggplot(aes(abs(value), terms, fill = Direction)) +
+  geom_col() +
+  facet_wrap(~component, scales = "free_y", ncol = 2) +
+  tidytext::scale_y_reordered() +
+  scale_fill_manual(values = c("Negative" = "#D55E00", "Positive" = "#56B4E9")) +
+  labs(
+    x = "Absolute Value of Contribution",
+    y = NULL,
+    fill = "Direction"
+  ) +
+  theme_few() +
+  theme(legend.position = "bottom")
+
+# Create PCA biplot
+do_pca_plt <- pca_scores |>
+  ggplot(aes(x = PC1, y = PC2)) +
+  geom_point(aes(fill = name, shape = name, color = name),
+             size = 3, alpha = 1, stroke = 0.3) +
+  stat_ellipse(aes(color = name),
+               geom = "polygon", level = 0.95,
+               alpha = 0.2, fill = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  # Add loading arrows
+  geom_segment(
+    data = loadings,
+    aes(x = 0, y = 0, xend = PC1, yend = PC2),
+    arrow = arrow(length = unit(0.2, "cm")),
+    color = "black"
+  ) +
+  geom_text_repel(
+    data = loadings,
+    aes(x = PC1 * 1.1, y = PC2 * 1.1, label = var_label),
+    size = 5,
+    direction = "both"
+  ) +
+  scale_color_manual(
+    values = setNames(site_meta$color, site_meta$name),
+    breaks = levels(site_meta$name)
+  ) +
+  scale_fill_manual(
+    values = setNames(site_meta$color, site_meta$name),
+    breaks = levels(site_meta$name)
+  ) +
+  scale_shape_manual(
+    values = setNames(site_meta$shape, site_meta$name),
+    breaks = levels(site_meta$name)
+  ) +
+  labs(
+    title = expression(paste("Daily DO"["% Sat"], " Metrics")),
+    x = pc1_label,
+    y = pc2_label
+  )
+
+do_pca_plt
+# Save main PCA plot
+ggsave(filename = "doPCA.png", plot = do_pca_plt, path = here("Figs/"), device = "png", width = 20, height = 20, units = "cm", dpi = 600)
+
+```
+
+```{r}
+## 1. Get eigenvalues and % variance for PC1–PC3
+pca_var_info <- do_pca |>
+  tidy(id = "PCA", type = "variance") |>
+  filter(
+    component %in% c("1", "2"),
+    terms %in% c("variance", "percent variance")
+  ) |>
+  select(component, terms, value) |>
+  pivot_wider(names_from = terms, values_from = value) |>
+  mutate(
+    eigenvalue = variance,
+    pct        = `percent variance`,
+    component = case_when(component == 1~"PC1", component == 2~"PC2", TRUE~NA)
+  )
+
+## 2. Build pretty labels like
+pc_labels <- pca_var_info |> 
+  arrange(component) |> 
+  mutate(label = sprintf( "%s\n(λ = %.2f, %.1f%%)", component, eigenvalue, pct )) |> 
+  pull(label)
+# pc_labels will be a character vector of length 3 # in order: PC1, PC2
+## 3. Your loadings table (as before) 
+pca_loadings_table <- loadings |> 
+  select(Variable = var_label, PC1, PC2) |> 
+  mutate( across(c(PC1, PC2), ~ round(.x, 2)) ) 
+## 4. Replace the PC column names with the new labels 
+names(pca_loadings_table)[2:3] <- pc_labels 
+
+pca_table_png <- pca_loadings_table |> 
+  gt() |>
+  tab_header(title = "PCA Loadings",) |> 
+  fmt_number(columns = everything(), decimals = 2) |> 
+  cols_align(align = "center")
+
+
+
+pca_table_png |> 
+  gtsave(here("Figs/Supplement/pca_table.png"))
+pca_table_png
+```
+
+```{r}
+library(plotly)
+
+
+# Build color vector in Site level order
+site_colors <- site_meta |>
+  arrange(fct_relevel(name, levels(site_meta$name))) |>
+  pull(color) |>
+  unname()
+
+# Rescale loadings for 3D arrows
+arrow_scale_3d <- min(
+  (max(pca_scores$PC1) - min(pca_scores$PC1)) / (max(loadings$PC1) - min(loadings$PC1)),
+  (max(pca_scores$PC2) - min(pca_scores$PC2)) / (max(loadings$PC2) - min(loadings$PC2)),
+  (max(pca_scores$PC3) - min(pca_scores$PC3)) / (max(loadings$PC3) - min(loadings$PC3))
+) * 1.5
+
+loadings_3d <- loadings |>
+  mutate(across(starts_with("PC"), ~ . * arrow_scale_3d))
+
+loading_lines <- loadings_3d |>
+  rowwise() |>
+  do({
+    data.frame(
+      var_label = .$var_label,
+      x = c(0, .$PC1),
+      y = c(0, .$PC2),
+      z = c(0, .$PC3)
+    )
+  }) |>
+  ungroup()
+
+# 3D PCA plot with forcats-based factor order & colors
+plot_ly() |>
+  add_trace(
+    data = pca_scores,
+    x = ~PC1, y = ~PC2, z = ~PC3,
+    type = "scatter3d", mode = "markers",
+    color = ~fct_relevel(name, levels(site_meta$name), after = 0), colors = site_colors,
+    marker = list(size = 4, opacity = 0.7)
+  ) |>
+  add_trace(
+    data = loading_lines,
+    x = ~x, y = ~y, z = ~z,
+    type = "scatter3d", mode = "lines",
+    line = list(color = "black", width = 3),
+    split = ~var_label,
+    showlegend = FALSE
+  ) |>
+  add_trace(
+    data = loadings_3d,
+    x = ~PC1, y = ~PC2, z = ~PC3,
+    type = "scatter3d", mode = "text",
+    text = ~var_label,
+    textposition = "top center",
+    showlegend = FALSE
+  ) |>
+  layout(
+    legend = list(title = list(text = "")),
+    scene = list(
+      xaxis = list(title = paste0("PC1 (", round(var_explained |> filter(component == 1) |> pull(value), 1), "%)")),
+      yaxis = list(title = paste0("PC2 (", round(var_explained |> filter(component == 2) |> pull(value), 1), "%)")),
+      zaxis = list(title = paste0("PC3 (", round(var_explained |> filter(component == 3) |> pull(value), 1), "%)"))
+    ),
+    title = "3D PCA of Daily DO Metrics"
+  )
+```
+
+# K-Means
+
+## Optimal Number of Cluster Selection
+
+```{r}
+# nbclust_res <- NbClust::NbClust(data = pca_scores |> select(PC1:PC2) |> as.matrix(),
+#                                   distance = "euclidean",
+#                                   min.nc = 2, max.nc = 9,
+#                                   method = "kmeans",
+#                                   index = "all")
+# 
+# majority_rule <- nbclust_res |>
+#   (\(x) {
+#     tbl <- table(x$Best.nc["Number_clusters", ])
+#     as.numeric(names(tbl)[which.max(tbl)])
+#   })()
+# 
+# # elbow method
+# res_ch <- NbClust::NbClust(
+#   data = pca_scores |> select(PC1:PC2) |> as.matrix(),
+#   distance = "euclidean",
+#   min.nc = 3,
+#   max.nc = 15,
+#   method = "kmeans",
+#   index = "ch"
+# ) 
+# # Silhouette index
+# res_sil <- NbClust::NbClust(
+#   data = pca_scores |> select(PC1:PC2) |> as.matrix(),
+#   distance = "euclidean",
+#   min.nc = 3,
+#   max.nc = 15,
+#   method = "kmeans",
+#   index = "silhouette"
+# )
+# majority_rule <- tibble(
+#   method = c("Elbow", "Silhouette"),
+#   num_clust = c(res_ch$Best.nc[["Number_clusters"]], res_sil$Best.nc[["Number_clusters"]])) |>
+#   (\(df){floor(mean(df$num_clust))})()
+majority_rule <- 3
+```
+
+```{r}
+#K-means clustering
+kmeans_result <- pca_scores |> 
+  select(PC1:PC2) |> 
+  as.matrix() |>
+  eclust(
+    FUNcluster = "kmeans", # Use K-means clustering
+    k = majority_rule, # Number of clusters
+    nstart = 25, # Number of random starts for K-means
+    graph = F,
+    nboot = 500
+  )
+pca_scores <- pca_scores |>
+  mutate(Cluster = as_factor(kmeans_result$cluster)) |> 
+  left_join(dailyDat |> select(name, Date, avgDO.pctsat), by = c("name", "Date")) |>
+  group_by(Cluster) |>
+  mutate(cluster_mean_DO = mean(avgDO.pctsat, na.rm = TRUE)) |>
+  ungroup() |>
+  mutate(Cluster = as_factor(dense_rank(desc(cluster_mean_DO)))) |>
+  select(-cluster_mean_DO)
+
+#Add cluster information back to the original dataset
+clustered_dat <- dailyDat |>
+  left_join(pca_scores |> select(name, Date, Cluster), by = c("name", "Date")) |>
+  mutate(name = fct_relevel(name, levels(site_meta$name))) |> 
+  write_csv(here("Data/rf_data.csv"))
+```
+
+## Plot K-Means
+
+```{r}
+# Summary statistics by cluster
+cluster_summary <- clustered_dat |>
+  drop_na(Cluster) |> 
+  group_by(Cluster) |>
+  summarise(
+    n_sites = n_distinct(Site),
+    n_observations = n(),
+    avg_DO_pctsat = mean(avgDO.pctsat, na.rm = TRUE),
+    avg_DO_amp = mean(DOpctsat.amp, na.rm = TRUE),
+    avg_DO_exc = mean(DOSat.exc, na.rm = TRUE),
+    avg_ProbHyp = mean(probHypSat, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cli::cli_inform("Cluster summary statistics:")
+print(cluster_summary)
+
+kmeans_plt <- ggplot(pca_scores, aes(x = PC1, y = PC2)) +
+  geom_point(aes(fill = Cluster, shape = name, color = Cluster), size = 3, alpha = 0.6, stroke = 0.3) +
+  stat_ellipse(aes(color = Cluster), geom = "polygon", level = 0.95, alpha = 0.2, fill = NA) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  # Add loading arrows
+  geom_segment(data = loadings, 
+               aes(x = 0, y = 0, xend = PC1, yend = PC2),
+               arrow = arrow(length = unit(0.2, "cm")), 
+               color = "black") +
+  # Use ggrepel for smart label positioning
+  geom_text_repel(data = loadings, 
+                  aes(x = PC1 * 1.1, y = PC2 * 1.1, label = var_label),
+                  size = 5, 
+                  direction = "both") +
+  scale_color_manual(values = cluster_colors) +
+  scale_fill_manual(values = cluster_colors) +
+  #scale_shape(solid = FALSE) +
+  scale_shape_manual(
+    values = setNames(site_meta$shape, site_meta$name),
+    breaks = levels(site_meta$name)
+    ) +
+  labs(
+    title = "DO Metrics Clustered by K-Means",
+    x = pc1_label, 
+    y = pc2_label,
+    shape = "Watershed",
+    color = "Cluster",
+    fill = "Cluster"
+  ) +
+  theme(legend.box = "vertical")
+kmeans_plt
+# Save the plot
+ggsave(filename = "kmeansPCA.png", plot = kmeans_plt, path = here("Figs/"), device = "png", width = 20, height = 20, units = "cm", dpi = "retina")
+```
+
+```{r}
+plot_ly() |>
+  # PCA scores as points
+  add_trace(
+    data = pca_scores,
+    x = ~PC1, y = ~PC2, z = ~PC3,
+    type = "scatter3d", mode = "markers",
+    color = ~Cluster, colors = cluster_colors,
+    marker = list(size = 4, opacity = 0.7)
+  ) |>
+  add_trace(
+    data = loading_lines,
+    x = ~x, y = ~y, z = ~z,
+    type = "scatter3d", mode = "lines",
+    line = list(color = "black", width = 3),
+    split = ~var_label,
+    showlegend = FALSE
+  ) |>
+  # Add loading labels at arrow tips
+  add_trace(
+    data = loadings_3d,
+    x = ~PC1, y = ~PC2, z = ~PC3,
+    type = "scatter3d", mode = "text",
+    text = ~var_label,
+    textposition = "top center",
+    showlegend = FALSE
+  ) |>
+  layout(
+    scene = list(
+      xaxis = list(title = paste0("PC1 (", round(var_explained |> filter(component == 1) |> pull(value), 1), "%)")),
+      yaxis = list(title = paste0("PC2 (", round(var_explained |> filter(component == 2) |> pull(value), 1), "%)")),
+      zaxis = list(title = paste0("PC3 (", round(var_explained |> filter(component == 3) |> pull(value), 1), "%)"))
+    ),
+    title = "3D PCA of Daily DO Metrics"
+  )
+rm(arrow_scale, arrow_scale_3d, pc1_label, pc2_label, loading_lines, loadings_3d, loadings)
+```
+
+```{r}
+do_metrics <- c(
+  "avgDO.pctsat" = "Avg.",
+  "DOpctsat.amp" = "Amplitude",
+  "DOSat.exc" = "Exceedence\nProbability",
+  "probHypSat" = "Probability of\nHypoxia",
+  "minDO.pctsat" = "Min",
+  "maxDO.pctsat" = "Max" 
+)
+# Reshape data to long format for faceting
+metrics <- c("avgDO.pctsat", "DOpctsat.amp", "DOSat.exc", "probHypSat", "minDO.pctsat", "maxDO.pctsat")
+
+plot_data <- clustered_dat |>
+  filter(!is.na(Cluster)) |> 
+  select(name, Cluster, all_of(names(do_metrics))) |>
+  pivot_longer(cols = all_of(names(do_metrics)), 
+               names_to = "Metric", 
+               values_to = "Value") |> 
+  mutate(Metric = recode(Metric, !!!do_metrics))
+
+# Create faceted plot
+ggplot(plot_data, aes(x = Cluster, y = Value, fill = Cluster)) +
+  geom_boxplot(outliers = FALSE) +
+  scale_fill_manual(values = cluster_colors) +
+  scale_color_manual(values = cluster_colors) +
+  geom_jitter(alpha = 0.1, aes(color = Cluster),
+              position = position_jitterdodge(jitter.width = 0.5, dodge.width = 0.75)) +
+  facet_wrap(~ Metric, ncol = 3, scales = "free") +
+  labs(title = "DO Metrics by Cluster",
+       y = "Value",
+       x = "Cluster") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        strip.text = element_text(size = 12, face = "bold"))
+
+# Create faceted plot
+site_cluster_plt <- plot_data |> 
+  ggplot(aes(x = name, y = Value, fill = Cluster)) +
+  geom_boxplot(outliers = FALSE) +
+  scale_fill_manual(values = cluster_colors) +
+  scale_color_manual(values = cluster_colors) +
+  geom_jitter(alpha = 0.1, aes(color = Cluster),
+              position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75)) +
+  facet_wrap(~ Metric, ncol = 3, scales = "free") +
+  labs(title = "DO Metrics by Cluster",
+       y = "Value",
+       x = "") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+site_cluster_plt
+ggsave(filename = "site_cluster_metric.png", plot = site_cluster_plt, path = here("Figs/Supplement"), device = "png", width = 40, height = 20, units = "cm", dpi = "retina")
+
+```
+
+# K-Means Validation
+
+```{r}
+library(vegan)
+# MRPP Validation
+mrpp_data <- pca_scores |> select(PC1:PC2) |> as.matrix()
+
+# Run MRPP test
+mrpp_result <- mrpp(
+  dat = mrpp_data,
+  grouping = pca_scores$Cluster,
+  permutations = 1000, 
+  distance = "euclidean"
+)
+
+# Group by Site instead of clusters
+site_mrpp <- mrpp(
+  dat = mrpp_data,
+  grouping = pca_scores$name, 
+  permutations = 1000,
+  distance = "euclidean"
+)
+
+# Display results
+cli::cli_inform(c(
+  "v" = "MRPP Cluster Validation Results:",
+  " " = "",
+  "i" = "Number of clusters: {.val {majority_rule}}",
+  "i" = "A-statistic: {.val {round(mrpp_result$A, 4)}}",
+  "i" = "P-value: {.val {round(mrpp_result$Pvalue, 4)}}",
+  "i" = "Delta (observed): {.val {round(mrpp_result$delta, 4)}}",
+  "i" = "Expected delta: {.val {round(mrpp_result$E.delta, 4)}}"
+))
+
+# Interpretation
+if (mrpp_result$Pvalue < 0.05) {
+  if (mrpp_result$A > 0.3) {
+    cli::cli_inform(c("v" = "Interpretation: {.strong STRONG} evidence of meaningful cluster separation"))
+  } else if (mrpp_result$A > 0.1) {
+    cli::cli_inform(c("v" = "Interpretation: {.strong MODERATE} evidence of meaningful cluster separation"))
+  } else if (mrpp_result$A > 0.05) {
+    cli::cli_inform(c("!" = "Interpretation: {.strong WEAK} but significant cluster separation"))
+  } else {
+    cli::cli_warn(c("!" = "Interpretation: {.strong SIGNIFICANT} but very weak cluster separation"))
+  }
+} else {
+  cli::cli_warn(c("x" = "Interpretation: {.strong NO} significant evidence of cluster separation"))
+}
+
+cli::cli_inform(c(
+  "i" = "Testing Site Effect:",
+  "i" = "Site-based A-statistic: {.val {round(site_mrpp$A, 4)}}",
+  "i" = "Site-based P-value: {.val {round(site_mrpp$Pvalue, 4)}}",
+  " " = "",
+  "i" = "Cluster-based A-statistic: {.val {round(mrpp_result$A, 4)}}",
+  "i" = "Cluster-based P-value: {.val {round(mrpp_result$Pvalue, 4)}}"
+))
+
+# Compare effect sizes
+if (mrpp_result$A > site_mrpp$A) {
+  cli::cli_inform(c("v" = "Clusters explain MORE variance than sites alone"))
+} else {
+  cli::cli_inform(c("!" = "Sites may be driving the clustering patterns"))
+}
+
+```
+
+### Cluster Time-series
+
+```{r}
+doDates <- clustered_dat |>
+ # filter(Site %in% c("KNZ", "SHN", "YMR")) |> 
+  mutate(Year = year(Date)) |> 
+  filter(!is.na(avgDO.pctsat)) |>
+  group_by(name, Year) |>
+  summarise(
+    first_date = min(Date),
+    last_date = max(Date),
+    .groups = "drop"
+  ) |> 
+  mutate(WinterStart_preY = as.Date(paste0(as.integer(as.character(Year))-1, "-12-01")),
+         WinterStart = as.Date(paste0(as.integer(as.character(Year)), "-12-01"))) |> 
+  mutate(WinterStart = case_when(name == "GP-3" & Year == "2021"~ as_date("2021-12-20"), T~WinterStart),
+         WinterStart_preY = case_when(name == "GP-3" & Year == "2022"~ as_date("2021-12-20"), T~WinterStart_preY)) |> 
+  mutate(WinterStart_preY = case_when(name == "GP-2" & Year == "2023" ~ NA, T~WinterStart_preY))
+
+
+# Create separate data frame for the SHN pre-first-date grey box
+preFirstDate_SHN <- doDates |>
+  filter(name == "GP-2") |>
+  mutate(xmin = as.Date("2021-06-01"),  # or your actual xlim min
+         xmax = first_date,
+         ymin = -Inf,
+         ymax = Inf) |> 
+  filter(Year == "2023")
+
+
+# Create the plot
+clustered_dat |> 
+  drop_na(Cluster) |> 
+  ggplot(aes(x = Date, y = avgDO.pctsat, color = Cluster)) +
+  geom_point(size = 3, alpha = 0.8) +
+  facet_wrap(~name, scales = "free_y", ncol = 1) +
+  scale_color_manual(values = cluster_colors, name = "Cluster") +
+  # geom_rect(data = doDates,
+  #           aes(xmin = WinterStart_preY, xmax = first_date, ymin = -Inf, ymax = Inf),
+  #           inherit.aes = FALSE,
+  #           fill = "#42d4f4", alpha = 0.2) +
+  # geom_rect(data = doDates,
+  #           aes(xmin = last_date, xmax = WinterStart, ymin = -Inf, ymax = Inf),
+  #           inherit.aes = FALSE,
+  #           fill = "#9A6324", alpha = 0.2) +
+  # geom_rect(data = preFirstDate_SHN,
+  #         aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+  #         inherit.aes = FALSE,
+  #         fill = "grey5", alpha = 0.2) +
+  ylim(0,100)+
+  scale_x_date(labels = date_format("%b '%y")) +
+  xlim(as_date("2021-06-01"), as_date("2024-12-01")) +
+  labs(
+  x = "",
+  y = expression("Daily Average DO"["% Sat"])
+  ) +
+  theme(axis.text = element_text(size = 15)) -> p 
+p
+ggsave(filename = "Average.png", plot = p, path = here("Figs/ClusterTimeseries"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = "retina")
+
+doDates <- doDates |> 
+  filter(Year == "2024") |> 
+  mutate(WinterStart_preY = as_date("2024-01-01"))
+
+clustered_dat |> 
+  filter(year(Date) == 2024) |> 
+  filter(!(name == "EF-1" & Date == as_date("2024-01-01"))) |> 
+  ggplot(aes(x = Date)) +
+  geom_point(aes(y = avgDO.pctsat, color = Cluster), size = 3, alpha = 0.8) +
+  facet_wrap(~name, scales = "free_y", ncol = 1) +
+  geom_rect(data = doDates,
+            aes(xmin = WinterStart_preY, xmax = first_date, ymin = -Inf, ymax = Inf),
+            inherit.aes = FALSE,
+            fill = "#42d4f4", alpha = 0.2) +
+  geom_rect(data = doDates,
+            aes(xmin = last_date, xmax = WinterStart, ymin = -Inf, ymax = Inf),
+            inherit.aes = FALSE,
+            fill = "#9A6324", alpha = 0.2) +
+  scale_color_manual(values = cluster_colors, name = "Cluster", na.translate = FALSE) +
+  scale_x_date(labels = date_format("%b"), breaks = "2 months") +
+  ylim(0,100)+
+  xlim(as_date("2024-01-01"), as_date("2024-12-01")) +
+  labs(x = "", y = expression("Daily Average DO"["% Sat"])) +
+  theme(axis.text = element_text(size = 15)) -> p 
+p
+ggsave(filename = "Average_2024.png", plot = p, path = here("Figs/ClusterTimeseries"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = "retina")
+
+clustered_dat |>
+  filter(!(name == "EF-1" & Date == as_date("2024-01-01"))) |> 
+  filter(year(Date) == 2024) |> 
+  ggplot(aes(x = Date)) +
+  geom_point(aes(y = avgDO.pctsat, color = Cluster), size = 3, alpha = 0.8) +
+  geom_line(aes(y = percent_network_wet), color = "black", linewidth = 1) +
+  facet_wrap(~name, scales = "free_y", ncol = 1, drop = FALSE) +
+  geom_rect(data = doDates,
+            aes(xmin = WinterStart_preY, xmax = first_date, ymin = -Inf, ymax = Inf),
+            inherit.aes = FALSE,
+            fill = "#42d4f4", alpha = 0.2) +
+  geom_rect(data = doDates,
+            aes(xmin = last_date, xmax = WinterStart, ymin = -Inf, ymax = Inf),
+            inherit.aes = FALSE,
+            fill = "#9A6324", alpha = 0.2) +
+  scale_color_manual(values = cluster_colors, name = "Cluster", na.translate = FALSE) +
+  scale_x_date(labels = date_format("%b"), breaks = "2 months") +
+  scale_y_continuous(
+    limits = c(0, 100),
+    name = expression("Daily Average DO"["% Sat"]),
+    sec.axis = sec_axis(~ ., name = "Network Wet (%)")
+  ) +
+  xlim(as_date("2024-01-01"), as_date("2024-12-01")) +
+  labs(x = "") +
+  theme(axis.text = element_text(size = 15)) -> p
+p
+ggsave(filename = "Average_2024_PercentWet.png", plot = p, path = here("Figs/ClusterTimeseries"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = "retina")
+```
+
+## Cluster Time Series for Selected Year
+
+```{r}
+clustered_dat |>
+  filter(!(name == "EF-1" & Date == as_date("2024-01-01"))) |>
+  filter(
+    (name %in% c("GP-1", "GP-2", "GP-3", "EF-1") & year(Date) == 2024) |
+    (name %in% c("ND-2", "EF-3", "EF-2") & year(Date) == 2023) |
+    (name %in% c("ND-1") & year(Date) == 2022)
+  ) |> 
+  mutate(
+    Year = year(Date),
+    SiteLabel = paste(name, Year),
+    fakeDate = as.Date(paste0("2000-", month(Date), "-", day(Date)))
+  ) |> 
+  mutate(SiteLabel = factor(SiteLabel, levels = c("GP-1 2024", "GP-2 2024", "GP-3 2024", "EF-1 2024", "EF-2 2023", "EF-3 2023", "ND-1 2022", "ND-2 2023"))) |> 
+  ggplot(aes(x = fakeDate)) +
+  geom_point(aes(y = avgDO.pctsat, color = Cluster), size = 3, alpha = 0.8) +
+  geom_line(aes(y = percent_network_wet), color = "black", linewidth = 1) +
+  facet_wrap(~SiteLabel, scales = "fixed", ncol = 2, drop = FALSE) +
+  scale_color_manual(values = cluster_colors, name = "Cluster", na.translate = FALSE) +
+  xlim(as_date("2000-01-01"), as_date("2000-12-01")) +
+  scale_x_date(labels = date_format("%b"), breaks = "1 months", expand = c(0,0)) +
+  scale_y_continuous(
+    #limits = c(0, 100),
+    name = expression(bold("Daily Average DO"["% Sat"])),
+    sec.axis = sec_axis(~ ., name = "Network Wet (%)")
+  ) +
+  labs(x = "") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text = element_text(size = 12),
+        text = element_text(size = 20),          # overall text size
+    legend.text = element_text(size = 20),   # legend entries
+    legend.title = element_text(size = 20),  # legend title
+    axis.title = element_text(size = 20),    # axis titles
+    axis.text = element_text(size = 20),     # axis tick labels
+    plot.title = element_text(size = 20, hjust = 0.5),
+    legend.position = "bottom") -> p
+
+p
+ggsave(filename = "Average_YEAR_PercentWet.png", plot = p, path = here("Figs/ClusterTimeseries"), device = "png", width = 40, height = 25.4, units = "cm", dpi = "retina")
+
+
+
+clustered_dat |>
+  filter(!(name == "EF-1" & Date == as_date("2024-01-01"))) |>
+  filter(
+    (name %in% c("GP-1", "GP-2", "GP-3", "EF-1") & year(Date) == 2024) |
+    (name %in% c("ND-2", "EF-3", "EF-2") & year(Date) == 2023) |
+    (name %in% c("ND-1") & year(Date) == 2022)
+  ) |> 
+  mutate(
+    Year = year(Date),
+    SiteLabel = paste(name, Year),
+    fakeDate = as.Date(paste0("2000-", month(Date), "-", day(Date)))
+  ) |>
+  filter(month(Date) < 10) |> 
+  mutate(SiteLabel = factor(SiteLabel, levels = c("GP-1 2024", "GP-2 2024", "GP-3 2024", "EF-1 2024", "EF-2 2023", "EF-3 2023", "ND-1 2022", "ND-2 2023"))) |> 
+  group_by(Site) |> 
+  mutate(active_network_length_m = active_network_length_m/max(active_network_length_m, na.rm = T)*100) |>
+  ungroup() |> 
+  ggplot(aes(x = fakeDate)) +
+  geom_point(aes(y = avgDO.pctsat, color = Cluster), size = 3, alpha = 0.8) +
+  geom_line(aes(y = active_network_length_m), color = "black", linewidth = 1) +
+  facet_wrap(~SiteLabel, scales = "fixed", ncol = 2, drop = FALSE) +
+  scale_color_manual(values = cluster_colors, name = "Regime", na.translate = FALSE) +
+  xlim(as_date("2000-01-01"), as_date("2000-12-01")) +
+  scale_x_date(labels = date_format("%b"), breaks = "1 months", expand = c(0,0)) +
+  scale_y_continuous(
+    #limits = c(0, 100),
+    name = expression(bold("Daily Average DO"["% Sat"])),
+    sec.axis = sec_axis(~ ., name = "ASDN (%)")
+  ) +
+  labs(x = "") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text = element_text(size = 12, face = "bold"),
+        text = element_text(size = 20),          # overall text size
+    legend.text = element_text(size = 20),   # legend entries
+    legend.title = element_text(size = 20),  # legend title
+    axis.title = element_text(size = 20, face = "bold"),    # axis titles
+    axis.text = element_text(size = 20),     # axis tick labels
+    plot.title = element_text(size = 20, hjust = 0.5, face = "bold"),
+    legend.position = "bottom") -> p
+
+p
+ggsave(filename = "Average_YEAR_ASDN.png", plot = p, path = here("Figs/ClusterTimeseries"), device = "png", width = 40, height = 25.4, units = "cm", dpi = "retina")
+```
+
+```{r}
+clustered_dat |> 
+  drop_na(Cluster) |> 
+  ggplot(aes(x = Date, y = DOpctsat.amp, color = Cluster)) +
+  geom_point(size = 3, alpha = 0.8) +
+  facet_wrap(~name, scales = "free_y", ncol = 1) +
+  scale_color_manual(values = cluster_colors, name = "Cluster") +
+  ylim(0,100)+
+  scale_x_date(labels = date_format("%b '%y")) +
+  xlim(as_date("2021-06-01"), as_date("2024-12-01")) +
+  labs(
+  x = "",
+  y = expression("Daily DO"["% Sat"]*" Amplitude")
+  ) +
+  theme(axis.text = element_text(size = 15)) -> p 
+p
+ggsave(filename = "Amplitude.png", plot = p, path = here("Figs/ClusterTimeseries"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = "retina")
+
+clustered_dat |> 
+  drop_na(Cluster) |> 
+  ggplot(aes(x = Date, y = minDO.pctsat, color = Cluster)) +
+  geom_point(size = 3, alpha = 0.8) +
+  facet_wrap(~name, scales = "free_y", ncol = 1) +
+  scale_color_manual(values = cluster_colors, name = "Cluster") +
+  ylim(0,100)+
+  scale_x_date(labels = date_format("%b '%y")) +
+  xlim(as_date("2021-06-01"), as_date("2024-12-01")) +
+  labs(
+  x = "",
+  y = expression("Daily DO"["% Sat"]*" Minimum")
+  ) +
+  theme(axis.text = element_text(size = 15)) -> p 
+p
+ggsave(filename = "Minimum.png", plot = p, path = here("Figs/ClusterTimeseries"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = "retina")
+
+clustered_dat |> 
+  drop_na(Cluster) |> 
+  ggplot(aes(x = Date, y = maxDO.pctsat, color = Cluster)) +
+  geom_point(size = 3, alpha = 0.8) +
+  facet_wrap(~name, scales = "free_y", ncol = 1) +
+  scale_color_manual(values = cluster_colors, name = "Cluster") +
+  ylim(0,100)+
+  scale_x_date(labels = date_format("%b '%y")) +
+  xlim(as_date("2021-06-01"), as_date("2024-12-01")) +
+  labs(
+  x = "",
+  y = expression("Daily DO"["% Sat"]*" Maximum")
+  ) +
+  theme(axis.text = element_text(size = 15)) -> p 
+p
+ggsave(filename = "Maximum.png", plot = p, path = here("Figs/ClusterTimeseries"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = "retina")
+
+
+clustered_dat |> 
+  drop_na(Cluster) |> 
+  ggplot(aes(x = Date, y = DOSat.exc, color = Cluster)) +
+  geom_point(size = 3, alpha = 0.8) +
+  facet_wrap(~name, scales = "free_y", ncol = 1) +
+  scale_color_manual(values = cluster_colors, name = "Cluster") +
+  ylim(0,1)+
+  scale_x_date(labels = date_format("%b '%y")) +
+  xlim(as_date("2021-06-01"), as_date("2024-12-01")) +
+  labs(
+  x = "",
+  y = expression("DO"["% Sat"]*" Exceedance Probability")
+  ) +
+  theme(axis.text = element_text(size = 15)) -> p 
+p
+ggsave(filename = "ExcProb.png", plot = p, path = here("Figs/ClusterTimeseries"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = "retina")
+
+clustered_dat |> 
+  drop_na(Cluster) |> 
+  ggplot(aes(x = Date, y = probHypSat, color = Cluster)) +
+  geom_point(size = 3, alpha = 0.8) +
+  facet_wrap(~name, scales = "free_y", ncol = 1) +
+  scale_color_manual(values = cluster_colors, name = "Cluster") +
+  ylim(0,1)+
+  scale_x_date(labels = date_format("%b '%y")) +
+  xlim(as_date("2021-06-01"), as_date("2024-12-01")) +
+  labs(
+  x = "",
+  y = "Probability of Hypoxia"
+  ) +
+  theme(axis.text = element_text(size = 15)) -> p 
+p
+ggsave(filename = "ProbHyp.png", plot = p, path = here("Figs/ClusterTimeseries"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = "retina")
+
+```
+
+```{r}
+clustered_dat |>
+  group_by(name) |> 
+  mutate(headGradient_scaled = scales::rescale(headGradient_1d, to = c(0, 100))) |> 
+  ungroup() |> 
+  ggplot(aes(x = Date)) +
+  geom_point(aes(y = avgDO.pctsat, color = Cluster), size = 1, alpha = 0.8) +
+  geom_line(aes(y = headGradient_scaled), color = "black", linewidth = 1) +
+  facet_wrap(~name, scales = "free_y", ncol = 1, drop = FALSE) +
+  scale_color_manual(values = cluster_colors, name = "Cluster", na.translate = FALSE) +
+  scale_x_date(labels = date_format("%b '%y")) +
+  scale_y_continuous(
+    limits = c(0, 100),
+    name = expression("Daily Average DO"["% Sat"]),
+    sec.axis = sec_axis(~ ., name = "Head Greadient (Scaled)")
+  ) +
+  labs(x = "") +
+  theme(axis.text = element_text(size = 15)) -> p 
+ggsave(filename = "HeadGradient.png", plot = p, path = here("Figs/ClusterTimeseries"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = "retina")
+
+clustered_dat |>
+  group_by(name) |> 
+  mutate(active_upstream_length = active_upstream_length/max(active_upstream_length, na.rm = T)*100) |> 
+  ungroup() |> 
+  ggplot(aes(x = Date)) +
+  geom_point(aes(y = avgDO.pctsat, color = Cluster), size = 1, alpha = 0.8) +
+  geom_line(aes(y = active_upstream_length), color = "black", linewidth = 1) +
+  facet_wrap(~name, scales = "free_y", ncol = 1, drop = FALSE) +
+  scale_color_manual(values = cluster_colors, name = "Cluster", na.translate = FALSE) +
+  scale_x_date(labels = date_format("%b '%y")) +
+  scale_y_continuous(
+    limits = c(0, 100),
+    name = expression("Daily Average DO"["% Sat"]),
+    sec.axis = sec_axis(~ ., name = "Active Upstream Length")
+  ) +
+  labs(x = "") +
+  theme(axis.text = element_text(size = 15)) -> p 
+ggsave(filename = "ActiveUpstreamLength.png", plot = p, path = here("Figs/ClusterTimeseries"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = "retina")
+
+
+clustered_dat |>
+  group_by(name) |> 
+  mutate(active_network_length_m = active_network_length_m/max(active_network_length_m, na.rm = T)*100) |> 
+  ungroup() |> 
+  ggplot(aes(x = Date)) +
+  geom_point(aes(y = avgDO.pctsat, color = Cluster), size = 1, alpha = 0.8) +
+  geom_line(aes(y = active_network_length_m), color = "black", linewidth = 1) +
+  facet_wrap(~name, scales = "free_y", ncol = 1, drop = FALSE) +
+  scale_color_manual(values = cluster_colors, name = "Cluster", na.translate = FALSE) +
+  scale_x_date(labels = date_format("%b '%y")) +
+  scale_y_continuous(
+    limits = c(0, 100),
+    name = expression("Daily Average DO"["% Sat"]),
+    sec.axis = sec_axis(~ ., name = "Active Upstream Length")
+  ) +
+  labs(x = "") +
+  theme(axis.text = element_text(size = 15)) -> p 
+ggsave(filename = "ActiveNetworkLength.png", plot = p, path = here("Figs/ClusterTimeseries"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = "retina")
+
+clustered_dat |>
+  ggplot(aes(x = Date)) +
+  geom_point(aes(y = avgDO.pctsat, color = Cluster), size = 1, alpha = 0.8) +
+  geom_line(aes(y = percent_network_wet), color = "black", linewidth = 1) +
+  facet_wrap(~name, scales = "free_y", ncol = 1, drop = FALSE) +
+  scale_color_manual(values = cluster_colors, name = "Cluster", na.translate = FALSE) +
+  scale_x_date(labels = date_format("%b '%y")) +
+  scale_y_continuous(
+    limits = c(0, 100),
+    name = expression("Daily Average DO"["% Sat"]),
+    sec.axis = sec_axis(~ ., name = "Network Wet (%)")
+  ) +
+  labs(x = "") +
+  theme(axis.text = element_text(size = 15)) -> p 
+ggsave(filename = "PercentNetworkWet.png", plot = p, path = here("Figs/ClusterTimeseries"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = "retina")
+
+clustered_dat |>
+  ggplot(aes(x = Date)) +
+  geom_point(aes(y = avgDO.pctsat, color = name), size = 1, alpha = 0.8) +
+  geom_line(aes(y = percent_network_wet), color = "black", linewidth = 1) +
+  facet_wrap(~name, scales = "free_y", ncol = 1, drop = FALSE) +
+  scale_color_manual(values = site_colors, name = "Cluster", na.translate = FALSE) +
+  scale_x_date(labels = date_format("%b '%y")) +
+  scale_y_continuous(
+    limits = c(0, 100),
+    name = expression("Daily Average DO"["% Sat"]),
+    sec.axis = sec_axis(~ ., name = "Network Wet (%)")
+  ) +
+  labs(x = "") +
+  theme(axis.text = element_text(size = 15), legend.position = "none") -> p 
+ggsave(filename = "PercentNetworkWet_FinalReport.png", plot = p, path = here("Figs/ClusterTimeseries"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = "retina")
+
+clustered_dat |>
+  group_by(name) |> 
+  mutate(a_cent = scales::rescale(a_cent, to = c(0, 100))) |> 
+  ungroup() |> 
+  ggplot(aes(x = Date)) +
+  geom_point(aes(y = avgDO.pctsat, color = Cluster), size = 1, alpha = 0.8) +
+  geom_line(aes(y = a_cent), color = "black", linewidth = 1) +
+  facet_wrap(~name, scales = "free_y", ncol = 1, drop = FALSE) +
+  scale_color_manual(values = cluster_colors, name = "Cluster", na.translate = FALSE) +
+  scale_x_date(labels = date_format("%b '%y")) +
+  scale_y_continuous(
+    limits = c(0, 100),
+    name = expression("Daily Average DO"["% Sat"]),
+    sec.axis = sec_axis(~ ., name = "Alpha Centrality")
+  ) +
+  labs(x = "") +
+  theme(axis.text = element_text(size = 15)) -> p 
+ggsave(filename = "AlphaCentrality.png", plot = p, path = here("Figs/ClusterTimeseries"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = "retina")
+```
+
+## Head Gradient
+
+```{r}
+site_plot_data <- clustered_dat |>
+  filter(!name %in% c("ND-1", "ND-2")) |> 
+  select(name, Date, avgDO.pctsat, headGradient_1d, Cluster) |>
+  pivot_longer(cols = c(avgDO.pctsat, headGradient_1d),
+               names_to = "Variable",
+               values_to = "Value") |>
+  mutate(Variable = recode(Variable,
+    "avgDO.pctsat" = "Daily Avg DO (%Sat)",
+    "headGradient_1d" = "Head Gradient"
+  ))
+
+custom_labeller <- labeller(
+  Variable = as_labeller(c(
+    "Daily Avg DO (%Sat)" = "Daily~Avg.~DO['% Sat']",
+    "Head Gradient"       = "Head~Gradient~(m)"
+  ), default = label_parsed),
+  name = label_value  # Leave Site labels unchanged
+)
+
+site_faceted_plot <- site_plot_data |> 
+  ggplot(aes(x = Date, y = Value)) +
+  geom_point(
+    data = filter(site_plot_data, Variable == "Daily Avg DO (%Sat)"),
+    aes(color = Cluster), size = 1, alpha = 0.8
+  ) +
+  geom_line(
+    data = filter(site_plot_data, Variable == "Head Gradient"),
+    color = "black", linewidth = 1
+  ) +
+  geom_hline(
+    data = filter(site_plot_data, Variable == "Head Gradient") |> distinct(Variable, name),
+    aes(yintercept = 0),
+    linetype = "dashed", color = "grey50"
+  ) +
+  facet_grid(Variable ~ name, scales = "free_y", labeller = custom_labeller) +
+  scale_color_manual(values = cluster_colors, name = "Cluster", na.translate = FALSE) +
+  scale_x_date() +
+  labs(x = "", y = "") +
+  theme(
+    strip.placement = "outside",
+    strip.text.y.left = element_text(angle = 0),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  )
+
+site_faceted_plot
+
+ggsave(
+    filename = "HeadGradient.png",
+    plot = site_faceted_plot,
+    path = here::here("Figs/Supplement/"),
+    width = 40, height = 20, units = "cm", dpi = "retina"
+  )
+```
+
+## Stacked Bars
+
+```{r}
+# Create month column and calculate frequencies
+cluster_freq <- clustered_dat |>
+  mutate(
+         Month = factor(lubridate::month(Date, label = T))) |>
+  drop_na(Cluster) |> 
+  group_by(name, Month, Cluster) |>
+  summarise(count = n(), .groups = 'drop') 
+
+monthlyPercWet <- allDat |>
+  mutate(name = case_when(
+    Site %in% c("KNZ", "SHN", "YMR") ~ c("GP-1", "GP-2", "GP-3")[match(Site, c("KNZ", "SHN", "YMR"))],
+    Site %in% c("TAL", "PRF", "WHR") ~ c("EF-1", "EF-2", "EF-3")[match(Site, c("TAL", "PRF", "WHR"))],
+    Site %in% c("GBJ", "JDR") ~ c("ND-1", "ND-2")[match(Site, c("GBJ", "JDR"))],
+    TRUE ~ NA_character_
+  )) |> 
+    mutate(name = factor(name, levels = c("GP-1", "GP-2", "GP-3", "EF-1", "EF-2", "EF-3", "ND-1", "ND-2")),
+           Month = factor(lubridate::month(Date, label = TRUE))) |>
+  group_by(name, Month) |>
+  summarise(meanPercWet = mean(percent_network_wet, na.rm = TRUE) , .groups = "drop")
+
+cluster_freq |> 
+  filter(!Month %in% c("Oct", "Nov", "Dec", "Jan")) |> 
+  ggplot(aes(x = Month, y = count, fill = Cluster)) +
+  geom_bar(stat = "identity", position = "fill") +
+  geom_point(
+    data = monthlyPercWet |> filter(!Month %in% c("Oct", "Nov", "Dec", "Jan")),
+    aes(x = Month, y = meanPercWet / 100),  # scale to proportion
+    inherit.aes = FALSE,
+    size = 3,
+    shape = 21,
+    fill = "black"
+  ) +
+  facet_wrap(~name, ncol = 3) +
+  scale_fill_manual(values = cluster_colors, name = "Cluster") +
+  scale_y_continuous(labels = scales::percent) +
+  theme_minimal() +
+  labs(
+    title = "",
+    x = "",
+    y = "Proportion"
+  ) +
+  theme_few() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    text = element_text(size = 18),
+    legend.text = element_text(size = 16),
+    legend.title = element_text(size = 18),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 16),
+    plot.title = element_text(size = 20, hjust = 0.5),
+    plot.margin = grid::unit(c(0, 0, 0, 0), "lines"),
+    legend.position = "bottom"
+  ) -> p
+p
+ggsave(filename = "clusterDist_PercWet.png", plot = p, path = here("Figs/"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = "retina")
+
+
+cluster_freq |> 
+  filter(!Month %in% c("Oct", "Nov", "Dec")) |> 
+  ggplot(aes(x = Month, y = count, fill = Cluster)) +
+  geom_bar(stat = "identity", position = "fill") +
+  facet_wrap(~name, nrow = 2) +
+  scale_fill_manual(values = cluster_colors, name = "Cluster") +
+  scale_y_continuous(labels = scales::percent, expand = c(0, 0)) +
+  theme_minimal() +
+  labs(
+    title = "",
+    x = "",
+    y = "Proportion"
+  ) +
+  theme_few() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    text = element_text(size = 20),          # overall text size
+    legend.text = element_text(size = 20),   # legend entries
+    legend.title = element_text(size = 20),  # legend title
+    axis.title = element_text(size = 20, face = "bold"),    # axis titles
+    axis.text = element_text(size = 20),     # axis tick labels
+    plot.title = element_text(size = 20, hjust = 0.5),
+    plot.margin = grid::unit(c(0, 0, 0, 0), "lines"),
+    strip.text = element_text(face = "bold"),
+    legend.position = "bottom"
+  ) -> p 
+p
+ggsave(filename = "clusterDist.png", plot = p, path = here("Figs/"), device = "png", width = 40, height = 20, units = "cm", dpi = "retina")
+```
+
+## Correlation
+
+```{r}
+rf_dat <- clustered_dat |>
+  group_by(Site) |> 
+  mutate(active_network_length_m = active_network_length_m/max(active_network_length_m, na.rm = T)*100,
+         active_upstream_length = active_upstream_length/max(active_upstream_length, na.rm = T)*100) |>  
+  ungroup() |> 
+  select(-c(avgDO.pctsat, DOSat.exc, DOpctsat.amp, maxDO.pctsat, probHypSat, minDO.pctsat, DOY, waterYear, maxPar)) |> 
+  arrange(Date) |>
+  mutate(across(
+    where(is.numeric),
+    ~ na.approx(.x, maxgap = 7, na.rm = FALSE),
+    .names = "{.col}"
+    ),
+    across(.cols = matches("^(Q_)"), ~ scale(.)[, 1]),
+    .by = "Site"
+  ) |>
+  #mutate(across(.cols = matches("^(Depth_)"), ~ scale(.)[, 1])) |> 
+  drop_na(Cluster)
+  
+
+
+png(here("Figs/Corr_00.png"), width = 2160, height = 2160)
+rf_dat |>
+  group_by(Site) |> 
+  mutate(across(where(is.numeric), ~ scale(.)[, 1])) |>
+  ungroup() |>
+  select(where(is.numeric)) |>
+  cor(use = "complete.obs") |>
+  (\(cor_mat) {
+    corrplot(cor_mat, method = "circle", type = "upper", order = "alphabet", tl.col = "black", tl.pos = "lt", tl.cex = 2,
+             cl.pos = "n", na.label = " ", diag = TRUE)
+    corrplot(cor_mat, method = "number", type = "lower", order = "alphabet", tl.pos = "n", add = TRUE, number.cex = 1.5, na.label = " ", diag = FALSE)
+  })()
+dev.off()
+
+png(here("Figs/Corr_50.png"), width = 2160, height = 2160)
+rf_dat |>
+  group_by(Site) |> 
+  mutate(across(where(is.numeric), ~ scale(.)[, 1])) |>
+  ungroup() |>
+  select(where(is.numeric)) |>
+  cor(use = "complete.obs") |>
+  (\(cor_mat) {
+    cor_mat[abs(cor_mat) < 0.5] <- NA
+    corrplot(cor_mat, method = "circle", type = "upper", order = "alphabet", tl.col = "black", tl.pos = "lt", tl.cex = 2,
+             cl.pos = "n", na.label = " ", diag = TRUE)
+    corrplot(cor_mat, method = "number", type = "lower", order = "alphabet", tl.pos = "n", add = TRUE, number.cex = 1.5, na.label = " ", diag = FALSE)
+  })()
+dev.off()
+
+png(here("Figs/Corr_75.png"), width = 2160, height = 2160)
+rf_dat |>
+  group_by(Site) |> 
+  mutate(across(where(is.numeric), ~ scale(.)[, 1])) |>
+  ungroup() |> 
+  select(where(is.numeric)) |>
+  cor(use = "complete.obs") |>
+  (\(cor_mat) {
+    cor_mat[abs(cor_mat) < 0.75] <- NA
+    corrplot(cor_mat, method = "circle", type = "upper", order = "alphabet", tl.col = "black", tl.pos = "lt", tl.cex = 2,
+             cl.pos = "n", na.label = " ", diag = TRUE)
+    corrplot(cor_mat, method = "number", type = "lower", order = "alphabet", tl.pos = "n", add = TRUE, number.cex = 1.5, na.label = " ", diag = FALSE)
+  })()
+dev.off()
+
+
+png(here("Figs/Corr_70.png"), width = 2160, height = 2160)
+rf_dat |>
+  group_by(Site) |> 
+  mutate(across(where(is.numeric), ~ scale(.)[, 1])) |>
+  ungroup() |> 
+  select(where(is.numeric)) |>
+  cor(use = "complete.obs") |>
+  (\(cor_mat) {
+    cor_mat[abs(cor_mat) < 0.70] <- NA
+    corrplot(cor_mat, method = "circle", type = "upper", order = "alphabet", tl.col = "black", tl.pos = "lt", tl.cex = 2,
+             cl.pos = "n", na.label = " ", diag = TRUE)
+    corrplot(cor_mat, method = "number", type = "lower", order = "alphabet", tl.pos = "n", add = TRUE, number.cex = 1.5, na.label = " ", diag = FALSE)
+  })()
+dev.off()
+```
+
+## Look at vars to standardize
+
+```{r}
+# density plots with means
+dat_dens <- clustered_dat |>
+  filter(PPT_1d < 1, Q_1d < 5) |>
+  select(name, Date, active_network_length_m, PPT_1d, Q_1d, Depth_1d, ET_1d, avgPar, headGradient_1d) |>
+  pivot_longer(
+    cols = -c(name, Date),
+    names_to = "variable",
+    values_to = "value"
+  )
+
+means_dens <- dat_dens |>
+  group_by(name, variable) |>
+  summarise(mean_val = mean(value, na.rm = TRUE), .groups = "drop")
+
+ggplot(dat_dens, aes(x = value, fill = name)) +
+  geom_density(position = "identity", alpha = 0.5) +
+  geom_vline(
+    data = means_dens,
+    aes(xintercept = mean_val, color = name),
+    linetype = "dashed",
+    linewidth = 0.6,
+    show.legend = FALSE
+  ) +
+  scale_fill_manual(
+    values = setNames(site_meta$color, site_meta$name),
+    breaks = levels(site_meta$name)
+  ) +
+  scale_color_manual(
+    values = setNames(site_meta$color, site_meta$name),
+    breaks = levels(site_meta$name)
+  ) +
+  labs(title = "RF Variables") +
+  facet_wrap(~variable, scales = "free") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) ->p
+ggsave(
+    filename = "vars_dens.png",
+    plot = p,
+    path = here::here("Figs/Supplement/"),
+    width = 40, height = 20, units = "cm", dpi = "retina"
+  )
+
+
+# Z-Score transformed density plots 
+dat_dens_z <- clustered_dat |> 
+  group_by(name) |> 
+  mutate(across(where(is.numeric), ~ scale(.)[, 1])) |>
+  ungroup() |> 
+  select(name, Date, active_network_length_m, PPT_1d, Q_1d, Depth_1d, ET_1d, avgPar, headGradient_1d) |> 
+  pivot_longer(
+    cols = -c(name, Date),  # keep Site and Date, melt everything else
+    names_to = "variable",
+    values_to = "value"
+  )
+means_dens_z <- dat_dens_z |>
+  group_by(name, variable) |>
+  summarise(mean_val = mean(value, na.rm = TRUE), .groups = "drop")
+
+ggplot(dat_dens_z |> 
+         filter(
+      (variable == "Q_1d"   & value < 4) |
+      (variable == "PPT_1d" & value < 2.5) |
+      !(variable %in% c("Q_1d", "PPT_1d"))
+    ), aes(x = value, fill = name)) +
+  geom_density(position = "identity", alpha = 0.5) +
+  geom_vline(
+    data = means_dens_z,
+    aes(xintercept = mean_val, color = name),
+    linetype = "dashed",
+    linewidth = 0.6,
+    show.legend = FALSE
+  ) +
+  scale_fill_manual(
+    values = setNames(site_meta$color, site_meta$name),
+    breaks = levels(site_meta$name)
+  ) +
+  scale_color_manual(
+    values = setNames(site_meta$color, site_meta$name),
+    breaks = levels(site_meta$name)
+  ) +
+  labs(title = "RF Variables Z-Score Transformed") +
+  facet_wrap(~variable, scales = "free") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) -> p
+ggsave(
+    filename = "vars_dens_zscore.png",
+    plot = p,
+    path = here::here("Figs/Supplement/"),
+    width = 40, height = 20, units = "cm", dpi = "retina"
+  )
+
+# 0-100 transformed density plots 
+dat_dens_scaled <- clustered_dat |>
+  select(name, Date, active_network_length_m, PPT_1d, Q_1d, Depth_1d, ET_1d, avgPar, headGradient_1d) |>
+  pivot_longer(
+    cols = -c(name, Date),
+    names_to = "variable",
+    values_to = "value"
+  ) |>
+  group_by(name, variable) |>
+  mutate(
+    scaled_value = (value - min(value, na.rm = TRUE)) / 
+                   (max(value, na.rm = TRUE) - min(value, na.rm = TRUE)) * 100
+  ) |>
+  ungroup()
+
+means_dens_scaled <- dat_dens_scaled |>
+  group_by(name, variable) |>
+  summarise(mean_val = mean(scaled_value, na.rm = TRUE), .groups = "drop")
+
+ggplot(dat_dens_scaled, aes(x = scaled_value, fill = name)) +
+  geom_density(position = "identity", alpha = 0.5) +
+  geom_vline(
+    data = means_dens_scaled,
+    aes(xintercept = mean_val, color = name),
+    linetype = "dashed",
+    linewidth = 0.6,
+    show.legend = FALSE
+  ) +
+  scale_fill_manual(
+    values = setNames(site_meta$color, site_meta$name),
+    breaks = levels(site_meta$name)
+  ) +
+  scale_color_manual(
+    values = setNames(site_meta$color, site_meta$name),
+    breaks = levels(site_meta$name)
+  ) +
+  labs(title = "RF Variables 0-100 Scale") +
+  facet_wrap(~variable, scales = "free") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) ->p
+ggsave(
+    filename = "vars_dens_0-100.png",
+    plot = p,
+    path = here("Figs/Supplement/"),
+    width = 40, height = 20, units = "cm", dpi = "retina"
+  )
+
+# Site centered density plots 
+dat_dens_cent <- clustered_dat |> 
+  select(name, Date, active_network_length_m, PPT_1d, Q_1d, Depth_1d, ET_1d, avgPar, headGradient_1d) |>
+  pivot_longer(
+    cols = -c(name, Date),
+    names_to = "variable",
+    values_to = "value"
+  ) |>
+  group_by(name, variable) |> 
+    mutate(
+    value = value - mean(value, na.rm = TRUE)
+  ) |>
+  ungroup()
+means_dens_cent <- dat_dens_z |>
+  group_by(name, variable) |>
+  summarise(mean_val = mean(value, na.rm = TRUE), .groups = "drop")
+
+ggplot(dat_dens_cent |> 
+         filter(
+      (variable == "Q_1d"   & value < 4) |
+      (variable == "PPT_1d" & value < 2.5) |
+      !(variable %in% c("Q_1d", "PPT_1d"))
+    ), aes(x = value, fill = name)) +
+  geom_density(position = "identity", alpha = 0.5) +
+  geom_vline(
+    data = means_dens_cent,
+    aes(xintercept = mean_val, color = name),
+    linetype = "dashed",
+    linewidth = 0.6,
+    show.legend = FALSE
+  ) +
+  scale_fill_manual(
+    values = setNames(site_meta$color, site_meta$name),
+    breaks = levels(site_meta$name)
+  ) +
+  scale_color_manual(
+    values = setNames(site_meta$color, site_meta$name),
+    breaks = levels(site_meta$name)
+  ) +
+  labs(title = "RF Variables Centered") +
+  facet_wrap(~variable, scales = "free") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) -> p
+ggsave(
+    filename = "vars_dens_mean_centered.png",
+    plot = p,
+    path = here::here("Figs/Supplement/"),
+    width = 40, height = 20, units = "cm", dpi = "retina"
+  )
+```
+
+```{r}
+
+
+metrics <- c(
+  "PPT_7d",
+  "Q_1d", "Q_7d", "Q_60d",
+  "Depth_1d", "Depth_60d",
+  "headGradient_1d", "headGradient_30d",
+  "ET_7d",
+  "avgPar",
+  "active_network_length_m",
+  "water.temp"
+)
+
+metric_names <- c(
+  PPT_7d = "Precip (7 Day Avg.)",
+  Q_1d = "Discharge", Q_7d = "Discharge (7 Day Avg.)", Q_60d = "Discharge (60 Day Avg.)",
+  Depth_1d = "Depth", Depth_60d = "Depth (60 Day Avg.)",
+  headGradient_1d = "Head Gradient", headGradient_30d = "Head Gradient (30 Day Avg.)",
+   ET_7d = "ET (7 Day Avg.)",
+  avgPar = "Light",
+  active_network_length_m = "ASDN",
+  water.temp = "Water Temp"
+)
+
+# Pivot data long
+plot_data <- rf_dat |>
+  filter(!is.na(Cluster)) |> 
+  select(name, Cluster, any_of(metrics)) |>
+  pivot_longer(cols = any_of(metrics), names_to = "Metric", values_to = "Value") |>
+  mutate(Metric_label = metric_names[Metric],
+         name = factor(name, levels = c("GP-1", "GP-2", "GP-3", "EF-1", "EF-2", "EF-3", "ND-1", "ND-2")))
+
+
+
+p <- ggplot(plot_data, aes(x = name, y = Value, fill = Cluster)) +
+  geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.75)) +
+  geom_jitter(
+    alpha = 0.1,
+    aes(color = Cluster),
+    position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75)
+    ) +
+  facet_wrap(~Metric_label, scales = "free_y") +  # facet by metric
+  scale_fill_manual(values = cluster_colors) +
+  scale_color_manual(values = cluster_colors) +
+  labs(title = "Random Forest Data by Cluster",
+    x = "", y = "Value") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  )
+
+ggsave(
+    filename = "rf_data.png",
+    plot = p,
+    path = here::here("Figs/Supplement/"),
+    width = 40, height = 20, units = "cm", dpi = "retina"
+  )
+
+
+```
+
+# Random Forest
+
+```{r}
+#  source(here("Code/functions/rf_model.R"))
+# 
+# rf_dat <- clustered_dat |>
+#   group_by(Site) |>
+#   mutate(active_network_length_m = active_network_length_m/max(active_network_length_m, na.rm = T)*100,
+#          active_upstream_length = active_upstream_length/max(active_upstream_length, na.rm = T)*100) |>
+#   ungroup() |>
+#   select(-c(contains("a_cent"), contains("percent_network_"), active_upstream_length, excProb, air.temp)) |> 
+#   select(Site, Date, tidyselect::peek_vars()[-(1:2)] |> sort()) |> 
+#   select(-c(avgDO.pctsat, DOSat.exc, DOpctsat.amp, maxDO.pctsat, probHypSat, minDO.pctsat, DOY, waterYear, wetQf, Season, maxPar)) |> 
+#   arrange(Site, Date) |>
+#   group_by(Site) |>
+#   mutate(across(
+#     where(is.numeric),
+#     ~ na.approx(.x, maxgap = 7, na.rm = FALSE),
+#     .names = "{.col}"
+#   )
+#   ) |>
+#   #mutate(across(.cols = matches("^(Depth_)"), ~ scale(.)[, 1])) |> 
+#   #mutate(across(.cols = matches("^(Q_)"), ~ scale(.)[, 1])) |> 
+#   ungroup() |> 
+#   drop_na(Cluster) |> 
+#   select(Site, Date, Cluster, active_network_length_m, Q_60d, avgPar_14d, Depth_7d, water.temp_7d, PPT_14d, headGradient_14d, ET_7d, Q_7d, Q_1d)
+#   #select(Site, Date, Cluster, active_network_length_m, Q_1d, avgPar, Depth_1d, water.temp, PPT_1d, headGradient_1d, ET_1d, Q_1d) 
+#   # group_by(Site) |> 
+#   # standardise(-active_network_length_m) |> 
+#   # ungroup()
+# 
+# rf_dat <- rf_dat |>
+#   group_by(Site) |>
+#   mutate(
+#     avgPar_14d = (avgPar_14d - min(avgPar_14d, na.rm = TRUE)) / (max(avgPar_14d, na.rm = TRUE) - min(avgPar_14d, na.rm = TRUE)) * 100,
+#     Depth_7d = (Depth_7d - min(Depth_7d, na.rm = TRUE)) / (max(Depth_7d, na.rm = TRUE) - min(Depth_7d, na.rm = TRUE)) * 100,
+#     Q_1d = (Q_1d - min(Q_1d, na.rm = TRUE)) / (max(Q_1d, na.rm = TRUE) - min(Q_1d, na.rm = TRUE)) * 100,
+#     Q_7d = (Q_7d - min(Q_7d, na.rm = TRUE)) / (max(Q_7d, na.rm = TRUE) - min(Q_7d, na.rm = TRUE)) * 100,
+#     Q_60d = (Q_60d - min(Q_60d, na.rm = TRUE)) / (max(Q_60d, na.rm = TRUE) - min(Q_60d, na.rm = TRUE)) * 100,
+#     ET_7d = (ET_7d - min(ET_7d, na.rm = TRUE)) / (max(ET_7d, na.rm = TRUE) - min(ET_7d, na.rm = TRUE)) * 100
+#   ) |>
+#   ungroup()
+# 
+# # Remove highly correlated variables (> 0.75)
+# cor_mat <- rf_dat |>
+#   select(where(is.numeric)) |>
+#   cor(use = "pairwise.complete.obs", method = "pearson")
+# high_cor <- findCorrelation(cor_mat, cutoff = 0.75, names = TRUE)
+# high_cor
+# rf_dat_nocorr <- rf_dat |>
+#   select(-all_of(high_cor))
+# 
+# 
+# # Run Full Model
+# rf_full_model <- fit_full_model(rf_dat_nocorr, response = "Cluster", label = "all_clusters")
+# 
+# final_wf <- rf_full_model$final_wf
+# final_fit <- rf_full_model$final_fit
+# fitted_model <- extract_fit_parsnip(final_fit)$fit
+# train_data <- rf_full_model$train_data
+# test_data <- rf_full_model$test_data
+# selected_vars <- rf_full_model$selected_vars
+# 
+# all_data <- train_data |> 
+#   mutate(model = "training") |> 
+#   rbind(test_data |> mutate(model = "testing")) |> 
+#   arrange(Site, Date)
+# 
+# beepr::beep(2)
+```
+
+```{r}
+# library(gt)
+# rf_dat_nocorr |>
+#   select(-Date, -Site) |>
+#   rename_with(~ var_names[.x], .cols = any_of(names(var_names))) |>
+#   report::report_sample(by = "Cluster") |>
+#   as.data.frame() |>
+#   mutate(
+#     Variable = Variable |>
+#       str_remove("^Mean\\s+") |>
+#       str_remove("\\s*\\(SD\\)$"),
+#     across(
+#       -Variable,
+#       ~ str_replace(.x, "^\\s*([\\-\\d\\.]+)\\s*\\(([-\\d\\.]+)\\)\\s*$", "\\1 ± \\2")
+#     )
+#   ) |> 
+#   gt() |> 
+#   tab_header(
+#     title = "Random Forest Variable Summary"
+#   ) |> 
+#   tab_spanner(
+#     label = "Cluster",
+#     columns = c(2:4)
+#   ) |> 
+#   gtsave(here("Figs/rf_data_table.png"), zoom = 6, vwidth = 2000, vheight = 1200)
+# 
+# do_rf_vars <- read_sheet("1_LX67QIfuoDmjS-BQi2w5_v3cmSWdVnFrTB6NQaEJck")
+# do_rf_vars |>
+#   gt() |>
+#   tab_header(
+#     title = "Random Forest Variable Selection Results"
+#   ) |>
+#   sub_missing(
+#     columns = everything(),
+#     missing_text = "-"
+#   ) 
+# 
+# do_rf_vars <- read_sheet("1_LX67QIfuoDmjS-BQi2w5_v3cmSWdVnFrTB6NQaEJck", sheet = "Matrix")
+# do_rf_vars |> 
+#   gt() |>
+#   # tab_header(
+#   #   title = "Random Forest Variable Selection"
+#   # ) |>
+#   sub_missing(
+#     columns = everything(),
+#     missing_text = ""
+#   )  |> 
+#   cols_align(
+#     align = "center",
+#     columns = -Variable   # or `everything()` if you want to center Variable too
+#   ) |> 
+#   # tab_footnote(
+#   #   footnote = "Removed for Correlation (-), Removed during RFE (*), Included in RF (✓)",
+#   # ) |> 
+#   gtsave(here("Figs/rf_var_table.png"), zoom = 6, vwidth = 2000, vheight = 1200)
+# 
+
+```
+
+```{r}
+# # List of cluster labels
+# labels <- c("all_clusters", "cluster_1", "cluster_2", "cluster_3")
+# cluster_colors <- c("1" = "#0072B2","2" = "#009E73","3" = "#E69F00")
+# 
+# # Read all importance files into one long dataframe
+# importance_df <-read_csv(here("Results/rf/all_clusters_importance.csv")) |>
+#   #mutate(Cluster = label) |>
+#   mutate(
+#     predictor = case_when(predictor %in% names(var_names) ~ var_names[predictor],
+#                          TRUE ~ predictor  # Keep original if not found in var_names
+#                          )
+#     ) |> 
+#   mutate(norm_importance = importance / max(importance, na.rm = TRUE)
+#   ) |>
+#   ungroup()
+#   
+# 
+# impVars <- importance_df |>
+#   mutate(predictor = str_wrap(predictor, width = 15)) |> 
+#   ggplot(aes(x = reorder(predictor, importance), y = importance)) +
+#   geom_col(position = position_dodge(width = 0.8), fill = "#2C3E50") +
+#   coord_flip() +
+#   labs(x = "Predictor", y = "Scaled Variable Importance", title = "Random Forest Variable Importance") +
+#   theme_few() + 
+#   theme(
+#     text = element_text(size = 18),          # overall text size
+#     legend.text = element_text(size = 16),   # legend entries
+#     legend.title = element_text(size = 18),  # legend title
+#     axis.title = element_text(size = 18),    # axis titles
+#     axis.text = element_text(size = 16),     # axis tick labels
+#     plot.title = element_text(size = 20, hjust = 0.5),
+#     legend.position = "none"
+#     )
+# impVars
+# 
+# 
+# conf_mat <- read_csv(here("Results/rf/all_clusters_confusion_matrix.csv")) |> 
+#  group_by(Prediction) |>
+#   mutate(precision = n / sum(n),
+#          freq.Perc = round(n / sum(n), 3)) |>
+#   ungroup() |>
+#   group_by(Reference) |>
+#   mutate(recall = n / sum(n)) |>
+#   ungroup() |>
+#   mutate(label = paste0("(", round(precision, 2), " / ", round(recall, 2), ")")) |> 
+#     mutate(label = if_else(Prediction == Reference, label, NA_character_))
+# 
+# conf_mat_plt <- ggplot(conf_mat) +
+#   geom_tile(aes(x = Reference, y = Prediction, fill = freq.Perc)) +
+#   scale_fill_viridis_c(option = "viridis", direction = 1) +
+#   geom_text(aes(x = Reference, y = Prediction, label = n), color = "white", size = 8) +
+#   geom_text(aes(x = Reference, y = Prediction + 0.2, label = label), color = "white", size = 6) +
+#   scale_y_continuous(
+#     trans = "reverse",
+#     expand = c(0, 0),
+#     breaks = 1:3,
+#     labels = paste("Cluster", 1:3)
+#   ) +
+#   scale_x_continuous(
+#     position = "top",
+#     expand = c(0, 0),
+#     breaks = 1:3,
+#     labels = paste("Cluster", 1:3)
+#   ) +
+#   labs(
+#     fill = "Fraction Predicted",
+#     x = "Actual",
+#     y = "Predicted"
+#   ) +
+#   theme(
+#     panel.background = element_rect(fill = NA, colour = "black", linewidth = 1),
+#     axis.line = element_line(colour = "black"),
+#     legend.position = "bottom",
+#   legend.key.width = unit(1.5, "cm"),
+#   legend.key.height = unit(0.3, "cm"),
+#   legend.title = element_text(vjust = 1),
+#   axis.text.y = element_text(angle = 90, hjust = .5)
+#   )
+# conf_mat_plt
+# ggsave(
+#   filename = "conf_mat.png",
+#   plot = conf_mat_plt,
+#   path = here("Figs/"),
+#   device = "png",
+#   width = 20,
+#   height = 20,
+#   units = "cm",
+#   dpi = 600
+# )
+# 
+# 
+# 
+
+```
+
+# Shap Values
+
+```{r}
+# # Ensure x_train and corresponding Site values match
+# x_train <- rf_full_model$train_data |>
+#   drop_na()
+# 
+# plan(multisession, workers = availableCores())
+# if (file.exists(here("Results/rf/all_exact_shap.rds"))) {
+#   all_shap <- read_rds(here("Results/rf/all_exact_shap.rds"))
+# } else {
+#   all_shap <- kernelshap::kernelshap(
+#     fitted_model,
+#     X = all_data |> drop_na(),
+#     feature_names = selected_vars,
+#     parallel_args = list(packages = "ranger"),
+#     parallel = TRUE,
+#     exact = TRUE,
+#     verbose = TRUE
+#   )
+#   saveRDS(all_shap, here("Results/rf/all_exact_shap.rds"))
+# }
+# plan(sequential)
+# 
+# 
+# 
+# 
+# all_shap_vz <- shapviz::shapviz(all_shap)
+# shapviz::sv_importance(all_shap_vz)
+# shapviz::sv_importance(all_shap_vz, kind = "bee")
+# 
+# 
+# 
+# shapviz::sv_importance(all_shap_vz) +
+#   theme_few()
+# shapviz::sv_importance(all_shap_vz[[1]], kind = "bee") +
+#   theme_few()
+# shapviz::sv_importance(all_shap_vz[[2]], kind = "bee") +
+#   theme_few()
+# shapviz::sv_importance(all_shap_vz[[3]], kind = "bee") +
+#   theme_few()
+# shapviz::sv_dependence(all_shap_vz, v = "active_network_length_m", color_var = NULL, share_y = TRUE) 
+# shapviz::sv_force(all_shap_vz) 
+```
+
+## Mean \|SHAP\| Overall
+
+```{r}
+# overall_mean_abs_shap <- all_shap$S |>
+#   lapply(\(S) abs(S)) |>
+#   (\(lst) Reduce("+", lst) / length(lst))() |>
+#   colMeans() |>
+#   (\(x) {
+#     tibble(
+#       predictor = names(x),
+#       mean_abs_shap = as.numeric(x)
+#     )
+#   })() |>
+#   mutate(
+#     predictor = case_when(
+#       predictor %in% names(var_names) ~ var_names[predictor],
+#       TRUE ~ predictor # Keep original if not found in var_names
+#     )
+#   )
+# # Plot overall importance
+# 
+# shap_imp <- overall_mean_abs_shap |>
+#   ggplot(aes(x = reorder(predictor, mean_abs_shap), y = mean_abs_shap)) +
+#   geom_col(position = position_dodge(width = 0.8), fill = "#2C3E50") +
+#   coord_flip() +
+#   scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+#   #scale_x_discrete(labels = wrap_format(15)) +
+#   labs(title = "SHAP Variable Importance",
+#        x = "Predictor",
+#        y = "Mean |SHAP|")
+# shap_imp
+# 
+# combined_plot <- plot_grid(kmeans_plt, shap_imp, labels = c("A", "B"), label_size = 20)
+# combined_plot
+# ggsave(
+#   filename = "kmeans_vars.png",
+#   plot = combined_plot,
+#   path = here("Figs/"),
+#   device = "png",
+#   width = 40,
+#   height = 20,
+#   units = "cm",
+#   dpi = 600
+# )
+# 
+# ggsave(
+#     filename = "shap_imp.png",
+#     plot = shap_imp,
+#     path = here("Figs/"),
+#     width = 20, height = 20, units = "cm", dpi = 600
+#   )
+# 
+# 
+# 
+# shap_conf <- plot_grid(conf_mat_plt, shap_imp, labels = c("A", "B"), label_size = 20)
+# shap_conf
+# ggsave(
+#   filename = "shap_confmat.png",
+#   plot = shap_conf,
+#   path = here("Figs/"),
+#   device = "png",
+#   width = 40,
+#   height = 20,
+#   units = "cm",
+#   dpi = 600
+# )
+```
+
+## Proportional SHAP Values
+
+```{r}
+# clust_shap <- names(all_shap$S) |>
+#   lapply(\(clust_name) {
+#     shap_mat <- all_shap$S[[clust_name]]
+#     as_tibble(shap_mat) |>
+#       cbind(all_shap$X |> select(Site, Date)) |> 
+#       transform(Cluster = clust_name)
+#   }) |>
+#   do.call(what = rbind) |> 
+#   as_tibble() |> 
+#   mutate(across(where(is.numeric), abs)) |> 
+#   group_by(Cluster) |> 
+#   summarise(across(where(is.numeric), mean)) |> 
+#   pivot_longer(-Cluster, names_to = "predictor", values_to = "shap") |> 
+#   group_by(Cluster) |> 
+#   #mutate(norm_shap = shap / max(shap)) |> 
+#   mutate(norm_shap = shap / sum(shap)) |> 
+#   ungroup()
+# 
+# # Rename predictors for readability
+# clust_shap <- clust_shap |>
+#   mutate(
+#     ClusterLabel = paste("Cluster", Cluster),
+#      predictor = case_when(predictor %in% names(var_names) ~ var_names[predictor],
+#                          TRUE ~ predictor  # Keep original if not found in var_names
+#                          )
+#     ) 
+# 
+# 
+# 
+# # Plot using normalized shap
+# cluster_var_prop <- clust_shap |>
+#   ggplot(aes(x = reorder(predictor, -norm_shap), y = norm_shap, fill = Cluster)) +
+#   geom_col(position = "dodge", alpha = 0.8) +
+#   scale_x_discrete(labels = label_wrap(15)) +
+#   scale_fill_manual(values = cluster_colors) +
+#   #theme_few() +
+#   scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+#   theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+#   labs(title = "Relative SHAP Importance by Cluster",
+#        x = "Predictor",
+#        y = "Proportion of Total |SHAP|",
+#        fill = "Cluster") 
+# cluster_var_prop
+# ggsave(
+#   filename = "cluster_var_prop.png",
+#   plot = cluster_var_prop,
+#   path = here("Figs/"),
+#   device = "png",
+#   width = 40,
+#   height = 20,
+#   units = "cm",
+#   dpi = "retina"
+# )
+# 
+# 
+# # Check if the sum of the normalized shap is 1
+# norm_check <- clust_shap |> group_by(Cluster) |>
+#     summarise(
+#         sum_shap = sum(shap, na.rm = TRUE),
+#         sum_norm_shap = sum(norm_shap, na.rm = TRUE)
+#     )
+
+```
+
+### site shap
+
+```{r}
+# site_shap <-  names(all_shap$S) |>
+#   lapply(\(clust_name) {
+#     shap_mat <- all_shap$S[[clust_name]]
+#     as_tibble(shap_mat) |>
+#       cbind(all_shap$X |> select(Site, Date)) |> 
+#       transform(Cluster = clust_name)
+#   }) |>
+#   do.call(what = rbind) |> 
+#   as_tibble() |>
+#   left_join(site_info |> select(Site, Region)) |> 
+#   mutate(across(where(is.numeric), abs)) |> 
+#   group_by(Region, Cluster) |> 
+#   summarise(across(where(is.numeric), mean)) |> 
+#   pivot_longer(-c(Cluster, Region), names_to = "predictor", values_to = "shap") |> 
+#   group_by(Cluster, Region) |> 
+#   #mutate(norm_shap = shap / max(shap)) |> 
+#   mutate(norm_shap = shap / sum(shap)) |> 
+#   ungroup() |> 
+#     mutate(
+#     ClusterLabel = paste("Cluster", Cluster),
+#      predictor = case_when(predictor %in% names(var_names) ~ var_names[predictor],
+#                          TRUE ~ predictor  # Keep original if not found in var_names
+#                          )
+#     ) 
+# 
+# site_cluster_var_imp <- site_shap |>
+#   ggplot(aes(x = reorder(predictor, -shap), y = norm_shap, fill = Region)) +
+#   geom_col(position = "dodge", alpha = 0.8) +
+#   facet_grid(Region~Cluster, scales = "free_x") +
+#   #coord_flip() +
+#   scale_fill_manual(
+#     values = c("#613921", "#83A102"),
+#     breaks = c("Great Plains", "Southeastern Forests")
+#   ) +
+#   scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+#   labs(
+#     x = "Predictor",
+#     y = "Mean |SHAP|"
+#   ) +
+#   theme(
+#     axis.text.x = element_text(angle = 45, hjust = 1),
+#     legend.position = "bottom"
+#   )
+# 
+# site_cluster_var_imp
+# 
+# 
+# # Check if the sum of the normalized shap is 1
+# norm_check <- site_shap |> group_by(Cluster, Region) |>
+#     summarise(
+#         sum_shap = sum(shap, na.rm = TRUE),
+#         sum_norm_shap = sum(norm_shap, na.rm = TRUE)
+#     )
+```
+
+## ALE Plots
+
+```{r}
+# library(ale)
+# rf_pred_fun <- function(object, newdata, type = "response") {
+#   predict(object, data = newdata)$predictions
+# }
+# plan(sequential)
+# plan(multisession, workers = parallel::detectCores() - 1)
+# # Create ALE plots with the custom prediction function
+# if (file.exists(here("Results/rf/ale_env.rds"))) {
+#   ale_rf <- read_rds(here("Results/rf/ale_env.rds"))
+# } else {
+#   ale_rf <- ale::ALE(
+#     model = fitted_model,
+#     data = train_data |> drop_na() |> select(selected_vars, Cluster),
+#     y_col = "Cluster",
+#     y_type = "categorical",
+#     pred_fun = rf_pred_fun,
+#     x_cols = list(d1 = TRUE), # All 1D effects
+#     boot_it = 1000,
+#     parallel = "all"
+#   )
+#   write_rds(ale_rf, here("Results/rf/ale_env.rds"))
+# }
+# 
+# 
+# ale_plts <- plot(ale_rf)
+# ale_plts
+# for (i in selected_vars) {
+#   get(ale_plts, i) |> print()
+# }
+# 
+# # Extract the data
+# ale_plot_data <- get_ale_data(ale_rf) |> 
+#   mutate(
+#     variable = case_when(variable %in% names(var_names) ~ var_names[variable],
+#                          TRUE ~ variable  # Keep original if not found in var_names
+#                          )
+#     ) |> 
+#   # Normalize to 0-1 scale for each cluster-variable combination
+#   group_by(Cluster, variable) |>
+#   mutate(
+#     # Scale to 0-1 range
+#     ale_scaled = (ale_values - min(ale_values, na.rm = TRUE)) / 
+#                        (max(ale_values, na.rm = TRUE) - min(ale_values, na.rm = TRUE)),
+#     ale_lower_scaled = (ale_lower - min(ale_values, na.rm = TRUE)) / 
+#                        (max(ale_values, na.rm = TRUE) - min(ale_values, na.rm = TRUE)),
+#     ale_upper_scaled = (ale_upper - min(ale_values, na.rm = TRUE)) / 
+#                        (max(ale_values, na.rm = TRUE) - min(ale_values, na.rm = TRUE))
+#   ) |>
+#   ungroup()
+# 
+# # Reorder variables by SHAP importance
+# var_order <- mean_shap |>
+#   arrange(desc(Mean_SHAP)) |>
+#   pull(predictor)
+# 
+# ale_plot_data <- ale_plot_data |>
+#   mutate(variable = factor(variable, levels = var_order))
+# 
+# ale_plot_data |> 
+#   ggplot(aes(x = x_values, y = ale_values, color = Cluster)) +
+#   scale_color_manual(values = cluster_colors) +
+#   scale_fill_manual(values = cluster_colors) +
+#   # Add confidence intervals as ribbons (behind the lines)
+#   geom_ribbon(aes(ymin = ale_lower, ymax = ale_upper, fill = Cluster), alpha = 0.4) +
+#   # Add the main ALE lines
+#   geom_line(size = 1.2, alpha = 0.9) +
+#   geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+#   facet_wrap(~variable, scales = "free", ncol = 3) +
+#   labs(
+#     title = "ALE Effects Across All Clusters and Variables",
+#     x = "Feature Values",
+#     y = "ALE Values",
+#     subtitle = paste("Based on", nrow(train_data), "observations with", 
+#                     length(unique(train_data$Cluster)), "clusters")
+#   ) +
+#   theme_minimal() +
+#   theme(
+#     strip.text = element_text(size = 10, face = "bold"),
+#     legend.position = "bottom",
+#     panel.grid.minor = element_blank(),
+#     axis.text.x = element_text(angle = 45, hjust = 1)
+#   )
+# 
+# # Plot scaled ALE effects
+# ale_scaled <- ale_plot_data |>
+#   #filter(!(variable %in% c("Q", "7 DA. Q", "60 DA. Q") & x_values > 20)) |> 
+#   filter(!is.na(x_values), !is.na(ale_scaled)) |>
+#   ggplot(aes(x = x_values, y = ale_scaled, color = Cluster, fill = Cluster)) +
+#   geom_ribbon(aes(ymin = ale_lower_scaled, ymax = ale_upper_scaled), 
+#               alpha = 0.25, color = NA) +
+#   geom_line(size = 1.3, alpha = 0.9) +
+#   geom_hline(yintercept = 0.5, linetype = "dashed", alpha = 0.5) +
+#   scale_color_manual(values = cluster_colors) +
+#   scale_fill_manual(values = cluster_colors) +
+#   facet_wrap(~variable, scales = "free_x", nrow = 2) +
+#   labs(
+#     x = "Feature Values",
+#     y = "Normalized ALE Values (0-1)"
+#   ) +
+#   theme(axis.text.x = element_text(angle = 45, hjust = 1))
+# ale_scaled
+# ggsave(
+#   filename = "scaled_ale_plt.png",
+#   plot = ale_scaled,
+#   path = here("Figs/"),
+#   device = "png",
+#   width = 40,
+#   height = 20,
+#   units = "cm",
+#   dpi = "retina"
+# )
+# 
+# 
+# ale_scaled_gpL <- ale_plot_data |>
+#   filter(variable %in% c("ASDN", "14 DA. Light", "7 DA. Water Temp", "7 DA. Q")) |> 
+#   filter(!is.na(x_values), !is.na(ale_scaled)) |>
+#   ggplot(aes(x = x_values, y = ale_scaled, color = Cluster, fill = Cluster)) +
+#   geom_ribbon(aes(ymin = ale_lower_scaled, ymax = ale_upper_scaled), 
+#               alpha = 0.25, color = NA) +
+#   geom_line(size = 1.3, alpha = 0.9) +
+#   geom_hline(yintercept = 0.5, linetype = "dashed", alpha = 0.5) +
+#   scale_color_manual(values = cluster_colors) +
+#   scale_fill_manual(values = cluster_colors) +
+#   facet_wrap(~variable, scales = "free_x", nrow = 2) +
+#   labs(
+#     x = "Feature Values",
+#     y = "Normalized ALE Values (0-1)"
+#   ) +
+#   theme(axis.text.x = element_text(angle = 45, hjust = 1))
+# ale_scaled_gpL
+# ggsave(
+#   filename = "scaled_ale_plt_GPLimno.png",
+#   plot = ale_scaled_gpL,
+#   path = here("Figs/"),
+#   device = "png",
+#   width = 20,
+#   height = 20,
+#   units = "cm",
+#   dpi = "retina"
+# )
+```
+
+```{r}
+# ale_rf_2way <- ale::ALE(
+#     model = fitted_model,
+#     data = train_data |> drop_na() |> select(selected_vars, Cluster),
+#     y_col = "Cluster",
+#     y_type = "categorical",
+#     pred_fun = rf_pred_fun,
+#     x_cols = list(d2 = TRUE), # All 1D effects
+#     boot_it = 10,
+#     parallel = "all"
+#   )
+# 
+# 
+# ale_plts_2w <- plot(ale_rf_2way)
+# ale_plts_2w
+# for (i in selected_vars) {
+#   get(ale_plts_2w, i)
+# }
+```
+
+# RF now with MORE LAGS
+
+### Find Best Lag
+
+```{r}
+source(here("Code/functions/rf_model.R"))
+
+plan(multisession, workers = parallel::detectCores() - 1)
+
+evaluate_lag <- function(dat, var, lag_k) {
+
+  roll_var <- paste0(var, "_roll", lag_k)
+
+  dat_roll <- dat |>
+    group_by(Site, name) |>
+    arrange(Date) |>
+    mutate(
+      "{roll_var}" := slider::slide_dbl(.data[[var]],
+                                .f = mean,
+                                .before = lag_k,
+                                .after = 0,
+                                .complete = FALSE)
+    ) |>
+    ungroup() |>
+    filter(!is.na(.data[[roll_var]]),
+           !is.na(Cluster)) |>
+    select(Cluster, all_of(roll_var))
+
+  folds <- vfold_cv(dat_roll, v = 5, strata = "Cluster")
+  
+  # Recipe
+  rec <- recipe(Cluster ~ ., data = dat_roll) |>
+    update_role(everything(), -Cluster, new_role = "predictor") |>
+    update_role(Cluster, new_role = "outcome") |>
+    step_zv()
+  
+  # RF Spec
+  model_spec <- rand_forest(trees = 500) |>
+    set_engine("ranger", seed = 42, num.threads = 1) |>
+    set_mode("classification")
+  # Workflow
+  wf <- workflow() |>
+    add_model(model_spec) |>
+    add_recipe(rec)
+  
+  # Results
+  res <- wf |>
+    fit_resamples(folds, metrics = metric_set(kap, f_meas, accuracy, roc_auc),
+                  control = control_resamples(save_pred = TRUE))
+
+  res |>
+    collect_metrics() |>
+    mutate(variable = var, lag = lag_k)
+}
+
+
+vars <- c("water.temp", "Q", "Depth", "headGradient", 
+          "PPT", "avgPar", "ET", "active_network_length_m")
+
+max_lag <- 60
+
+grid <- tidyr::expand_grid(
+  variable = vars,
+  lag = 0:max_lag
+)
+
+lagged_data <- dailyDat |> 
+  as_tibble() |> 
+  # group_by(Site) |>
+  # mutate(active_network_length_m = active_network_length_m/max(active_network_length_m, na.rm = T)*100,
+  #        active_upstream_length = active_upstream_length/max(active_upstream_length, na.rm = T)*100) |>
+  # ungroup() |>
+  select(-ends_with(c("_7d", "_14d", "_30d", "_60d"))) |> 
+  rename_with(~ gsub("_1d$", "", .x), ends_with("_1d")) |> 
+  select(-c("active_upstream_length", "a_cent", "a_cent_weighted", "Season", "DOY", "excProb", 
+            "DOSat.exc", "air.temp", "minDO.pctsat", "maxDO.pctsat", "avgDO.pctsat", "DOpctsat.amp", "probHypSat",
+            "wetQf", "maxPar", "waterYear", "percent_network_wet")) |> 
+  left_join(pca_scores |> select(name, Date, Cluster), by = c("name", "Date")) |> 
+  relocate(c("name", "Cluster"), .after = Site) |> 
+  arrange(Site, Date)
+
+
+# scale data
+lagged_data_scaled <- lagged_data |>
+  # group_by(Site) |>
+  # # mutate(across(
+  # #   all_of(c("active_network_length_m", "avgPar", "Depth", "Q", "ET", "PPT")),
+  # #   ~ ( (.x - min(.x, na.rm = TRUE)) /
+  # #       (max(.x, na.rm = TRUE) - min(.x, na.rm = TRUE)) ) * 100
+  # # )) |>
+  # mutate(active_network_length_m = active_network_length_m/max(active_network_length_m, na.rm = T)*100) |>
+  # mutate(
+  #   across(all_of(c("avgPar", "Depth", "Q", "ET", "PPT")),
+  #          ~ .x - mean(.x, na.rm = TRUE))
+  # ) |>
+  #  # mutate(across(all_of(c("active_network_length_m", "avgPar", "Depth", "Q", "ET", "PPT")), ~ scale(.)[, 1])) |>
+  # ungroup() |>
+  group_by(Site) |>
+  mutate(across(where(is.numeric), ~ as.numeric(scale(.x)))) |>
+  ungroup()
+
+lag_results <- future_map_dfr(
+  seq_len(nrow(grid)),
+  function(i) {
+    evaluate_lag(
+      dat = lagged_data_scaled,
+      var = grid$variable[i],
+      lag_k = grid$lag[i]
+    )
+  },
+  .options = furrr_options(seed = TRUE)
+)
+plan(sequential)
+```
+
+```{r}
+best_points <- lag_results |>
+  group_by(variable, .metric) |>
+  #mutate(mean = round(mean, 2)) |> 
+  mutate(
+         best_mean = max(mean, na.rm = TRUE)) |>
+  filter(mean >= best_mean * 0.97) |>
+  slice_min(lag, n = 1) |>
+  ungroup() |>
+  select(-best_mean) |>
+  mutate(variable = case_when(variable %in% names(var_names) ~ var_names[variable],TRUE ~ variable),
+         .metric = case_when(.metric == "accuracy" ~ "Accuracy",
+                             .metric == "f_meas" ~ "F1",
+                             .metric == "kap" ~ "Kappa",
+                             .metric ==  "roc_auc" ~ "ROC AUC"))
+
+
+lag_results |>
+  mutate(variable = case_when(variable %in% names(var_names) ~ var_names[variable],TRUE ~ variable),
+         .metric = case_when(.metric == "accuracy" ~ "Accuracy", 
+                             .metric == "f_meas" ~ "F1", 
+                             .metric == "kap" ~ "Kappa",
+                             .metric ==  "roc_auc" ~ "ROC AUC")) |> 
+  #filter(.metric %in% c("F1")) |> 
+  ggplot(aes(x = lag, y = mean, color = variable)) +
+  geom_line() +
+  see::scale_color_okabeito() +
+  geom_point(
+    data = best_points,#|> filter(.metric %in% c("F1")),
+    aes(x = lag, y = mean),
+    color = "red",
+    alpha = 0.5,
+    show.legend = FALSE
+  ) +
+    geom_text_repel(
+    data = best_points,#|> filter(.metric %in% c("F1")),
+    aes(x = lag, y = mean, label = lag),
+    vjust = -0.6,
+    color = "red",
+    size = 4,
+    show.legend = FALSE
+  ) +
+  facet_grid(.metric ~ variable, scales = "free_y") +
+  labs(
+    title = "Performance Across Metrics",
+    subtitle = "Higher is better - Point shows 'Best' Lag",
+    x = "Days Prior",
+    y = "Performance",
+    color = ""
+  ) +
+  theme_bw() +
+  theme(    text = element_text(size = 18),          # overall text size
+    legend.text = element_text(size = 16),   # legend entries
+    legend.title = element_text(size = 18),  # legend title
+    axis.title = element_text(size = 18),    # axis titles
+    axis.text = element_text(size = 16),     # axis tick labels
+    plot.title = element_text(size = 20),
+    legend.position = "none") -> p
+p
+
+
+ggsave(
+  filename = "best_lags.png",
+  plot = p,
+  path = here("Figs/Supplement/"),
+  width = 40,
+  height = 20,
+  units = "cm",
+  dpi = "retina"
+)
+```
+
+```{r}
+
+# Find best lag
+best_lag <- lag_results |>
+  filter(.metric == c("f_meas")) |>
+  group_by(variable) |>
+  mutate(
+         best_mean = max(mean, na.rm = TRUE)) |>
+  filter(mean >= best_mean * 0.97) |>
+  slice_min(lag, n = 1) |>
+  ungroup() |>
+  select(-best_mean)
+
+# Lag data
+best_lags_data <- lagged_data_scaled |>
+  group_by(Site, name) |>
+  arrange(Date) |>
+  mutate(
+    across(
+      all_of(best_lag$variable),
+      ~ {
+        this_lag <- best_lag$lag[best_lag$variable == cur_column()]
+        slider::slide_dbl(
+          .x,
+          mean,
+          .before = this_lag,
+          .after = 0,
+          .complete = FALSE
+        )
+      },
+      .names = "{.col}_lag"
+    )
+  ) |>
+  ungroup()
+
+rename_lagged <- function(df, best_tbl) {
+  for (i in seq_len(nrow(best_tbl))) {
+    var <- best_tbl$variable[i]
+    lagn <- best_tbl$lag[i]
+    df <- df |>
+      rename("{var}_{lagn}d" := paste0(var, "_lag"))
+  }
+  df
+}
+
+best_lags_data <- rename_lagged(best_lags_data, best_lag)
+best_lags_data <- best_lags_data |>
+  select(-any_of(best_lag$variable)) |> 
+  drop_na(Cluster)
+
+rf_lagged_mod <- fit_full_model(df = best_lags_data, response = "Cluster", label   = "best_lag_model")
+
+final_wf <- rf_lagged_mod$final_wf
+final_fit <- rf_lagged_mod$final_fit
+fitted_model <- extract_fit_parsnip(final_fit)$fit
+train_data <- rf_lagged_mod$train_data
+selected_vars <- rf_lagged_mod$selected_vars
+beep(2)
+```
+
+### Conf Mat
+
+```{r}
+# List of cluster labels
+labels <- c("all_clusters", "cluster_1", "cluster_2", "cluster_3")
+cluster_colors <- c("1" = "#0072B2","2" = "#009E73","3" = "#E69F00")
+
+# Read all importance files into one long dataframe
+importance_df <-read_csv(here("Results/rf/best_lag_model_importance.csv")) |>
+  #mutate(Cluster = label) |>
+  mutate(
+    predictor = case_when(predictor %in% names(var_names) ~ var_names[predictor],
+                         TRUE ~ predictor  # Keep original if not found in var_names
+                         )
+    ) |> 
+  mutate(norm_importance = importance / max(importance, na.rm = TRUE)
+  ) |>
+  ungroup()
+  
+
+impVars <- importance_df |>
+  mutate(predictor = str_wrap(predictor, width = 15)) |> 
+  ggplot(aes(x = reorder(predictor, importance), y = importance)) +
+  geom_col(position = position_dodge(width = 0.8), fill = "#2C3E50") +
+  coord_flip() +
+  labs(x = "Predictor", y = "Scaled Variable Importance", title = "Random Forest Variable Importance") +
+  theme_few() + 
+  theme(
+    text = element_text(size = 18),          # overall text size
+    legend.text = element_text(size = 16),   # legend entries
+    legend.title = element_text(size = 18),  # legend title
+    axis.title = element_text(size = 18),    # axis titles
+    axis.text = element_text(size = 16),     # axis tick labels
+    plot.title = element_text(size = 20, hjust = 0.5),
+    legend.position = "none"
+    )
+impVars
+
+
+conf_mat <- read_csv(here("Results/rf/best_lag_model_confusion_matrix.csv")) |> 
+ group_by(Prediction) |>
+  mutate(precision = n / sum(n),
+         freq.Perc = round(n / sum(n), 3)) |>
+  ungroup() |>
+  group_by(Reference) |>
+  mutate(recall = n / sum(n)) |>
+  ungroup() |>
+  mutate(label = paste0("(", round(precision, 2), " / ", round(recall, 2), ")")) |> 
+    mutate(label = if_else(Prediction == Reference, label, NA_character_))
+
+conf_mat_plt <- ggplot(conf_mat) +
+  geom_tile(aes(x = Reference, y = Prediction, fill = freq.Perc)) +
+  scale_fill_viridis_c(option = "viridis", direction = 1) +
+  geom_text(
+  aes(x = Reference, y = Prediction, label = n, color = Prediction == Reference), size = 8) +
+  scale_color_manual(values = c("TRUE" = "black", "FALSE" = "white"), guide = "none") +
+  geom_text(aes(x = Reference, y = Prediction + 0.2, label = label), color = "black", size = 6) +
+  scale_y_continuous(
+    trans = "reverse",
+    expand = c(0, 0),
+    breaks = 1:3,
+    labels = paste("Regime", 1:3)
+  ) +
+  scale_x_continuous(
+    position = "top",
+    expand = c(0, 0),
+    breaks = 1:3,
+    labels = paste("Regime", 1:3)
+  ) +
+  labs(
+    tag = "A",
+    fill = "Fraction Predicted",
+    x = "Actual",
+    y = "Predicted"
+  ) +
+  theme(
+    panel.background = element_rect(fill = NA, colour = "black", linewidth = 1),
+    axis.line = element_line(colour = "black"),
+    legend.position = "bottom",
+    legend.key.width = unit(1.5, "cm"),
+    legend.key.height = unit(0.3, "cm"),
+    legend.title = element_text(vjust = 1),
+    axis.text.y = element_text(angle = 90, hjust = .5)
+  )
+conf_mat_plt
+
+
+ggsave(
+  filename = "best_lags_conf.png",
+  plot = conf_mat_plt,
+  path = here("Figs/Supplement/"),
+  width = 20,
+  height = 20,
+  units = "cm",
+  dpi = "retina"
+)
+```
+
+### SHAP
+
+```{r}
+# Ensure x_train and corresponding Site values match
+# x_train <- best_lags_data |> 
+#   filter(
+#     Site %in% c("GBJ", "JDR") | !if_any(everything(), is.na)
+#   )
+
+x_train <- rf_lagged_mod$train_data
+set.seed(42)
+x_bg <- x_train |> 
+  slice_sample(n = 200)
+
+plan(multisession, workers = availableCores())
+system.time(
+  if (file.exists(here("Results/rf/lagged_rf_exact_shap.rds"))) {
+  all_shap <- read_rds(here("Results/rf/lagged_rf_exact_shap.rds"))
+  } else {
+  all_shap <- kernelshap::kernelshap(
+    fitted_model,
+    X = x_train,
+    bg_X = x_bg,
+    feature_names = selected_vars,
+    parallel_args = list(packages = "ranger"),
+    parallel = TRUE,
+    verbose = TRUE,
+    seed = 42
+  )
+  saveRDS(all_shap, here("Results/rf/lagged_rf_exact_shap.rds"))
+  }
+)
+plan(sequential)
+
+
+
+
+all_shap_vz <- shapviz::shapviz(all_shap)
+shapviz::sv_importance(all_shap_vz)
+shapviz::sv_importance(all_shap_vz, kind = "bee")
+
+
+
+shapviz::sv_importance(all_shap_vz) +
+  theme_few()
+shapviz::sv_importance(all_shap_vz[[1]], kind = "bee") +
+  theme_few()
+shapviz::sv_importance(all_shap_vz[[2]], kind = "bee") +
+  theme_few()
+shapviz::sv_importance(all_shap_vz[[3]], kind = "bee") +
+  theme_few()
+shapviz::sv_dependence(all_shap_vz, v = "active_network_length_m_0d", color_var = NULL, share_y = TRUE) 
+shapviz::sv_force(all_shap_vz) 
+```
+
+### Testing Beeswarm
+
+```{r}
+feature_long <- all_shap$X |>
+  select(all_of(selected_vars)) |>
+  mutate(id = row_number()) |>
+  pivot_longer(
+    cols = -id,
+    names_to = "feature",
+    values_to = "feature_value"
+  )
+# Convert SHAP list to long tibble
+shap_tibble <- map2_dfr(
+  all_shap$S,
+  names(all_shap$S),
+  \(mat, clust) {
+    as_tibble(mat) |>
+      mutate(across(everything(), as.numeric)) |>
+      mutate(id = row_number(), Cluster = clust)
+  }
+) |>
+  pivot_longer(
+    cols = -c(id, Cluster),
+    names_to = "feature",
+    values_to = "shap_value"
+  )
+
+shap_tibble <- shap_tibble |>
+  left_join(feature_long, by = c("id", "feature")) |> 
+  mutate(feature = case_when(
+      feature %in% names(var_names) ~ var_names[feature], TRUE ~ feature))
+
+feature_order <- shap_tibble |>
+  group_by(feature) |>
+  summarise(mean_abs_shap = mean(abs(shap_value), na.rm = TRUE)) |>
+  arrange(desc(mean_abs_shap)) |>
+  pull(feature)
+
+library(ggbeeswarm)
+
+shap_tibble |>
+  group_by(feature) |>
+  mutate(
+    feature_value_scaled = (feature_value - min(feature_value, na.rm = TRUE)) /
+      (max(feature_value, na.rm = TRUE) - min(feature_value, na.rm = TRUE))
+  ) |>
+  ungroup() |> 
+  mutate(feature = factor(feature, levels = feature_order),
+         Cluster = factor(Cluster, levels = c("3", "2", "1"))) |> 
+  ggplot(aes(x = shap_value, y = Cluster, color = feature_value_scaled)) +
+  geom_quasirandom(groupOnX = FALSE, dodge.width = 1, alpha = 0.2, method = "tukeyDense") +
+  scale_color_viridis_c(
+    option = "plasma",
+    breaks = c(0, 1),
+    labels = c("Low", "High")
+  ) +
+  labs(
+    x = "SHAP Value",
+    y = "Regime",
+    color = "Feature Value",
+  ) +
+  facet_wrap(~feature, nrow = 2, scales = "free_x") +
+  theme(legend.title = element_text(vjust = 1),
+        axis.text.x = element_text(angle = 45, hjust = 1)) -> p
+p
+ggsave(
+  filename = "shap.png",
+  plot = p,
+  path = here("Figs/"),
+  device = "png",
+  width = 40,
+  height = 20,
+  units = "cm",
+  dpi = 600
+)
+
+```
+
+```{r}
+overall_mean_abs_shap <- all_shap$S |>
+  lapply(\(S) abs(S)) |>
+  (\(lst) Reduce("+", lst) / length(lst))() |>
+  colMeans() |>
+  (\(x) {
+    tibble(
+      predictor = names(x),
+      mean_abs_shap = as.numeric(x)
+    )
+  })() |>
+  mutate(
+    predictor = case_when(
+      predictor %in% names(var_names) ~ var_names[predictor],
+      TRUE ~ predictor # Keep original if not found in var_names
+    )
+  )
+# Plot overall importance
+
+shap_imp <- overall_mean_abs_shap |>
+  ggplot(aes(x = mean_abs_shap, y = reorder(predictor, mean_abs_shap))) +
+  geom_col(position = position_dodge(width = 0.8), fill = "#2C3E50") +
+  #coord_flip() +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.05))) +
+  #scale_x_discrete(labels = wrap_format(15)) +
+  labs(tag = "B",
+       title = "SHAP Variable Importance",
+       x = "Mean |SHAP|",
+       y = "Predictor")
+shap_imp
+
+combined_plot <- plot_grid(kmeans_plt, shap_imp) + theme(plot.tag = element_text(face = "bold", size = 20))
+combined_plot
+ggsave(
+  filename = "kmeans_vars.png",
+  plot = combined_plot,
+  path = here("Figs/"),
+  device = "png",
+  width = 40,
+  height = 20,
+  units = "cm",
+  dpi = 600
+)
+
+ggsave(
+    filename = "shap_imp.png",
+    plot = shap_imp,
+    path = here("Figs/"),
+    width = 20, height = 20, units = "cm", dpi = 600
+  )
+
+
+
+shap_conf <- plot_grid(conf_mat_plt, shap_imp, label_size = 0) + theme(plot.tag = element_text(face = "bold", size = 20))
+shap_conf
+ggsave(
+  filename = "shap_confmat.png",
+  plot = shap_conf,
+  path = here("Figs/"),
+  device = "png",
+  width = 40,
+  height = 20,
+  units = "cm",
+  dpi = 600
+)
+```
+
+```{r}
+clust_shap <- names(all_shap$S) |>
+  lapply(\(clust_name) {
+    shap_mat <- all_shap$S[[clust_name]]
+    as_tibble(shap_mat) |>
+      cbind(all_shap$X |> select(Site, Date)) |> 
+      transform(Cluster = clust_name)
+  }) |>
+  do.call(what = rbind) |> 
+  as_tibble() |> 
+  mutate(across(where(is.numeric), abs)) |> 
+  group_by(Cluster) |> 
+  summarise(across(where(is.numeric), mean)) |> 
+  pivot_longer(-Cluster, names_to = "predictor", values_to = "shap") |> 
+  group_by(Cluster) |> 
+  #mutate(norm_shap = shap / max(shap)) |> 
+  mutate(norm_shap = shap / sum(shap)) |> 
+  ungroup()
+
+# Rename predictors for readability
+clust_shap <- clust_shap |>
+  mutate(
+    ClusterLabel = paste("Cluster", Cluster),
+     predictor = case_when(predictor %in% names(var_names) ~ var_names[predictor],
+                         TRUE ~ predictor  # Keep original if not found in var_names
+                         )
+    ) 
+
+
+
+# Plot using normalized shap
+cluster_var_prop <- clust_shap |>
+  ggplot(aes(x = reorder(predictor, -norm_shap), y = norm_shap, fill = Cluster)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  scale_x_discrete(labels = label_wrap(15)) +
+  scale_fill_manual(values = cluster_colors) +
+  #theme_few() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Relative SHAP Importance by Regime",
+       x = "Predictor",
+       y = "Proportion of Total |SHAP|",
+       fill = "Regime") 
+cluster_var_prop
+
+ggsave(
+  filename = "cluster_var_prop.png",
+  plot = cluster_var_prop,
+  path = here("Figs/"),
+  device = "png",
+  width = 40,
+  height = 20,
+  units = "cm",
+  dpi = "retina"
+  )
+
+cluster_var_prop_facet <- clust_shap |> 
+  ggplot(aes(x = reorder(predictor, -norm_shap), y = norm_shap, fill = Cluster)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  scale_x_discrete(labels = label_wrap(15)) +
+  scale_fill_manual(values = cluster_colors) +
+  #theme_few() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") +
+  labs(title = "Relative SHAP Importance by Regime",
+       x = "Predictor",
+       y = "Proportion of Total |SHAP|",
+       fill = "Regime") +
+  facet_wrap(~Cluster, ncol = 1)
+cluster_var_prop_facet
+ggsave(
+  filename = "cluster_var_prop_facet.png",
+  plot = cluster_var_prop_facet,
+  path = here("Figs/"),
+  device = "png",
+  width = 20,
+  height = 40,
+  units = "cm",
+  dpi = "retina"
+  )
+
+# Check if the sum of the normalized shap is 1
+norm_check <- clust_shap |> group_by(Cluster) |>
+    summarise(
+        sum_shap = sum(shap, na.rm = TRUE),
+        sum_norm_shap = sum(norm_shap, na.rm = TRUE)
+    )
+
+
+clust_shap |>
+  ggplot(aes(x = reorder(predictor, -shap), y = shap, fill = Cluster)) +
+  geom_col(alpha = 0.8) +
+  scale_x_discrete(labels = label_wrap(15)) +
+  scale_fill_manual(values = cluster_colors) +
+  #theme_few() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "SHAP Importance by Regime",
+       x = "Predictor",
+       y = "Mean |SHAP|",
+       fill = "Regime") 
+
+clust_shap |>
+  ggplot(aes(x = reorder(predictor, -shap), y = shap, fill = Cluster)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  scale_x_discrete(labels = label_wrap(15)) +
+  scale_fill_manual(values = cluster_colors) +
+  #theme_few() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "SHAP Importance by Regime",
+       x = "Predictor",
+       y = "Mean |SHAP|",
+       fill = "Regime") 
+```
+
+```{r}
+site_shap <-  names(all_shap$S) |>
+  lapply(\(clust_name) {
+    shap_mat <- all_shap$S[[clust_name]]
+    as_tibble(shap_mat) |>
+      cbind(all_shap$X |> select(Site, Date)) |> 
+      transform(Cluster = clust_name)
+  }) |>
+  do.call(what = rbind) |> 
+  as_tibble() |>
+  left_join(site_info |> select(Site, Region)) |> 
+  mutate(across(where(is.numeric), abs)) |> 
+  group_by(Region, Cluster) |> 
+  summarise(across(where(is.numeric), mean)) |> 
+  pivot_longer(-c(Cluster, Region), names_to = "predictor", values_to = "shap") |> 
+  group_by(Cluster, Region) |> 
+  #mutate(norm_shap = shap / max(shap)) |> 
+  mutate(norm_shap = shap / sum(shap)) |> 
+  ungroup() |> 
+    mutate(
+    ClusterLabel = paste("Cluster", Cluster),
+     predictor = case_when(predictor %in% names(var_names) ~ var_names[predictor],
+                         TRUE ~ predictor  # Keep original if not found in var_names
+                         )
+    ) 
+
+site_cluster_var_imp <- site_shap |>
+  ggplot(aes(x = reorder(predictor, -shap), y = norm_shap, fill = Region)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  facet_grid(Region~Cluster, scales = "free_x") +
+  #coord_flip() +
+  scale_fill_manual(
+    values = c("#613921", "#83A102", "#006475"),
+    breaks = c("Great Plains", "Eastern Temperate Forests", "North American Deserts")
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    x = "Predictor",
+    y = "Proportion of Total |SHAP|"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+site_cluster_var_imp
+
+
+# Check if the sum of the normalized shap is 1
+norm_check <- site_shap |> group_by(Cluster, Region) |>
+    summarise(
+        sum_shap = sum(shap, na.rm = TRUE),
+        sum_norm_shap = sum(norm_shap, na.rm = TRUE)
+    )
+
+site_cluster_var_imp <- site_shap |>
+  ggplot(aes(x = reorder(predictor, -shap), y = norm_shap, fill = Region)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  facet_wrap(~Cluster, scales = "free_x") +
+  #coord_flip() +
+  scale_fill_manual(
+    values = c("#613921", "#83A102", "#006475"),
+    breaks = c("Great Plains", "Eastern Temperate Forests", "North American Deserts")
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    x = "Predictor",
+    y = "Proportion of Total |SHAP|"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+site_cluster_var_imp
+
+
+site_cluster_var_imp <- site_shap |>
+  ggplot(aes(x = reorder(predictor, -shap), y = norm_shap, fill = Cluster)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  facet_wrap(~Region, scales = "free_x") +
+  #coord_flip() +
+  # scale_fill_manual(
+  #   values = c("#613921", "#83A102", "#006475"),
+  #   breaks = c("Great Plains", "Eastern Temperate Forests", "North American Deserts")
+  # ) +
+  scale_fill_manual(values = cluster_colors) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    x = "Predictor",
+    y = "Proportion of Total |SHAP|",
+    fill = "Regime"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+  )
+site_cluster_var_imp
+
+site_shap |> group_by(Region) |>
+    summarise(
+        sum_shap = sum(shap, na.rm = TRUE),
+        sum_norm_shap = sum(norm_shap, na.rm = TRUE)
+    )
+
+ggsave(
+  filename = "site_shap.png",
+  plot = site_cluster_var_imp,
+  path = here("Figs/Supplement/"),
+  device = "png",
+  width = 40,
+  height = 20,
+  units = "cm",
+  dpi = "retina"
+)
+
+# order predictors by overall mean importance (across all region-regime combos)
+pred_order <- site_shap |>
+  group_by(predictor) |>
+  summarise(m = mean(norm_shap, na.rm = TRUE), .groups = "drop") |>
+  arrange(desc(m)) |>
+  pull(predictor)
+
+site_shap |>
+  mutate(
+    predictor = factor(predictor, levels = rev(pred_order)),
+    Cluster = factor(Cluster, levels = c("1","2","3"))
+  ) |>
+  ggplot(aes(x = Cluster, y = predictor, fill = norm_shap)) +
+  geom_tile(color = "white", linewidth = 0.2) +
+  facet_wrap(~ Region, nrow = 1) +
+  scale_y_discrete(drop = FALSE) +
+  scale_fill_viridis_c(option = "viridis", direction = 1) +
+  labs(x = "Regime", y = NULL, fill = "Proportion of\nTotal |SHAP|") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid = element_blank())
+
+site_shap_ranked <- site_shap |>
+  group_by(Region, predictor) |>
+  mutate(pred_mean_region = mean(norm_shap, na.rm = TRUE)) |>
+  ungroup() |>
+  mutate(
+    predictor = reorder(predictor, pred_mean_region),
+    Cluster = factor(Cluster, levels = c("1","2","3"))
+  )
+
+
+zero_trim <- function(x) {
+  ifelse(x == 0, "0", label_number(accuracy = 0.01)(x))
+}
+
+site_cluster_var_imp <- ggplot(site_shap_ranked,
+                               aes(x = predictor, y = norm_shap, fill = Cluster)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75, alpha = 0.9) +
+  facet_wrap(~ Region, scales = "fixed") +
+  coord_flip() +
+  scale_fill_manual(values = cluster_colors) +
+  scale_y_continuous(
+    labels = zero_trim,
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  labs(x = NULL, y = "Proportion of Total |SHAP|", fill = "Regime") +
+  theme(
+    panel.spacing.x = unit(2.0, "lines"),
+    # plot.margin = ggplot2::margin(5.5, 20, 5.5, 5.5),
+    # axis.text.y = element_text(margin = ggplot2::margin(r = 6)),
+    strip.text = element_text(face = "bold", size = 20)
+  )
+
+site_cluster_var_imp
+ggsave(
+  filename = "site_shap.png",
+  plot = site_cluster_var_imp,
+  path = here("Figs/Supplement/"),
+  device = "png",
+  width = 40,
+  height = 20,
+  units = "cm",
+  dpi = "retina"
+)
+
+```
+
+### ALE
+
+```{r}
+library(ale)
+rf_pred_fun <- function(object, newdata, type = "response") {
+  predict(object, data = newdata)$predictions
+}
+plan(sequential)
+plan(multisession, workers = parallel::detectCores() - 1)
+# Create ALE plots with the custom prediction function
+if (file.exists(here("Results/rf/ale_env.rds"))) {
+  ale_rf <- read_rds(here("Results/rf/ale_env.rds"))
+} else {
+  ale_rf <- ale::ALE(
+    model = fitted_model,
+    data = train_data |> select(selected_vars, Cluster) |> drop_na(),
+    y_col = "Cluster",
+   # y_type = "categorical",
+    pred_fun = rf_pred_fun,
+    x_cols = list(d1 = TRUE), # All 1D effects
+    boot_it = 1000,
+    parallel = "all",
+   p_values = NULL,
+   seed = 42
+  )
+  write_rds(ale_rf, here("Results/rf/ale_env.rds"))
+}
+
+
+ale_plts <- suppressWarnings(plot(ale_rf))
+ale_plts
+for (i in selected_vars) {
+  get(ale_plts, i) |> print(ncol = 2)
+}
+
+# Extract the data
+ale_plot_data <- get_ale_data(ale_rf) |> 
+  mutate(
+    variable = case_when(variable %in% names(var_names) ~ var_names[variable],
+                         TRUE ~ variable  # Keep original if not found in var_names
+                         )
+    ) |> 
+  # Normalize to 0-1 scale for each cluster-variable combination
+  group_by(Cluster, variable) |>
+  mutate(
+    # Scale to 0-1 range
+    ale_scaled = (ale_values - min(ale_values, na.rm = TRUE)) / 
+                       (max(ale_values, na.rm = TRUE) - min(ale_values, na.rm = TRUE)),
+    ale_lower_scaled = (ale_lower - min(ale_values, na.rm = TRUE)) /
+                       (max(ale_values, na.rm = TRUE) - min(ale_values, na.rm = TRUE)),
+    ale_upper_scaled = (ale_upper - min(ale_values, na.rm = TRUE)) /
+                       (max(ale_values, na.rm = TRUE) - min(ale_values, na.rm = TRUE))
+  ) |>
+  # mutate(
+  #   ale_lower_scaled = pmax(ale_lower_scaled, -0.01),
+  #   ale_upper_scaled = pmin(ale_upper_scaled, 1.01)
+  # ) |>
+  ungroup()
+
+# Reorder variables by SHAP importance
+var_order <- overall_mean_abs_shap |>
+  arrange(desc(mean_abs_shap)) |>
+  pull(predictor)
+
+ale_plot_data <- ale_plot_data |>
+  mutate(variable = factor(variable, levels = var_order))
+
+# ale_plot_data |> 
+#   ggplot(aes(x = x_values, y = ale_values, color = Cluster)) +
+#   scale_color_manual(values = cluster_colors) +
+#   scale_fill_manual(values = cluster_colors) +
+#   # Add confidence intervals as ribbons (behind the lines)
+#   geom_ribbon(aes(ymin = ale_lower, ymax = ale_upper, fill = Cluster), alpha = 0.4) +
+#   # Add the main ALE lines
+#   geom_line(linewidth = 1.2, alpha = 0.9) +
+#   geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+#   facet_wrap(~variable, scales = "free", ncol = 3) +
+#   labs(
+#     title = "ALE Effects Across All Clusters and Variables",
+#     x = "Feature Values",
+#     y = "ALE Values",
+#     subtitle = paste("Based on", nrow(train_data), "observations with", 
+#                     length(unique(train_data$Cluster)), "clusters")
+#   ) +
+#   theme_minimal() +
+#   theme(
+#     strip.text = element_text(size = 10, face = "bold"),
+#     legend.position = "bottom",
+#     panel.grid.minor = element_blank(),
+#     axis.text.x = element_text(angle = 45, hjust = 1)
+#   )
+
+# Plot scaled ALE effects
+ale_scaled <- ale_plot_data |>
+  filter(!is.na(x_values), !is.na(ale_scaled)) |>
+  ggplot(aes(x = x_values, y = ale_scaled, color = Cluster, fill = Cluster)) +
+  geom_ribbon(
+    aes(ymin = ale_lower_scaled, ymax = ale_upper_scaled),
+    alpha = 0.2, color = NA, na.rm = FALSE
+  ) +
+  geom_line(linewidth = 1.3, alpha = 0.9) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", alpha = 0.5) +
+  scale_color_manual(values = cluster_colors) +
+  scale_fill_manual(values = cluster_colors) +
+  facet_wrap(~variable, scales = "free_x", nrow = 2) +
+  labs(
+    x = "Feature Values",
+    y = "Normalized ALE Values (0–1)",
+    fill = "Regime",
+    color = "Regime"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold")
+  ) +
+  coord_cartesian(ylim = c(0, 1))
+ale_scaled
+ggsave(
+  filename = "scaled_ale_plt.png",
+  plot = ale_scaled,
+  path = here("Figs/"),
+  device = "png",
+  width = 40,
+  height = 20,
+  units = "cm",
+  dpi = "retina"
+)
+beepr::beep(2)
+```
+
+### PDP
+
+```{r}
+# classes <- levels(train_data$Cluster)
+# 
+# pdp_out <- list()
+# 
+# sites <- train_data |> 
+#   select(all_of(selected_vars), Site) |> 
+#   drop_na() |> 
+#   pull(Site) |> 
+#   unique()
+# 
+# unscalled_lag <- lagged_data |>
+#   group_by(Site, name) |>
+#   arrange(Date) |>
+#   mutate(
+#     across(
+#       all_of(best_lag$variable),
+#       ~ {
+#         this_lag <- best_lag$lag[best_lag$variable == cur_column()]
+#         slider::slide_dbl(
+#           .x,
+#           mean,
+#           .before = this_lag,
+#           .after = 0,
+#           .complete = TRUE
+#         )
+#       },
+#       .names = "{.col}_lag"
+#     )
+#   ) |>
+#   ungroup()
+# unscalled_lag <- rename_lagged(unscalled_lag, best_lag)
+# 
+# var_ranges <- unscalled_lag |>
+#   group_by(Site) |>
+#   summarise(across(all_of(selected_vars),
+#                    \(x) list(c(min(x, na.rm = TRUE), max(x, na.rm = TRUE)))))
+# 
+# 
+# for (var in selected_vars) {
+#   for (cl in classes) {
+#     for (s in sites) {
+#       # site training data
+#       train_s <- train_data |> 
+#         filter(Site == s) |> 
+#         select(all_of(selected_vars)) |> 
+#         drop_na()
+#       # if a site has zero or 1 rows, skip it
+#       if (nrow(train_s) < 2) next
+# 
+#       pd <- pdp::partial(
+#         object = fitted_model,
+#         pred.var = var,
+#         train = train_s,
+#         prob = TRUE,
+#         which.class = cl
+#       ) |>
+#         mutate(
+#           variable = var,
+#           cluster = cl,
+#           Site = s
+#         ) |>
+#         rename(predictor_value = !!sym(var))
+# 
+#       pdp_out[[paste(var, cl, s, sep = "_")]] <- pd
+#     }
+#   }
+# }
+# pdp_df <- bind_rows(pdp_out)
+# 
+# p <- list()
+# 
+# for (var in selected_vars) {
+# 
+#   df_var <- pdp_df |> 
+#     filter(variable == var) |> 
+#     group_by(Site, cluster, variable) |> 
+#     mutate(prob_scale = rescale(yhat, to = c(0, 1))) |> 
+#     ungroup()
+#   
+#   
+#     df_var <- df_var |>
+#       left_join(var_ranges, by = "Site") |>
+#       rowwise() |>
+#       mutate(
+#         predictor_orig =
+#           (predictor_value / 100) *
+#           (get(variable)[[2]] - get(variable)[[1]]) +
+#           get(variable)[[1]]
+#       ) |>
+#       ungroup() |> 
+#       mutate(
+#       variable = case_when(
+#         variable %in% names(var_names) ~ var_names[variable],
+#         TRUE ~ variable
+#       )
+#     ) 
+# 
+#   p[[var]] <- df_var |> 
+#     ggplot(aes(x = predictor_orig, y = prob_scale, color = cluster)) +
+#     geom_line(linewidth = 0.8) +
+#     scale_color_manual(values = cluster_colors) +
+#     facet_wrap(~ Site, scales = "free_x") +
+#     labs(
+#       x = var_names[var],
+#       y = "Scaled probability (0–1 within Regime)",
+#       color = "Regime",
+#       title = "PDP by Regime × Site",
+#       subtitle = paste("Predictor:", var_names[var])
+#     ) +
+#     theme_few()
+# }
+# 
+# p
+# 
+# 
+# ggsave(
+#   filename = "site_pdp_asdn.png",
+#   plot = p$active_network_length_m_0d,
+#   path = here("Figs/Supplement/"),
+#   device = "png",
+#   width = 40,
+#   height = 20,
+#   units = "cm",
+#   dpi = "retina"
+# )
+```
+
+```{r}
+# 
+# classes <- levels(train_data$Cluster)
+# 
+# pdp_out <- list()
+# 
+# regions <- train_data |> 
+#   select(all_of(selected_vars), Site) |> 
+#   left_join(site_info |> select(Site, Region)) |> 
+#   pull(Region) |> 
+#   unique()
+# 
+# train_data <- train_data |> 
+#   left_join(site_info |> select(Site, Region))
+# 
+# for (var in selected_vars) {
+#   for (cl in classes) {
+#     for (region in regions) {
+#       # region training data
+#       train_region <- train_data |> 
+#         filter(Region == region) |> 
+#         select(all_of(selected_vars))
+#       
+#       # must have enough rows
+#       if (nrow(train_region) < 2) next
+# 
+#       # drop rows where this var is NA (prevents min/max Inf/-Inf)
+#       train_region_nonmiss <- train_region |>
+#         filter(!is.na(.data[[var]]))
+# 
+#       if (nrow(train_region_nonmiss) < 2) next
+# 
+#       # need some variation; constant predictor can also cause trouble/useless PD
+#       if (length(unique(train_region_nonmiss[[var]])) < 2) next
+#       
+#       pd <- pdp::partial(
+#         object = fitted_model,
+#         pred.var = var,
+#         train = train_region,
+#         prob = TRUE,
+#         which.class = cl
+#       ) |>
+#         mutate(
+#           variable = var,
+#           cluster = cl,
+#           Region = region
+#         ) |>
+#         rename(predictor_value = !!sym(var))
+# 
+#       pdp_out[[paste(var, cl, region, sep = "_")]] <- pd
+#     }
+#   }
+# }
+# pdp_df <- bind_rows(pdp_out)
+# 
+# p <- list()
+# 
+# for (var in selected_vars) {
+#   
+#   df_var <- pdp_df |> 
+#     filter(variable == var) |> 
+#     group_by(Region, cluster, variable) |> 
+#     mutate(prob_scale = rescale(yhat, to = c(0, 1))) |> 
+#     ungroup() |> 
+#     mutate(
+#       variable = case_when(
+#         variable %in% names(var_names) ~ var_names[variable],
+#         TRUE ~ variable
+#       )
+#     ) 
+#   
+#   p[[var]] <- df_var |> 
+#     ggplot(aes(x = predictor_value, y = prob_scale, color = cluster)) +
+#     geom_line(linewidth = 0.8) +
+#     scale_color_manual(values = cluster_colors) +
+#     facet_wrap(~ Region, scales = "free_x") +
+#     labs(
+#       x = var_names[var],
+#       y = "Scaled probability (0–1 within Regime)",
+#       color = "Regime",
+#       title = "PDP by Regime × Region",
+#       subtitle = paste("Predictor:", var_names[var])
+#     ) +
+#     theme_few()
+# }
+# 
+# p
+# 
+# 
+# ggsave(
+#   filename = "site_pdp_asdn.png",
+#   plot = p$active_network_length_m_0d,
+#   path = here("Figs/Supplement/"),
+#   device = "png",
+#   width = 40,
+#   height = 20,
+#   units = "cm",
+#   dpi = "retina"
+# )
+
+```
+
+```{r}
+classes <- levels(train_data$Cluster)
+
+pdp_out <- list()
+
+sites <- train_data |>
+  select(all_of(selected_vars), Site) |>
+  left_join(site_info |> select(Site, Region)) |>
+  pull(Site) |>
+  unique()
+
+for (var in selected_vars) {
+  for (cl in classes) {
+    for (s in sites) {
+      # region training data
+      train_site <- train_data |>
+        filter(Site == s) |>
+        select(all_of(selected_vars))
+
+      # must have enough rows
+      if (nrow(train_site) < 2) next
+
+      # drop rows where this var is NA (prevents min/max Inf/-Inf)
+      train_site_nonmiss <- train_site |>
+        filter(!is.na(.data[[var]]))
+
+      if (nrow(train_site_nonmiss) < 2) next
+
+      # need some variation; constant predictor can also cause trouble/useless PD
+      if (length(unique(train_site_nonmiss[[var]])) < 2) next
+
+      pd <- pdp::partial(
+        object = fitted_model,
+        pred.var = var,
+        train = train_site,
+        prob = TRUE,
+        which.class = cl
+      ) |>
+        mutate(
+          variable = var,
+          cluster = cl,
+          Site = s
+        ) |>
+        rename(predictor_value = !!sym(var))
+
+      pdp_out[[paste(var, cl, s, sep = "_")]] <- pd
+    }
+  }
+}
+pdp_df <- bind_rows(pdp_out)
+
+p <- list()
+
+for (var in selected_vars) {
+
+  df_var <- pdp_df |>
+    filter(variable == var) |>
+    group_by(Site, cluster, variable) |>
+    mutate(prob_scale = rescale(yhat, to = c(0, 1))) |>
+    ungroup() |>
+    mutate(
+      variable = case_when(
+        variable %in% names(var_names) ~ var_names[variable],
+        TRUE ~ variable
+      )
+    )
+
+  p[[var]] <- df_var |>
+    ggplot(aes(x = predictor_value, y = prob_scale, color = cluster)) +
+    geom_line(linewidth = 0.8) +
+    scale_color_manual(values = cluster_colors) +
+    facet_wrap(~ Site, scales = "free_x") +
+    labs(
+      x = var_names[var],
+      y = "Scaled probability (0–1 within Regime)",
+      color = "Regime",
+      title = "PDP by Regime × Site",
+      subtitle = paste("Predictor:", var_names[var])
+    ) +
+    theme_few()
+}
+
+p
+
+```
+
+```{r}
+beepr::beep(2)
+# unlink(here("Results/rf/lagged_rf_exact_shap.rds"))
+# unlink(here("Results/rf/ale_env.rds"))
+```
+

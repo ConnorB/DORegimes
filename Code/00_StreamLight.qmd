@@ -29,7 +29,7 @@ pathDir <- here("Data/streamLight")
 
 ```{r}
 siteInfo <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Sites") |> 
-  dplyr::filter(siteId %in% c("SFM01", "SHM01", "ENM01")) |> 
+  dplyr::filter(siteId %in% c("SFM01", "SHM01", "ENM01") & watershed != "KNG") |> 
   dplyr::rename(Site_ID = siteId) |> 
   st_transform(crs = 4326) |>
   dplyr::mutate(
@@ -114,7 +114,7 @@ plan(multisession)
 # Main parallel processing using furrr
 results <- future_map(fit_methods, function(method) {
   # Process data with current method
-  modProc <- suppressWarnings(AppEEARS_proc(unpacked_LAI = modDat, fit_method = method, plot = FALSE))
+  modProc <- AppEEARS_proc(unpacked_LAI = modDat, fit_method = method, plot = FALSE)
   
   # Calculate metrics for all sites
   site_metrics <- map(names(modProc), function(site_name) {

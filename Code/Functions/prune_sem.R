@@ -1961,7 +1961,7 @@ plot_sem_graph <- function(sem_fit, round_digits = 2, file = NULL, width = 3600,
                             ifelse(P.Value < 0.01, "**",
                                    ifelse(P.Value < 0.05, "*", "")))),
       color = ifelse(Estimate >= 0, "green3", "firebrick"),
-      penwidth = 10 * abs(Estimate),
+      penwidth = 1 * abs(Estimate),
       style = ifelse(P.Value < 0.05, "solid", "dotted")
     )
   

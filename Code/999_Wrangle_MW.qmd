@@ -1,0 +1,764 @@
+---
+title: "CLB"
+author: "Wrangle JDR"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+library(here)
+source(here("Code/paths+packages.R"))
+source(here("Code/Functions/aims.R"))
+```
+
+# New Data from SG
+
+```{r}
+list.files("~/Downloads/MWAIMS_PT_v2", recursive = T)
+
+pt_v2 <- list.files("~/Downloads/MWAIMS_PT_v2", pattern = "\\.txt$",
+                    recursive = TRUE, full.names = TRUE) |>
+  (\(files) {
+    lst <- lapply(files, \(f) {
+      df <- fread(f, sep = "auto", quote = "\"",
+                  na.strings = c("NA", "", "null"),
+                  colClasses = "character")
+    })
+    rbindlist(lst, use.names = TRUE, fill = TRUE)
+  })()
+
+pt_v2[, dt_mountain :=
+        ifelse(grepl("Z$", datetime),
+               force_tz(ymd_hms(datetime, tz = "UTC"), "America/Denver"),
+               mdy_hm(datetime, tz = "America/Denver")) |>
+        as.POSIXct()]
+```
+
+# Find All the Data We Need
+
+```{r}
+jdr_meta <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_MountainWest.gpkg", layer = "Sites") |> 
+  filter(siteId == "JSS01") |> 
+  st_transform(4326) |> 
+  mutate(
+    lon = st_coordinates(geom)[, 1],
+    lat = st_coordinates(geom)[, 2]
+  ) |> 
+  select(siteId, elev_m, lat, lon)
+
+jss01_Q_SG <- read_csv(here("Data/MW/Q_SG/Qstage_21to24_all.csv")) |> 
+  mutate(dateTime = with_tz(as.POSIXct(DateTime, format = "%d%b%Y %I:%M:%S %p", tz = "MST"), tz = "UTC")) |> 
+  filter(site == "JSS01") |> 
+  select(dateTime, waterDepth_cm = FS_stage, Q_Ls = Q) |>
+  mutate(waterDepth_cm = replace_na(waterDepth_cm, 0),
+    waterDepth_cm = if_else(waterDepth_cm < 0, 0, waterDepth_cm)) |> 
+  mutate(
+     wetdry = case_when(
+       waterDepth_cm <= 0 ~ 0,
+       TRUE ~ 1)) |> 
+  filter(between(dateTime, ymd("2022-01-01"), ymd("2023-12-31"))) 
+
+jss01_Stage <- read_csv(here("Data/MW/SUPERSENSOR.csv")) |> 
+  select(dateTime = datetime, siteId = siteID, waterDepth_cm = finalwaterlevel, ptTemp = tempC, wetdry) |>
+  filter(siteId == "JSS01") |> 
+  select(-siteId) |> 
+  mutate(
+    dateTime = as.POSIXct(dateTime, format = "%m/%d/%Y %H:%M"),
+    dateTime = force_tz(dateTime, tz = "MST")) |> 
+  drop_na(dateTime) |> 
+  complete(dateTime = seq(
+    floor_date(min(dateTime), "15 min"), 
+    floor_date(max(dateTime), "15 min"), 
+    by = "15 min")) |>
+  arrange(dateTime) |>
+  mutate(
+    wetdry = as.numeric(wetdry),
+    ) |>
+  filter(minute(dateTime) %% 15 == 0) |> 
+  filter(between(dateTime, ymd("2022-01-01"), ymd("2023-12-31"))) 
+
+# jss01_stageQ <- jss01_Q_SG |> 
+#   full_join(jss01_Stage)
+
+jdr_exo <- read_csv(here("Data/MW/JDR/JDR_exodata_wide_2022_23_final.csv")) |> 
+  rename(dateTime = TIMESTAMP, siteId = SiteName) |> 
+  rename_with(~ str_replace_all(.x, "_+", "_")) |>  # Collapse repeated underscores
+  rename_with(~ str_replace(.x, "_$", "")) |>          # Drop underscore at end
+  complete(dateTime = seq(min(dateTime), max(dateTime), by = "15 min"), fill = list(siteId = "JDR")) |>
+  arrange(dateTime) |> 
+  mutate(across(
+    where(is.numeric),
+    ~ na.approx(., x = dateTime, na.rm = FALSE, maxgap = 2)
+  ))
+
+jdr_ppt <- read_delim(here("Data/MW/JDR/reynolds-creek-125-hourly-precipitation.dat"), skip = 20, delim = ",") |> 
+  mutate(datetime = with_tz(force_tz(datetime, tzone = "MST"), tzone = "UTC")) |> 
+  select(dateTime = datetime, precip_corr_mm = ppta, precip_shielded_mm = ppts, precip_unshielded_mm = pptu)
+
+jdr_q <- read_delim(here("Data/MW/JDR/reynolds-creek-125b-breakpoint-streamflow.dat"), skip = 18, delim = ",") |> 
+  mutate(datetime = with_tz(force_tz(datetime, tzone = "MST"), tzone = "UTC")) |> 
+  rename(dateTime = datetime, Q_cms = qcms) |> 
+  filter(between(dateTime, ymd("2022-01-01"), ymd("2023-12-31")))
+
+
+jdr_met <-read_delim(here("Data/MW/JDR/reynolds-creek-125-climate-l1.dat"), skip = 29, delim = ",") |> 
+  mutate(datetime = with_tz(force_tz(datetime, tzone = "MST"), tzone = "UTC")) |> 
+  rename(dateTime = datetime, wind_dir_deg = wnd3d, wind_run_km = wnd3r, solar_rad_W_m2 = sol, wind_dir_mean_deg = wnd3dr, wind_speed_mean_m_s = wnd3sa,      
+    wind_speed_resultant_m_s = wnd3sr, wind_speed_max_m_s = wnd3sx, rel_humidity_pct = hum3, air_temp_C = tmp3, vapor_pressure_kPa = vap3, vapor_pressure_sat_kPa = vap3s,
+    wind_speed_inst_m_s = wnd3s) |> 
+  filter(between(dateTime, ymd("2022-01-01"), ymd("2023-12-31")))
+
+jdr_ars <- jdr_q |> 
+  full_join(jdr_met) |> 
+  mutate(across(where(is.numeric), ~ ifelse(.x == -999, NA, .x)))
+rm(jdr_met, jdr_q, jdr_ppt)
+
+# Ameriflux
+# Read the half-hourly data
+flux_hh <- read_csv(here("Data/MW/JDR/AmeriFlux/AMF_US-Rws_FLUXNET_FULLSET_HH_2014-2023_5-7.csv"),
+                    na = c("-9999", "-9999.0", "NA")) |> 
+   mutate(dateTime =  with_tz(ymd_hm(as.character(TIMESTAMP_START), tz = "MST"), tzone = "UTC")) |>
+  select(dateTime, air_temp_C = TA_F, solar_rad_W_m2 = SW_IN_F, air_pressure_kPa = PA_F) |> 
+  filter(between(dateTime, ymd("2022-01-01"), ymd("2023-12-31"))) |> 
+  complete(dateTime = seq(min(dateTime), max(dateTime), by = "15 min")) |>
+  arrange(dateTime) |> 
+  mutate(
+    air_temp_C = na.approx(air_temp_C, x = dateTime, na.rm = FALSE),
+    solar_rad_W_m2 = na.approx(solar_rad_W_m2, x = dateTime, na.rm = FALSE),
+    air_pressure_kPa = na.approx(air_pressure_kPa, x = dateTime, na.rm = FALSE)
+  )
+flux_heights <- read_csv(here("Data/MW/JDR/AmeriFlux/BASE_MeasurementHeight_20250522.csv")) |> 
+  filter(Site_ID =="US-Rws")
+bif <- readxl::read_excel(here("Data/MW/JDR/AmeriFlux/AMF_AA-Flx_BIF_CCBY4_20250522.xlsx")) |> 
+  filter(SITE_ID =="US-Rws") |> 
+  select(-c(GROUP_ID, VARIABLE_GROUP)) |> 
+  filter(VARIABLE %in% c("SITE_ID", "SITE_NAME", "FLUX_MEASUREMENTS_DATE_START", "LOCATION_LAT", "LOCATION_LONG", "LOCATION_ELEV", "LOCATION_COMMENT")) |>
+  distinct(SITE_ID, VARIABLE, DATAVALUE) |> 
+  pivot_wider(names_from = VARIABLE, values_from = DATAVALUE) |>
+  mutate(across(everything(), as.character)) |> 
+  select(siteId = SITE_ID, SITE_NAME, FLUX_MEASUREMENTS_DATE_START, lat = LOCATION_LAT, lon = LOCATION_LONG, elev_m = LOCATION_ELEV, LOCATION_COMMENT)  |>
+  mutate(across(lat:elev_m, as.numeric))
+
+flux_daily <- read_csv(here("Data/MW/JDR/AmeriFlux/AMF_US-Rws_FLUXNET_FULLSET_DD_2014-2023_5-7.csv"),
+                    na = c("-9999", "-9999.0", "NA")) |> 
+  select(dateTime = TIMESTAMP, precip_mm = P_F) |> 
+   mutate(dateTime = ymd(as.character(dateTime), tz = "MST")) |> 
+  filter(between(dateTime, ymd("2022-01-01"), ymd("2023-12-31"))) 
+
+
+jdr_sites <- jdr_meta |> 
+  st_drop_geometry() |> 
+  full_join(bif |>  select(siteId, lat, lon, elev_m)) |> 
+  st_as_sf(coords = c("lon", "lat"), crs = 4326)
+
+library(mapview)
+map <- mapview(jdr_sites, zcol = "elev_m", label = "siteId")
+map
+```
+
+# Check out Data
+
+```{r}
+
+ggplot(jdr_exo, aes(x = dateTime, y = ODO_mg_L, color = ODO_mg_L_flag)) +
+  geom_point(alpha = 0.6) +
+  labs(
+    title = "JDR",
+    x = "",
+    y = "DO (mg/L)",
+  ) +
+  theme_minimal()
+
+jdr_exo |> 
+ggplot(aes(x = dateTime, y = ODOSat, color = as.factor(ODOSat_flag))) +
+  geom_point(alpha = 0.6) +
+  labs(
+    title = "JDR",
+    x = "",
+    y = "DO (mg/L)",
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Get all column names except dateTime
+vars_to_plot <- jdr_ars |>
+  select(-dateTime) |>
+  names()
+
+# Create plots
+walk(vars_to_plot, function(var) {
+  p <- ggplot(jdr_ars, aes(x = dateTime, y = .data[[var]])) +
+    geom_point(na.rm = TRUE, alpha = 0.5) +
+    labs(title = var, x = "Time", y = var) +
+    theme_minimal()
+  print(p)  # Display the plot
+})
+
+
+# Get all column names except dateTime
+vars_to_plot <- flux_hh |>
+  select(-dateTime) |>
+  names()
+
+# Create plots
+walk(vars_to_plot, function(var) {
+  p <- ggplot(flux_hh, aes(x = dateTime, y = .data[[var]])) +
+    geom_point(na.rm = TRUE, alpha = 0.5) +
+    labs(title = var, x = "Time", y = var) +
+    theme_minimal()
+  print(p)  # Display the plot
+})
+
+# Get all column names except dateTime
+vars_to_plot <- jss01_Q_SG |>
+  select(-dateTime) |>
+  names()
+
+# Create plots
+walk(vars_to_plot, function(var) {
+  p <- ggplot(jss01_Q_SG, aes(x = dateTime, y = .data[[var]])) +
+    geom_point(na.rm = TRUE, alpha = 0.5) +
+    labs(title = var, x = "Time", y = var) +
+    theme_minimal()
+  print(p)  # Display the plot
+})
+
+
+# Get all column names except dateTime
+vars_to_plot <- jss01_Stage |>
+  select(-dateTime) |>
+  names()
+
+# Create plots
+walk(vars_to_plot, function(var) {
+  p <- ggplot(jss01_Stage, aes(x = dateTime, y = .data[[var]])) +
+    geom_point(na.rm = TRUE, alpha = 0.5) +
+    labs(title = var, x = "Time", y = var) +
+    theme_minimal()
+  print(p)  # Display the plot
+})
+```
+
+# Wrangle ARS and Flux Tower Data
+
+```{r}
+jss01_elev <- jdr_sites |> filter(siteId == "JSS01") |> pull(elev_m)
+flux_elev <- jdr_sites |> filter(siteId == "US-Rws") |> pull(elev_m)
+flux_bp_corr <- flux_hh |> 
+  rename(flux_tower_bp_kPa = air_pressure_kPa, flux_tower_air_temp_C = air_temp_C) |> 
+  mutate(bp_kPa_corr = preMetabolizer::correct_bp(flux_tower_bp_kPa, flux_tower_air_temp_C, flux_elev, jss01_elev, drop_units = TRUE)) |> 
+  select(dateTime, bp_kPa_corr)
+
+jdr_ars_corr <- jdr_ars |> 
+  mutate(Q_Ls = units::drop_units(preMetabolizer::convert_flow(units::set_units(Q_cms, "m^3/s"), to = "lps")),
+        bp_kPa_calc = streamMetabolizer::calc_air_pressure(temp.air = air_temp_C, elevation = jss01_elev) * 0.1,
+        PAR.obs = streamMetabolizer::convert_SW_to_PAR(solar_rad_W_m2)) |> 
+  select(dateTime, air_temp_C, Q_Ls, bp_kPa_calc, PAR.obs)
+
+jdr_data <- jdr_exo |> 
+  left_join(jdr_ars_corr) |> 
+  left_join(flux_bp_corr |> rename(bp_kPa = bp_kPa_corr)) |> 
+  left_join(jss01_Q_SG |> select(dateTime, waterDepth_cm_SW = waterDepth_cm)) |> 
+  mutate(swDepth = waterDepth_cm_SW / 100) |> 
+  select(-waterDepth_cm_SW)
+
+jdr_data <- jdr_data |>
+  mutate(
+    solar.time = convert_UTC_to_solartime(dateTime, jdr_meta |> pull(lon), "mean solar"),
+    isDaytime = calc_is_daytime(solar.time, jdr_meta |> pull(lat)),
+    DO.sat = calc_DO_sat(Temp_EXO_C, bp_kPa*10),
+    DO.sat.calcBP = calc_DO_sat(Temp_EXO_C, bp_kPa_calc*10),
+    ) |> 
+  mutate(ODOSat_mg_L = (ODO_mg_L/ODOSat) * 100) |> 
+  mutate(DO.sat.offset = DO.sat - ODOSat_mg_L) |> 
+  mutate(DO.obs.corr = ODO_mg_L + DO.sat.offset,
+         DO.pctsat = (DO.obs.corr/DO.sat)*100)
+
+```
+
+# Plot DO Sat
+
+```{r}
+
+jdr_data |>
+  select(solar.time, siteId, starts_with("DO")) |>
+  pivot_longer(cols = starts_with("DO"), names_to = "type", values_to = "DO.value") |>
+  mutate(
+    units = case_when(
+      type %in% c("DO.pctsat", "DO.pctsat.calcBP") ~ "DO\n(% sat)",
+      TRUE ~ "DO\n(mg/L)"
+    )
+  ) |>
+  ggplot(aes(x = solar.time, y = DO.value, color = type)) +
+  geom_line(na.rm = TRUE) +
+  facet_grid(units ~ siteId, scales = "free_y") +
+  theme_few() +
+  scale_color_discrete("variable") +
+  theme(legend.position = "bottom", 
+        legend.title = element_blank())
+
+```
+
+# Calc DO Metrics
+
+```{r}
+dailyDO <- jdr_data |> 
+  select(-DO.obs.corr, -DO.pctsat) |> 
+  rename(DO.pctsat = ODOSat, DO.obs.corr =  ODO_mg_L) |> 
+  #filter(wetQf != "Dry") |> 
+  mutate(Date = as_date(solar.time)) |>
+  group_by(Date) |>
+  arrange(.by_group = TRUE) |>
+  summarize(
+    maxPar = max(PAR.obs, na.rm = T),
+    avgPar = mean(PAR.obs, na.rm = T),
+    water.temp = mean(Temp_EXO_C, na.rm = T),
+    air.temp = mean(air_temp_C, na.rm = T),
+    minDO.obs = min(DO.obs.corr, na.rm = T),
+    maxDO.obs = max(DO.obs.corr, na.rm = T),
+    minDO.pctsat = min(DO.pctsat, na.rm = T),
+    maxDO.pctsat = max(DO.pctsat, na.rm = T),
+    avgDO.obs = mean(DO.obs.corr, na.rm = T),
+    avgDO.pctsat = mean(DO.pctsat, na.rm = T),
+    DOSat.hyp = sum(DO.pctsat <= 50, na.rm = T),
+    DO.hyp = sum(DO.obs.corr <= 2, na.rm = T),
+    cvDO.pctsat = (sd(DO.pctsat, na.rm = T)/mean(DO.pctsat, na.rm = T))*100,
+    sdDO.pctsat = sd(DO.pctsat, na.rm = T),
+    totalDO = n()
+    ) |> 
+  mutate(DOSat.slope = (avgDO.pctsat - lag(avgDO.pctsat))) |> 
+  mutate(across(where(is.numeric), ~ ifelse(is.finite(.), ., NA))) |> 
+  mutate(across(where(is.numeric), ~ ifelse(if_any(everything(), is.na), NA, .))) |> 
+  mutate(across(minDO.obs:avgDO.pctsat, ~ ifelse(. == 0, NA, .))) |> 
+  mutate(DO.amp = maxDO.obs - minDO.obs,
+         DOpctsat.amp = maxDO.pctsat - minDO.pctsat,
+         probHyp = DO.hyp / totalDO,
+         probHypSat = DOSat.hyp / totalDO) |> 
+  mutate(dDOpctsat.amp = DOpctsat.amp - lag(DOpctsat.amp),
+         dMinDO.pctsat = minDO.pctsat - lag(minDO.pctsat)) |> 
+  ungroup() |> 
+  mutate(
+         DOSat.exc = calc_exceedance_prob(avgDO.pctsat)) |> 
+  ungroup()
+#nighttime hypoxia ratio
+nightHypRat <- jdr_data |> 
+  #filter(wetQf != "Dry") |> 
+  mutate(across(c("DO.obs.corr", "DO.pctsat"), ~ ifelse(. == 0, NA, .))) |> 
+  select(dateTime, solar.time, DO.obs.corr, DO.pctsat, isDaytime) |> 
+  mutate(Date = as_date(solar.time)) |>
+  group_by(Date, isDaytime) |> 
+  summarise(DO.hyp.obs = sum(DO.obs.corr <= 2, na.rm = TRUE),
+            DO.hyp.sat = sum(DO.pctsat <= 50, na.rm = TRUE), .groups = 'drop') |> 
+  ungroup() |> 
+  pivot_wider(names_from = isDaytime, 
+              values_from = c(DO.hyp.obs, DO.hyp.sat), 
+              names_prefix = "DO_hyp_", 
+              names_sep = "_") |> 
+  rename(DayHyp_obs = DO.hyp.obs_DO_hyp_TRUE, 
+         NightHyp_obs = DO.hyp.obs_DO_hyp_FALSE,
+         DayHyp_sat = DO.hyp.sat_DO_hyp_TRUE, 
+         NightHyp_sat = DO.hyp.sat_DO_hyp_FALSE) |> 
+  mutate(NHR_obs = NightHyp_obs / DayHyp_obs,
+         NHR_sat = NightHyp_sat / DayHyp_sat) |> 
+  mutate(across(where(is.numeric), ~ ifelse(is.finite(.), ., NA))) |> 
+  select(Date, NHR_obs, NHR_sat)
+
+
+# Calculate probabilities for daytime
+dayHypProb <- jdr_data |> 
+  #filter(wetQf != "Dry") |> 
+  mutate(across(c("DO.obs.corr", "DO.pctsat"), ~ ifelse(. == 0, NA, .))) |> 
+  select(dateTime, solar.time, DO.obs.corr, DO.pctsat, isDaytime) |> 
+  mutate(Date = as_date(solar.time)) |>
+  filter(isDaytime) |>
+  group_by(Date) |>
+  summarise(
+    dayProbConc = mean(DO.obs.corr < 2, na.rm = TRUE),
+    dayProbSat = mean(DO.pctsat < 50, na.rm = TRUE),
+    .groups = 'drop'
+  ) |> 
+  ungroup()
+
+# Calculate probabilities for nighttime
+nightHypProb <- jdr_data |>
+  #filter(wetQf != "Dry") |> 
+  mutate(across(c("DO.obs.corr", "DO.pctsat"), ~ ifelse(. == 0, NA, .))) |> 
+  select(dateTime, solar.time, DO.obs.corr, DO.pctsat, isDaytime) |> 
+  mutate(Date = as_date(solar.time)) |>
+  filter(!isDaytime) |>
+  group_by(Date) |>
+  summarise(
+    nightProbConc = mean(DO.obs.corr < 2, na.rm = TRUE),
+    nightProbSat = mean(DO.pctsat < 50, na.rm = TRUE),
+    .groups = 'drop'
+  ) |> 
+  ungroup()
+
+# Join the daytime and nighttime probabilities
+nightHypRat <- dayHypProb |>
+  inner_join(nightHypProb, by = "Date") |> 
+  mutate(NHR_obs = nightProbConc/dayProbConc,
+         NHR_sat = nightProbSat/dayProbSat) |> 
+  mutate(across(where(is.numeric), ~ ifelse(is.finite(.), ., NA)))
+
+
+
+#Merge DO Metrics
+doMetrics <- dailyDO |> 
+  full_join(nightHypRat)
+
+
+
+doMetrics |>
+  ggplot(aes(Date, avgDO.pctsat)) +
+  geom_point() +
+  ylab("DO (% Sat)") +
+  theme_few() +
+  scale_x_date(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Daily Q
+
+```{r}
+
+dailyQ <- jdr_data |> 
+  mutate(Date = as_date(solar.time)) |> 
+  group_by(Date) |> 
+  summarise(minQ = min(Q_Ls, na.rm = TRUE),
+            maxQ = max(Q_Ls, na.rm = TRUE),
+            Q_1d = mean(Q_Ls, na.rm = TRUE),
+            minDepth = min(swDepth, na.rm = TRUE),
+            maxDepth = max(swDepth, na.rm = TRUE),
+            Depth_1d = mean(swDepth, na.rm = TRUE))
+```
+
+# Daily PPT
+
+```{r}
+dailyPPT <- flux_daily |> 
+  rename(Date = dateTime, PPT_1d = precip_mm) |> 
+  mutate(Date = as_date(Date))
+```
+
+# Merge All
+
+```{r}
+jdr_daily <- doMetrics |> 
+  full_join(dailyQ) |> 
+  full_join(dailyPPT) |> 
+  mutate(Site = "JDR") |> 
+  data.table()
+
+# Define rolling window sizes
+window_sizes <- c(7, 14, 30, 60)
+
+# List of variables to compute rolling means for
+vars <- list(
+  Q_1d = "Q",
+  Depth_1d = "Depth",
+  PPT_1d = "PPT"
+)
+
+# Generate rolling means for each variable and window size
+for (var in names(vars)) {
+  prefix <- vars[[var]]  # Get the appropriate prefix for the variable
+  jdr_daily[, (paste0(prefix, "_", window_sizes, "d")) := 
+              lapply(window_sizes, function(w) frollmean(get(var), n = w, align = "right", na.rm = TRUE)),
+           by = Site]
+}
+
+# Gather the rolling mean data into a long format
+rollingCols <- grep("_(\\d+d)$", names(jdr_daily), value = TRUE)  # Select columns like Q_7d, Depth_7d, etc.
+longDat <- melt(jdr_daily, id.vars = c("Site", "Date"), measure.vars = rollingCols, 
+                variable.name = "Variable", value.name = "Value")
+
+# Extract the variable type (e.g., Q, Depth, etc.) and rolling window size (e.g., 7d, 14d)
+longDat[, c("VariableType", "Window") := tstrsplit(Variable, "_", fixed = TRUE)]
+
+# List to store plots
+plots <- list()
+
+longDat <- longDat |> 
+  group_by(Site, VariableType, Window) |> 
+  complete(Date = seq(min(Date, na.rm = TRUE), max(Date, na.rm = TRUE), by = "1 day")) |> 
+  ungroup()
+
+# Create separate plots for each VariableType
+unique_vars <- unique(longDat$VariableType)
+
+for (var in unique_vars) {
+  p <- longDat |> 
+    filter(VariableType == var) |>  # Use `filter()` instead of `[ ]`
+    ggplot(aes(x = Date, y = Value, color = Window, group = Window)) +
+    geom_line(linewidth = 0.8, linetype = "dashed", na.rm = T) +  
+    scale_color_manual(
+      values = c("1d" = "grey", "7d" = "blue", "14d" = "green", "30d" = "orange", "60d" = "red"),
+      name = "Rolling Window"
+    ) +
+    labs(x = "Date", y = var) +
+    theme_few() +
+    theme(legend.position = "bottom",
+          legend.title = element_text(size = 12),
+          legend.text = element_text(size = 10)) +
+    facet_wrap(~Site, scales = "free_y", ncol = 1)
+
+  # Store the plot
+  plots[[var]] <- p
+}
+
+# Display plots
+for (p in plots) {
+  print(p)
+}
+
+# Create an empty list to store plots
+plots <- list()
+
+# Loop through each unique variable
+for (var in unique_vars) {
+  # Center and scale the data for the current variable
+  centered_scaled_data <- longDat |>
+    filter(VariableType == var) |>
+    group_by(Site) |>  # Group by Site to center and scale within each site
+    mutate(Value = scale(Value)) |>  # Center and scale the Value column
+    ungroup() |>  # Ungroup to return to a regular data frame
+  filter(Window == "1d")
+  # Create the plot
+  p <- centered_scaled_data |> 
+    ggplot(aes(x = Date, y = Value, color = Site, group = Site)) +
+    geom_line(linewidth = 0.8, linetype = "dashed", na.rm = TRUE) +  
+    labs(x = "Date", y = paste("Centered & Scaled", var)) +  # Update y-axis label
+    theme_few() +
+    theme(legend.position = "bottom",
+          legend.title = element_text(size = 12),
+          legend.text = element_text(size = 10)) 
+  # Store the plot
+  plots[[var]] <- p
+}
+
+# Display plots
+for (p in plots) {
+  print(p)
+}
+```
+
+```{r}
+jdr_daily |> 
+  write_csv(here("Data/JDR_dailyData.csv"))
+```
+
+# PTs
+
+```{r}
+jdr_exo |>
+  ggplot(aes(dateTime, SW_Level_ft, color = DryFlag)) +
+  geom_point() +
+  ylab("SW Level (ft)") +
+  theme_few() +
+  scale_x_date(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+jdr_exo |>
+  ggplot(aes(dateTime, Conductivity_uS_cm, color = DryFlag)) +
+  geom_point() +
+  ylab("SW Level (ft)") +
+  theme_few() +
+  scale_x_date(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+jss01 <- jdr_exo |> 
+  select(dateTime, DryFlag) |> 
+  mutate(wetdry = case_when(DryFlag == 1 ~ 0, T ~ 1),
+         siteId = "JSS01") |> 
+  select(dateTime, siteId, wetdry)
+```
+
+```{r}
+
+
+jdr_pts <- list.files(here("Data/MW/PTs/JD"), pattern = "\\.csv$", full.names = TRUE) |>
+  map(function(file) {
+    tryCatch(
+      read_csv(file, col_types = cols(.default = "c")),
+      error = function(e) {
+        message("Failed to read: ", file)
+        return(NULL)
+      }
+    )
+  }) |>
+  compact() |>  # remove NULLs
+  bind_rows() |> 
+  filter(sublocation == "SW") |> 
+  rename(dateTime = datetime) |> 
+  select(-c(project, rType, sublocation, flagbelow, flagremove, lowconf)) |> 
+  relocate(siteId, dateTime, QAQC) |> 
+  mutate(
+    across(c(sensorPressure_kPa:waterDepth_cm), as.numeric),
+    dateTime = parse_date_time(dateTime, orders = c("ymd_HMS", "mdy_HM", "mdy HMS", "mdy_HMS", "ymd_HM", "ymd HMS", "Ymd HMS", "Ymd HM", "Ymd_HMS", "Ymd_HM")),
+    QAQC = case_when(QAQC == "#VALUE!" ~ "D",
+                     is.na(waterDepth_cm) ~ "D",
+                     TRUE ~ QAQC)) 
+
+# 
+# jdr_pts |>
+#   ggplot(aes(dateTime, waterDepth_cm, color = QAQC)) +
+#   geom_point() +
+#   ylab("Water Depth (cm)") +
+#   theme_few() +
+#   facet_wrap(~siteId) +
+#   scale_x_date(labels = date_format("%b '%y")) +
+#   theme(axis.title.x = element_blank(),
+#         axis.text.x = element_text(angle = 45, hjust = 1))
+# 
+
+dry_pts <- jdr_pts |>
+  mutate(year = year(dateTime)) |> 
+  filter(QAQC == "D") |> 
+  group_by(siteId, year) |> 
+  summarise(minDepth = min(waterDepth_cm, na.rm = TRUE),
+            maxDepth = max(waterDepth_cm, na.rm = TRUE),
+            avgDepth = mean(waterDepth_cm, na.rm = TRUE))
+
+jdr_pts <- jdr_pts |>
+  mutate(year = year(dateTime)) |> 
+  left_join(dry_pts |> select(siteId, year, maxDepth), by = c("siteId", "year")) |>
+  mutate(
+    flag_Dry = if_else(!is.na(waterDepth_cm) & waterDepth_cm <= maxDepth, "D", NA_character_)
+  ) |> 
+  select(-year, -maxDepth)
+
+jdr_pts |>
+  ggplot(aes(dateTime, waterDepth_cm, color = flag_Dry)) +
+  geom_point() +
+  ylab("Water Depth (cm)") +
+  theme_few() +
+  facet_wrap(~siteId) +
+  scale_x_date(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+jdr_pts <- jdr_pts |> 
+  mutate(wetdry = case_when(
+    flag_Dry == "D" | QAQC == "D" ~ 0,
+    TRUE ~ 1
+  )) |> 
+  select(siteId, dateTime, wetdry)
+```
+
+# STICS
+
+```{r}
+jdr_stics <- read_csv(here("Data/MW/STICs/JRD_allmergedjdformatted_2021_2022_2023_2024_version0.csv")) |> 
+  rename(dateTime = datetime) |>
+  filter(qual_rating != "poor") |>
+  select(dateTime, siteId = SiteID, wetdry) |>
+  mutate(
+    wetdry = case_when(
+    wetdry %in% c("dry", "0") ~ 0,
+    wetdry %in% c("wet", "1") ~ 1,
+    TRUE ~ NA_real_)) |> 
+  full_join(jdr_pts) |> 
+  full_join(jss01) |> 
+  mutate(siteId = toupper(siteId),
+        watershed = "JDR")
+
+daily_presAbs <- jdr_stics |> 
+mutate(date = as_date(dateTime)) |>
+  filter(!is.na(siteId)) |>
+  group_by(watershed, siteId, date) |>
+  summarise(wetdry = calc_mode(wetdry), .groups = "drop") |>
+  select(date, watershed, siteId, wetdry) |>
+  pivot_wider(
+    names_from = siteId,
+    values_from = wetdry
+    )
+
+# Write to CSV
+write_csv(daily_presAbs, here("Data/STICs/MW_JDR_DailyPresAbs.csv"))
+```
+
+# MW Maintenance Check
+
+```{r}
+mwMaint <- read_sheet(
+  ss = "1XFDYFzv7UuQPKCTikZTdceA4a_65YeKFP8w-R7a4G6g",
+  sheet = "Maintenance",
+  na = c("NA", "Na", "na", ""),
+  col_types = "c"
+) |>
+  janitor::clean_names(case = "small_camel") |>
+  drop_na(watershed) |>
+  mutate(
+    time = coalesce(
+      arrivalTime,
+      departureTime,
+      startMaintenanceTime,
+      endMaintenanceTime,
+      samplingStartTime,
+      samplingEndTime,
+      timeSensorsOut,
+      timeSensorsBackIn
+    )
+  ) |>
+  mutate(
+    timeClean = case_when(
+      str_detect(time, "^\\d{1,2}:\\d{2}(:\\d{2})?$") ~ str_sub(time, 1, 5),
+      # keep only HH:MM if HH:MM:SS
+      str_detect(time, "^\\d{3}$") ~ str_c("0", str_sub(time, 1, 1), ":", str_sub(time, 2, 3)),
+      # e.g. 847 → 08:47
+      str_detect(time, "^\\d{4}$") ~ str_c(str_sub(time, 1, 2), ":", str_sub(time, 3, 4)),
+      # e.g. 1405 → 14:05
+      TRUE ~ "12:00"
+    )
+  ) |>
+  mutate(dateTime = with_tz(parse_date_time(
+    paste(date, timeClean),
+    orders = c(
+      "mdY HM",
+      "mdY HMS",
+      "%m/%d/%Y HM",
+      "%m/%d/%Y HMS",
+      "%m/%d/%y HM",
+      "%m/%d/%y HMS"
+    ),
+    tz = "MST"
+  ), tzone = "UTC"))
+
+mw_do <- mwMaint |>
+  filter(site == "JSS01", !is.na(do)) |>
+  mutate(
+    DO.value = as.numeric(do),
+    type = "manual_DO",
+    units = "DO\n(mg/L)"
+  ) |>
+  mutate(site = "JDR",
+         units = case_when(DO.value == 60 ~ "DO\n(% sat)", TRUE ~ units)) |> 
+  select(dateTime, siteId = site, type, DO.value, units)
+```
+
+```{r}
+jdr_data |>
+  select(dateTime, siteId, starts_with("DO")) |>
+  pivot_longer(cols = starts_with("DO"), names_to = "type", values_to = "DO.value") |>
+  mutate(
+    units = case_when(
+      type %in% c("DO.pctsat", "DO.pctsat.calcBP") ~ "DO\n(% sat)",
+      TRUE ~ "DO\n(mg/L)"
+    )
+  ) |>
+  bind_rows(mw_do) |>
+  ggplot(aes(x = dateTime, y = DO.value, color = type)) +
+  geom_line(data = function(df) df |> filter(type != "manual_DO"), na.rm = TRUE) +
+  geom_point(data = function(df) df |> filter(type == "manual_DO"), size = 2, shape = 21, fill = "black") +
+  facet_grid(units ~ siteId, scales = "free_y") +
+  theme_few() +
+  scale_color_discrete("variable") +
+  theme(legend.position = "bottom", 
+        legend.title = element_blank())
+```

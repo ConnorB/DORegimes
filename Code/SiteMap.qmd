@@ -35,178 +35,868 @@ library(whitebox)
 library(stars)
 library(mapview) # needs to be dev version:    remotes::install_github("r-spatial/mapview")
 library(ggspatial)
+library(gt)
+distColors <- c('#e6194B', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#911eb4', '#42d4f4', '#f032e6', '#bfef45', '#fabed4', '#469990', '#dcbeff', '#9A6324', '#fffac8', '#800000', '#aaffc3', '#808000', '#ffd8b1', '#000075', '#a9a9a9', '#ffffff', '#000000')
+
+okabeIto <- c("#0072B2", "#E69F00", "#CC79A7", "#009E73", "#56B4E9", "#D55E00", "#F0E442", "#999999", "#000000")
 ```
 
-```{r}
-sites <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Sites") |> 
-  filter(siteId %in% c("SFM01", "SHM01", "ENM01"))
-```
+# Sites, Streams, and Sheds
 
 ```{r}
+gp_streams <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Streams", quiet = T) |> 
+  filter(watershed %in% c("KNZ", "SHN", "YMR")) |> 
+  st_transform(crs = 4326)
+gp_sheds <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Watersheds", quiet = T) |> 
+  filter(watershed %in% c("KNZ", "SHN", "YMR")) |> 
+  st_transform(crs = 4326)
+# Load sites
+gp_sites <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Sites") |> 
+  filter(watershed %in% c("KNZ", "SHN", "YMR")) |> 
+  st_transform(crs = 4326) |> 
+  mutate(
+    lon = st_coordinates(geom)[, "X"],
+    lat  = st_coordinates(geom)[, "Y"]
+  ) 
+
+se_sites <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_SouthEast.gpkg", layer = "Sites") |> 
+  filter(!sublocation == "HW") |> 
+  st_transform(4326) |>
+  mutate(
+    lon = st_coordinates(geom)[, 1],
+    lat = st_coordinates(geom)[, 2]
+  ) 
+
+se_streams <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_SouthEast.gpkg", layer = "Streams") |> 
+  st_transform(4326)
+se_sheds <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_SouthEast.gpkg", layer = "Watersheds") |> 
+  st_transform(4326)
+
+mw_sites <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_MountainWest.gpkg", layer = "Sites") |> 
+  st_transform(4326) |> 
+  mutate(
+    lon = st_coordinates(geom)[, 1],
+    lat = st_coordinates(geom)[, 2]
+  ) |> 
+  filter(watershed %in% c("GBJ", "JDR"))
+
+mw_streams <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_MountainWest.gpkg", layer = "Streams") |> 
+  st_transform(4326) |> 
+  filter(watershed %in% c("GBJ", "JDR"))
+mw_sheds <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_MountainWest.gpkg", layer = "Watersheds") |> 
+  st_transform(4326) |> 
+  filter(watershed %in% c("GBJ", "JDR"))
+
+all_sheds <- bind_rows(gp_sheds, mw_sheds, se_sheds) |> 
+  st_transform("EPSG:5070")
+
 # Read and transform USA shapefile
-usShape <- st_read(here("Data/USA_Shp/cb_2018_us_state_500k.shp")) |>
+us_shp <- st_read(here("Data/USA_Shp/cb_2018_us_state_500k.shp")) |>
   filter(!STUSPS %in% c("AK", "AS", "VI", "HI", "GU", "MP", "PR")) |>
-  st_transform("ESRI:102003")
+  #st_transform(4326)
+  st_transform("EPSG:5070")
 
-# Extract Kansas
-ksShape <- usShape |> filter(STUSPS == "KS")
-
-# Read in site data
-sites <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Sites") |>
-  filter(siteId %in% c("SFM01", "SHM01", "ENM01") & watershed != "KNG") |> 
-  st_transform("ESRI:102003")
-
-stics <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Sites") |>
-  filter(watershed %in% c("KNZ", "SHN", "YMR")) 
-
-streams <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Streams") |>
-  filter(watershed != "KNG") 
-watersheds <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Watersheds") |>
-  filter(watershed != "KNG")
-
-site_colors <- c("KNZ" = "#0072B2", "SHN" = "#E69F00", "YMR" = "#CC79A7")
-
-ksStreams <- st_read(here("Data/kansas_streams/kansas_streams_order3_9_webmerc.shp")) %>% 
-  st_transform("ESRI:102003")
+us_poly <- us_shp |>
+  vect() |>
+  aggregate() |>
+  #buffer(width = 1000) |>
+  project("EPSG:4326")
 
 
+arid_index <- terra::rast("~/Dropbox/GIS/rasters/Global-AI_ET0__annual_v3_1/ai_v31_yr.tif")
+# Scale back to real AI (values were *10,000 in the file)
+arid_index <- arid_index |> 
+  (\(r) r / 10000)()
 
-library(tmap)
+# Crop to WGS84 CONUS 
+arid_crop <- arid_index |> 
+  crop(us_poly) |> 
+  mask(us_poly)
+# Reproject to EPSG:5070 (meters)
+arid_crop <- arid_crop |>
+  project("EPSG:5070", method = "bilinear", res = 1000)
 
-# Set tmap to plotting mode (not interactive)
-tmap_mode("plot")
+shed_points <- all_sheds |>
+  st_transform(st_crs(us_shp)) |>
+  st_point_on_surface() |>
+  mutate(lon = st_coordinates(geom)[, 1],
+         lat = st_coordinates(geom)[, 2]) |>
+  arrange(lon) |>
+  mutate(watershed = factor(watershed, levels = unique(watershed))) |>
+  st_drop_geometry()
 
-# Define custom colors
-site_colors <- c("KNZ" = "#0072B2", "SHN" = "#E69F00", "YMR" = "#CC79A7")
-ks <- tm_shape(ksShape) +
-  tm_polygons(fill = "white", 
-              col = "black", 
-              lwd = 8) +
-  tm_shape(ksStreams) + 
-  tm_lines(col = "#6c84a8", 
-           lwd = "STRAHLER",
-           lwd.scale = tm_scale_categorical(values = c(0.5, 1, 1.5, 2, 2.5, 3, 3.5)*1.5),  # Remove breaks argument
-           lwd.legend = tm_legend(show = FALSE)) +  # Hide line width legend
-  tm_shape(sites) +
-  tm_symbols(fill = "watershed",                                          
-             size = 2, shape = 21,
-             fill.scale = tm_scale_categorical(values = site_colors),      
-             col = "black") +
-  tm_labels("watershed",  
-            size = 5,
-            options = opt_tm_labels(
-              point.label = TRUE,
-              remove_overlap = FALSE,
-              point.label.method = "GA"
-            )) +
-tm_layout(
-  legend.show = FALSE,
-  frame = FALSE,
-  bg.color = NA,               
-  outer.bg.color = NA          
+#site_colors <- c("JDR" = "#0072B2", "GBJ" = "#E69F00", "KNZ" = "#CC79A7", "SHN" = "#009E73", "YMR" = "#56B4E9", "WHR" = "#D55E00", "PRF" = "#F0E442", "TAL" = "#999999")
+site_colors <- c("JDR" = "#006475", "GBJ" = "#56CFD8", "KNZ" = "#613921", "SHN" = "#F2C27B", "YMR" = "#A77652", "WHR" = "#345022", "PRF" = "#5A6C0A", "TAL" = "#83A102")
+all_outlets <- tibble(siteId = c("GSS01", "JSS01", "SFM01", "SHM01", "ENM01", "WHM01", "TLM01", "PRM01"))
+
+do_stics <- read_csv(here("Data/STICs/stics_for_doRegimes.csv")) |> 
+  full_join(all_outlets) |> 
+  pull(siteId)
+```
+
+# Connectivity Paper
+
+```{r}
+site_colors_connectivity <- c("KNZ" = "#C5692D", "YMR" = "#FEB359", "TAL" = "#132F5B", "PRF" = "#435F90", "GBJ" = "#68434E", "JDR" = "#B47E83")
+
+connectivity_stics <- read_csv(here("Data/STICs/stics_for_connectivity.csv")) |> 
+  full_join(all_outlets) |> 
+  pull(siteId)
+
+# Define the date ranges for each watershed
+connectivity_meta <- data.frame(
+  watershed = c("KNZ", "TAL", "GBJ", "PRF", "YMR", "JDR"),
+  start_date = as.Date(c("2022-06-22", "2023-02-01", "2022-04-22", "2023-03-09", "2022-03-25", "2023-03-22")),
+  end_date = as.Date(c("2022-09-01", "2023-12-31", "2022-09-07", "2023-06-12", "2022-08-04", "2023-07-17"))
+) |> 
+  mutate(start_wy = calcWaterYear(start_date),
+         end_wy = calcWaterYear(end_date),
+         Year = year(start_date))
+```
+
+## Aridity
+
+```{r}
+# Display range (cap extremes for readability)
+ai_limits <- c(0, 2)   
+state_map <- ggplot() +
+  geom_spatraster(data = arid_crop) +
+  scico::scale_fill_scico(
+    name   = str_wrap("Aridity Index (P/ET0)", width = 15),
+    palette = "roma",
+    direction = 1,
+    limits = ai_limits,
+    oob = squish,
+    na.value = "#00000000",
+    guide = guide_colorbar(
+      title.position = "top",
+      title.hjust = 0.5,
+      barheight = unit(1.5, "cm"),  # bar thickness
+      barwidth  = unit(10, "cm")        # center the title
+      )
+  ) +
+  geom_sf(data = us_shp, fill = "#00000000", color = "#000000") +
+  ggnewscale::new_scale_fill() +
+  geom_point(
+    data = shed_points |> filter(watershed %in% connectivity_meta$watershed),
+    aes(x = lon, y = lat, fill = watershed), 
+    color = "#000000", size = 4, stroke = 1, shape = 21, show.legend = FALSE
+  ) +
+  scale_fill_manual(values = site_colors_connectivity, name = "Watershed") +
+  coord_sf() +
+  labs(x = "", y = "") +
+  theme_void() +
+  theme(legend.position = "none")
+arid_legend <- state_map + 
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(size = 35, hjust = 0.5),  # bigger title text
+    legend.text = element_text(size = 25),                # bigger label text
+    legend.key.height = unit(1.5, "cm"),                  # taller color bar
+    legend.key.width  = unit(6, "cm"),                    # longer color bar
+  ) 
+aridity_legend <- plot_grid(get_legend(arid_legend))
+state_map
+ggsave(state_map, filename = here("Figs/Maps_Connectivity/Aridity_StateMap.png"), width = 40, height = 20, units = "cm")
+ggsave(aridity_legend, filename = here("Figs/Maps_Connectivity/Aridity_Legend.png"), width = 20,
+  height = 10,
+  units = "cm",
+  dpi = 600)
+
+
+
+
+# Display range (cap extremes for readability)
+ai_limits <- c(0, 2)   
+state_map <- ggplot() +
+  geom_spatraster(data = arid_crop) +
+  scico::scale_fill_scico(
+    name   = str_wrap("Aridity Index (P/ET0)", width = 15),
+    palette = "roma",
+    direction = 1,
+    limits = ai_limits,
+    oob = squish,
+    na.value = "#00000000",
+    guide = guide_colorbar(
+      title.position = "top",
+      title.hjust = 0.5,
+      barheight = unit(1.5, "cm"),  # bar thickness
+      barwidth  = unit(10, "cm")        # center the title
+      )
+  ) +
+  geom_sf(data = us_shp, fill = "#00000000", color = "#000000") +
+  ggnewscale::new_scale_fill() +
+  geom_point(
+    data = shed_points,
+    aes(x = lon, y = lat, fill = watershed), 
+    color = "#000000", size = 8, stroke = 1, shape = 21, show.legend = FALSE
+  ) +
+  scale_fill_manual(values = site_colors, name = "Watershed") +
+  coord_sf() +
+  labs(x = "", y = "") +
+  theme_void() +
+  theme(legend.position = "none")
+arid_legend <- state_map + 
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(size = 35, hjust = 0.5),  # bigger title text
+    legend.text = element_text(size = 25),                # bigger label text
+    legend.key.height = unit(1.5, "cm"),                  # taller color bar
+    legend.key.width  = unit(6, "cm"),                    # longer color bar
+  ) 
+aridity_legend <- plot_grid(get_legend(arid_legend))
+state_map
+ggsave(state_map, filename = here("Figs/Maps/Aridity_StateMap.png"), width = 40, height = 20, units = "cm")
+ggsave(aridity_legend, filename = here("Figs/Maps/Aridity_Legend.png"), width = 20,
+  height = 10,
+  units = "cm",
+  dpi = 600)
+```
+
+```{r}
+# Cut into UNEP classes
+arid_class <- arid_crop |>
+  classify(rbind(
+    c(-Inf, 0.05, 1),
+    c(0.05, 0.20, 2),
+    c(0.20, 0.50, 3),
+    c(0.50, 0.65, 4),
+    c(0.65,  Inf, 5)
+  )) |> 
+  as.factor()
+
+class_labs <- c("Hyper-arid (<0.05)", "Arid (0.05–0.20)", "Semi-arid (0.20–0.50)",
+                "Dry sub-humid (0.50–0.65)", "Humid (≥0.65)")
+levels(arid_class) <- data.frame(ID = 1:5, Class = class_labs)
+
+# 3) Plot with a discrete raster scale
+class_cols <- c("#8c510a", "#d8b365", "#f6e8c3", "#92c5de", "#2166ac")
+
+# Map colors to the LABELS (not the numeric IDs)
+pal_named <- stats::setNames(class_cols, class_labs)
+
+state_map <- ggplot() +
+  geom_spatraster(data = arid_class) +
+  scale_fill_manual(
+    name   = "",
+    values = pal_named,
+    # breaks are the label strings shown in the legend
+    breaks = class_labs,
+    labels = class_labs,
+    drop   = FALSE,
+    na.value = "#00000000"
+  ) +
+  geom_sf(data = us_shp, fill = NA, color = "black") +
+  #guides(fill = guide_legend(nrow=2,byrow=TRUE)) +
+  ggnewscale::new_scale_fill() +
+  geom_point(
+    data = shed_points |> filter(watershed %in% connectivity_meta$watershed),
+    aes(x = lon, y = lat, fill = watershed), 
+    color = "#000000", size = 4, stroke = 1, shape = 21, show.legend = FALSE
+  ) +
+  scale_fill_manual(values = site_colors_connectivity, name = "Watershed") +
+  coord_sf() +
+  labs(x = NULL, y = NULL) +
+  theme_void() +
+  theme(legend.position = "none")
+aridity_cat_legend <- state_map +
+  theme(legend.position = "left")
+aridity_cat_legend <- plot_grid(get_legend(aridity_cat_legend))
+state_map
+ggsave(state_map, filename = here("Figs/Maps_Connectivity/Aridity_Categorical_StateMap.png"), width = 40, height = 20, units = "cm")
+```
+
+## Level 1 Ecoregions
+
+```{r}
+eco_regions <- st_read("~/Dropbox/GIS/shpFiles/EPA_Ecoregions/na_cec_eco_l1/NA_CEC_Eco_Level1.shp") |> 
+  st_transform("EPSG:5070")
+eco_colors <- read_csv("~/Dropbox/GIS/shpFiles/EPA_Ecoregions/level_1_ecoregion_palette.csv") |> 
+  mutate(Ecoregion = trimws(Ecoregion)) |>
+  {\(df) stats::setNames(df$HexColor, df$Ecoregion)}()
+
+eco_colors <- c(
+  "ARCTIC CORDILLERA" = "#6788B9",
+  "TUNDRA" = "#99A4C7",
+  "TAIGA" = "#90BEDB",
+  "HUDSON PLAIN" = "#48A9B1",
+  "NORTHERN FORESTS" = "#AFDAD9",
+  "NORTHWESTERN FORESTED MOUNTAINS" = "#5BB254",
+  "MARINE WEST COAST FOREST" = "#4CB9AF",
+  "EASTERN TEMPERATE FORESTS" = "#B9D586",
+  "GREAT PLAINS" = "#F2CA98",
+  "NORTH AMERICAN DESERTS" = "#F8D96C",
+  "MEDITERRANEAN CALIFORNIA" = "#D1E3AF",
+  "SOUTHERN SEMIARID HIGHLANDS" = "#D7CF8D",
+  "TEMPERATE SIERRAS" = "#B9D586",
+  "TROPICAL DRY FORESTS" = "#E17B62",
+  "TROPICAL WET FORESTS" = "#B96D9E",
+  "WATER" = NULL
+)
+eco_regions_us <- st_intersection(eco_regions, us_shp |> st_union())
+state_map <- ggplot() +
+  geom_sf(data = eco_regions_us, aes(fill = NA_L1NAME), color = "#00000000", size = 0.2) +
+  scale_fill_manual(
+    values = eco_colors, 
+    name = "",
+    labels = function(x) str_wrap(str_to_title(x), width = 10)
+  ) +
+  ggnewscale::new_scale_fill() +
+  geom_sf(data = us_shp, fill = "#00000000", color = "grey50") +
+  geom_point(
+    data = shed_points |> filter(watershed %in% connectivity_meta$watershed),
+    aes(x = lon, y = lat, fill = watershed), 
+    color = "#000000", size = 4, stroke = 1, shape = 21, show.legend = FALSE
+  ) +
+  scale_fill_manual(values = site_colors_connectivity, name = "Watershed") +
+  coord_sf() +
+  theme_void() +
+  theme(legend.position = "none")
+
+ecoregions_legend <- state_map +
+  theme(legend.position = "left")
+ecoregions_legend <- plot_grid(get_legend(ecoregions_legend))
+state_map
+ggsave(state_map, filename = here("Figs/Maps_Connectivity/Ecoregions_StateMap.png"), width = 40, height = 20, units = "cm")
+ggsave(ecoregions_legend, filename = here("Figs/Maps/Ecoregions_Legend.png"), width = 20, height = 10, units = "cm", dpi = 600)
+```
+
+```{r}
+state_map <- ggplot() +
+  geom_sf(data = us_shp, fill = "#ffffff", color = "#000000") +
+  geom_point(
+    data = shed_points,
+    aes(x = lon, y = lat, color = watershed), size = 6, stroke = 1
+  ) +
+  scale_color_manual(values = site_colors) +
+  coord_sf() +
+  labs(x = "", y = "") +
+  #   geom_text_repel(
+  #     data = shed_points,
+  #     aes(x = lon, y = lat, label = watershed),
+  #     size = 4
+  # ) +
+  # ggspatial::annotation_scale(
+  #   location = "bl", width_hint = 0.3, # bottom left, 30% of plot width
+  #   line_width = 0.7, text_cex = 1
+  #   ) +
+  theme_void() +
+  theme(
+    legend.position = "none",
+    panel.grid.major = element_line(color = "white")
+  )
+state_map
+ggsave(state_map, filename = here("Figs/Maps/StateMap.png"), width = 40, height = 20, units = "cm")
+```
+
+## Merge Sites
+
+```{r}
+#### Get common cols ####
+common_cols <- c("siteId", "slope", "twi", "drainage_area_sqkm", "outlet_dist_m", "elev_m", "watershed", "lon", "lat")
+
+# SE
+se_sites <- se_sites |>
+  # Select only the columns we want to keep
+  mutate(outlet_dist_m = distance_from_outlet,
+         slope = slope_point,
+         elev_m = elevation,
+         drainage_area_sqkm = drainage_area_m / 1000000  # Convert m² to km²
+         ) |> 
+  select(all_of(common_cols))
+  
+
+# Merge GP and MW, all have same cols, then drop and merge with SE
+all_sites <- gp_sites |>
+  st_drop_geometry() |> 
+  full_join(mw_sites |> st_drop_geometry()) |> 
+  select(all_of(common_cols)) |> 
+  full_join(se_sites |> st_drop_geometry()) |> 
+  st_as_sf(coords = c("lon", "lat"), crs = 4326)
+
+
+# Combine streams
+all_streams <- list(
+  se_streams |> select(watershed),
+  gp_streams |> select(watershed),
+  mw_streams |> select(watershed)) |> 
+  bind_rows()
+```
+
+### HydroShare Extent
+
+```{r}
+bb_expanded <- all_sheds |>
+  # buffer by 10 meters
+  #st_buffer(5) |>
+  # transform bbox back to WGS84
+  st_transform(4326) |>
+  # get expanded bbox
+  st_bbox()
+
+# convert bbox to an sf polygon
+bb_poly <- st_as_sfc(bb_expanded)
+
+# plot with mapview
+mapview(all_sheds) + mapview(bb_poly, col.regions = "red", alpha = 0.1)
+```
+
+## Get DEMs
+
+```{r}
+# TAL
+
+tal_dem <- list.files("~/Dropbox/AIMS/GIS/Data/1mDEM/TAL", pattern = ".tif$", full.names = TRUE) |> 
+  lapply(rast)
+tal_dem <- do.call(merge, tal_dem)
+
+whr_dem <- list.files("~/Dropbox/AIMS/GIS/Data/1mDEM/WHR", pattern = ".tif$", full.names = TRUE) |> 
+  lapply(rast)
+whr_dem <- do.call(merge, whr_dem)
+
+prf_dem <- list.files("~/Dropbox/AIMS/GIS/Data/1mDEM/PRF", pattern = ".tif$", full.names = TRUE) |> 
+  lapply(rast)
+prf_dem <- do.call(merge, prf_dem)
+
+# List only files that match *_DEM.tif
+dem_paths <- list.files("~/Dropbox/AIMS/GIS/Results", pattern = "_DEM\\.tif$", full.names = TRUE) |> 
+  (\(x) x[basename(x) != "KNG_DEM.tif"])()
+
+# Create a named list of SpatRasters using watershed prefix (e.g., "DRC", "GBJ")
+all_dems <- setNames(
+  lapply(dem_paths, rast, lyrs = "original_dem"),
+  str_remove(basename(dem_paths), "_DEM\\.tif$")
 )
 
-# Save with transparent background
-tmap_save(ks, here("Figs/SFS_25/KS_Map.png"), 
-          height = 25.4, width = 25.4, units = "in",
-          bg = "transparent")
+all_dems[["TAL"]] <- tal_dem
+all_dems[["WHR"]] <- whr_dem
+all_dems[["PRF"]] <- prf_dem
 ```
 
+# STICs
+
 ```{r}
+gpPresAbs <- read_csv(here("Data/STICs/GP_DailyPresAbs.csv"))
+sePresAbs <- read_csv(here("Data/STICs/SE_DailyPresAbs.csv"))
 
-knzElev  <- terra::rast("~/Dropbox/AIMS/GIS/Results/KNZ_DEM.tif")
-shnElev  <- terra::rast("~/Dropbox/AIMS/GIS/Results/SHN_DEM.tif")
-ymrElev  <- terra::rast("~/Dropbox/AIMS/GIS/Results/YMR_DEM.tif")
+presAbs <- bind_rows(
+  gpPresAbs,
+  sePresAbs)  |> 
+  arrange(watershed, date)
 
-# Create separate maps manually
-library(gridExtra)
-# Create separate maps for each watershed with elevation
-create_watershed_map <- function(watershed_name, elev_raster, watershed_poly, streams_data, sites_data, stic_data) {
-  
-  # Crop and mask elevation to watershed boundary
-  elev_cropped <- crop(elev_raster$original_dem, watershed_poly)
-  elev_masked <- mask(elev_cropped, watershed_poly)
-  
-  # Filter data for this watershed
-  watershed_streams <- streams_data[streams_data$watershed == watershed_name, ]
-  watershed_sites <- sites_data[sites_data$watershed == watershed_name, ]
-  watershed_stics <- stic_data[stic_data$watershed == watershed_name, ]
-  watershed_colors <- site_colors[watershed_name]
-  
-  # Create map with valid palette but no legend
-  tm_shape(elev_masked) +
-    tm_raster(col_alpha = 0.8,
-              col.scale = tm_scale_continuous(values = terrain.colors(10)),
-              col.legend = tm_legend(show = FALSE)) +  # Hide elevation legend
-  tm_shape(watershed_poly) +
-    tm_borders(col = "black", lwd = 2) +
-  tm_shape(watershed_streams) +
-    tm_lines(col = "#6c84a8", lwd = 4) +
-  tm_shape(watershed_sites) +
-    tm_symbols(col = watershed_colors, size = 3, shape = 21, border.col = "black",
-               col.legend = tm_legend(show = FALSE)) +  # Hide symbols legend
-    tm_shape(watershed_stics) +
-    tm_symbols(col = "red", size = 1, shape = 21, border.col = "black",
-               col.legend = tm_legend(show = FALSE)) +
-  tm_title(watershed_name, size = 5) +
-  tm_layout(
-    frame = FALSE
+
+mwStics <- list.files(here("Data/MW/STICs"), full.names = TRUE, recursive = TRUE) |>
+  # Only keep files in folders that end with _combined
+  lapply(\(file) {
+    read_csv(file, col_types = cols(.default = col_character()))
+  }) |> 
+  bind_rows() |>
+  rename(dateTime = datetime) |>
+  filter(qual_rating != "poor") |>
+  select(dateTime, siteId = SiteID, wetdry) |>
+  mutate(
+    wetdry = case_when(
+    wetdry %in% c("dry", "0") ~ 0,
+    wetdry %in% c("wet", "1") ~ 1,
+    TRUE ~ NA_real_),
+    watershed = case_when(
+    startsWith(siteId, "D") ~ "DRC",
+    startsWith(siteId, "G") ~ "GBJ",
+    startsWith(siteId, "J") ~ "JDR",
+    TRUE ~ NA_character_  
+  )) |> 
+  mutate(dateTime = parse_date_time(dateTime, orders = c("ymd HM", "ymd HMS"), tz = "UTC")) |> 
+  drop_na(dateTime)
+
+daily_presAbsMW <- mwStics |>
+  mutate(
+    date = as_date(dateTime)
+  ) |>
+  filter(!is.na(watershed)) |>
+  group_by(watershed, siteId, date) |>
+  summarise(wetdry = preMetabolizer::calc_mode(wetdry), .groups = "drop") |>
+  split(~watershed, drop = T) |> 
+  lapply(\(df) {
+    df |>
+      select(date, siteId, wetdry) |>
+      pivot_wider(
+        names_from = siteId,
+        values_from = wetdry
+      )
+  }) 
+daily_presAbsMW <- bind_rows(daily_presAbsMW, .id = "watershed") |> 
+  drop_na(date) |> 
+  mutate(GJ8 = coalesce(GJ8, GJ8b)) |> 
+  select(-GJ8b)
+
+
+presAbs <- presAbs |> 
+  bind_rows(daily_presAbsMW) |> 
+  arrange(watershed, date)
+
+avgPercWet <- presAbs |>
+  pivot_longer(
+    cols = -c(watershed, date),
+    names_to = "siteId",
+    values_to = "wet"
+  ) |>
+  group_by(watershed, siteId) |>
+  summarise(
+    avg_pct_wet = mean(wet == 1, na.rm = TRUE) * 100,
+    avg_pct_dry = mean(wet == 0, na.rm = TRUE) * 100,
+    total = avg_pct_wet + avg_pct_dry,
+    .groups = "drop"
+  ) |> 
+  drop_na(total) 
+
+avgPercWet_connectivity <- presAbs |>
+  left_join(connectivity_meta |> select(watershed, Year), by = "watershed") |>
+  filter(year(date) == Year) |> 
+  select(-Year) |> 
+  pivot_longer(
+    cols = -c(watershed, date),
+    names_to = "siteId",
+    values_to = "wet"
+  ) |>
+  group_by(watershed, siteId) |>
+  summarise(
+    avg_pct_wet_connectivity = mean(wet == 1, na.rm = TRUE) * 100,
+    avg_pct_dry_connectivity = mean(wet == 0, na.rm = TRUE) * 100,
+    total_connectivity = avg_pct_wet_connectivity + avg_pct_dry_connectivity,
+    .groups = "drop"
+  ) |> 
+  drop_na(total_connectivity) 
+
+all_sites <- all_sites |>
+  filter(siteId %in% unique(c(do_stics, connectivity_stics))) |> 
+  full_join(avgPercWet |> select(watershed, siteId, avg_pct_wet), by = c("watershed", "siteId")) |> 
+  full_join(avgPercWet_connectivity |> select(watershed, siteId, avg_pct_wet_connectivity), by = c("watershed", "siteId")) |> 
+  filter(watershed != "DRC")
+
+nDays_watershed <- presAbs |>
+  group_by(watershed) |>
+  summarise(
+    n_days = n_distinct(date),
+    .groups = "drop"
+  )
+nDays_watershed |> filter(watershed != "DRC") |> 
+  mutate(n_days = round(n_days/365.25, 2)) |> 
+  rename(Site = watershed, "Years of STIC Data" = n_days) |> 
+  gt::gt() |> 
+  gtsave(here("Figs/stic_days.png"), zoom = 6, vwidth = 2000, vheight = 1200)
+```
+
+# Watershed Maps
+
+## Try contour lines instead of DEM
+
+```{r}
+# Define a name map
+name_map <- c(
+  "KNZ" = "GP-1", "SHN" = "GP-2", "YMR" = "GP-3",
+  "TAL" = "EF-1", "PRF" = "EF-2", "WHR" = "EF-3",
+  "GBJ" = "ND-1", "JDR" = "ND-2"
+)
+
+shed_maps <- list()
+for (shed in names(all_dems)) {
+  shed_poly <- all_sheds |> filter(watershed == shed)
+  site_streams <- all_streams |> filter(watershed == shed)
+  site_stics <- all_sites |> filter(watershed == shed)
+
+  if (nrow(shed_poly) == 0) {
+    warning("No polygon for ", shed, ", skipping...")
+    next
+  }
+
+  crs_target <- "EPSG:5070"
+  shed_poly <- shed_poly |> st_transform(crs_target)
+  site_streams <- site_streams |> st_transform(crs_target)
+
+  super_sens <- site_stics |>
+    st_transform(crs_target) |>
+    filter(siteId %in% c("GSS01", "JSS01", "SFM01", "SHM01", "ENM01", "WHM01", "TLM01", "PRM01"))
+
+  site_stics <- site_stics |>
+    st_transform(crs_target) |>
+    filter(!siteId %in% c("GSS01", "JSS01", "SFM01", "SHM01", "ENM01", "WHM01", "TLM01", "PRM01")) |>
+    drop_na(avg_pct_wet) |>
+    mutate(avg_pct_wet = as.numeric(avg_pct_wet))
+
+  iso_dem <- all_dems[[shed]] |>
+    as.contour() |>
+    st_as_sf() |>
+    st_transform(crs_target) |>
+    st_intersection(shed_poly)
+
+  # Look up the new title (fallback to original if missing)
+  shed_title <- ifelse(shed %in% names(name_map), name_map[[shed]], shed)
+
+  # Create plot
+  p <- ggplot() +
+    geom_sf(data = shed_poly, fill = NA, color = site_colors[[shed]], linewidth = 1.5) +
+    geom_sf(data = iso_dem, color = "#000000", alpha = 0.5, lwd = 0.5) +
+    geom_sf(data = site_streams, color = "#1F305E", linewidth = 1) +
+    geom_sf(data = site_stics, aes(fill = avg_pct_wet), shape = 21, color = "black", size = 6, show.legend = FALSE, alpha = 1) +
+    geom_sf(data = super_sens, shape = 22, fill = "red", color = "red", size = 6, alpha = 1) +
+    viridis::scale_fill_viridis(name = "Avg. % Wet", option = "viridis", limits = c(0, 100), na.value = "grey80", direction = -1) +
+    annotation_scale(height = unit(0.35, "cm"), width_hint = 0.5, text_cex = 2) +
+    labs(title = shed_title) +
+    theme_void() +
+    theme(
+      plot.title = element_text(
+        color = site_colors[[shed]], face = "bold", size = 40, hjust = 0.5
+      )
+    )
+
+  shed_maps[[shed]] <- p
+  ggsave(
+    filename = paste0(here("Figs/Maps/map_"), shed, ".png"),
+    plot = p,
+    width = 20,
+    height = 20,
+    units = "cm",
+    dpi = 600
   )
 }
 
-# Create maps for each watershed
-knz_poly <- watersheds[watersheds$watershed == "KNZ", ]
-shn_poly <- watersheds[watersheds$watershed == "SHN", ]
-ymr_poly <- watersheds[watersheds$watershed == "YMR", ]
 
-map_knz <- create_watershed_map("KNZ", knzElev, knz_poly, streams, sites, stics)
-map_shn <- create_watershed_map("SHN", shnElev, shn_poly, streams, sites, stics)
-map_ymr <- create_watershed_map("YMR", ymrElev, ymr_poly, streams, sites, stics)
+p
 
-# Arrange maps vertically
-ws <- tmap_arrange(map_knz, map_shn, map_ymr)
-
-tmap_save(ws, here("Figs/SFS_25/WS_Map.png"), height = 12.7, width =  25.4, units = "in", bg = "transparent")
 ```
 
+## Legend
+
 ```{r}
-# Create the inset map
-insetMap <-  ggplot() +
-  geom_sf(data = usShape, fill = "white", color = "black", linewidth = 0.25) +
-  geom_sf(data = ksShape, fill = NA, color = "red", linewidth = 1) +
-  labs(x = NULL, y = NULL) +
-  theme_void() + 
-  theme(axis.text = element_blank(),
-        axis.ticks = element_blank(),
-        axis.ticks.length = unit(0, "pt"),
-        axis.title=element_blank(),
-        panel.background = element_rect(fill = "white"))
+shed <- "KNZ"
+shed_poly <- all_sheds |> filter(watershed == shed)
+site_streams <- all_streams |> filter(watershed == shed)
+site_stics <- all_sites |> filter(watershed == shed)
 
-# Main map with inset
-siteMap <- ggplot() +
-  geom_sf(data = ksShape, fill="#ffffff", color="black", linewidth=0.25) +
-  geom_sf(data = ksStreams, color = "#6c84a8")+
-  geom_sf(data = allSites, aes(color = Site), size = 5, shape = 20) +
-  scale_color_manual(values = c("KMZ" = "#345023", "Kings Creek Gage" = "#596C0B", "YMR" = "#3A1F46", "Elk River Gage" = "#7F4B89")) +
-  geom_label_repel(data = allSites, aes(label = Site, geometry = geometry),
-                   stat = "sf_coordinates", size = 5, fill = "white") +
-  ggspatial::annotation_scale(style = "ticks", line_width = 1.5, text_face = "bold")+
-  ggspatial::annotation_north_arrow(style = north_arrow_minimal(), pad_x = unit(-0.25, "cm"), pad_y = unit(0.5, "cm"))+
-  theme_few()+
-  theme(axis.title.x = element_blank(),
-        axis.text.x = element_text(angle = 45, hjust = 1),
-        axis.title.y = element_blank(),
-        legend.position = "none",
-        text = element_text(size = 20),       # Increase overall text size
-        axis.title = element_text(size = 20), # Increase axis titles size
-        axis.text = element_text(size = 20),  # Increase axis text size
-        strip.text = element_text(size = 20)  # Increase facet labels size) 
-        )
-#siteMap
-siteMap2 <- ggdraw() +
-  draw_plot(siteMap) +
-  draw_plot(insetMap, x = 0.15, y = 0.62, width = 0.3, height = 0.3)
 
-ggsave("siteMap.png", siteMap2, here("Figs/"), device = "png",  width = 9, height = 6, units = "in", dpi = "retina")
+crs_target <- "EPSG:5070"
+shed_poly <- shed_poly |> st_transform(crs_target)
+site_streams <- site_streams |> st_transform(crs_target)
 
+super_sens <- site_stics |>
+  st_transform(crs_target) |>
+  filter(siteId %in% c("GSS01", "JSS01", "SFM01", "SHM01", "ENM01", "WHM01", "TLM01", "PRM01"))
+
+site_stics <- site_stics |>
+  st_transform(crs_target) |>
+  filter(!siteId %in% c("GSS01", "JSS01", "SFM01", "SHM01", "ENM01", "WHM01", "TLM01", "PRM01")) |>
+  drop_na(avg_pct_wet) |>
+  mutate(avg_pct_wet = as.numeric(avg_pct_wet))
+
+# Contour lines instead of DEM, transform, and crop to watershed
+iso_dem <- all_dems[[shed]] |>
+  as.contour() |> 
+  st_as_sf() |> 
+  st_transform(crs_target) |> 
+  st_intersection(shed_poly)
+
+super_sens <- super_sens |> mutate(sensor_type = "Outlet")
+site_stics <- site_stics |> mutate(sensor_type = "STIC")
+
+p <- ggplot() +
+  geom_sf(data = shed_poly, fill = NA, color = site_colors[[shed]], linewidth = 1) +
+  geom_sf(data = site_streams, color = "black", linewidth = 0.5) +
+  # STIC: circle w/ viridis fill
+  geom_sf(data = site_stics, aes(fill = avg_pct_wet, shape = sensor_type), color = "black", size = 6) +
+  # SuperSensor: red square
+  geom_sf(data = super_sens, aes(shape = sensor_type), fill = "red", color = "red", size = 6) +
+  # viridis colorbar
+  scale_fill_viridis_c(
+    name = "% Wet",
+    option = "viridis",
+    limits = c(0, 100),
+    na.value = "grey80",
+    direction = -1,
+    guide = guide_colorbar(
+      barheight = unit(1.5, "cm"),
+      barwidth  = unit(10, "cm"),
+      title.position = "left",
+      title.vjust = 0.85
+    )
+  ) +
+  # sensor type legend
+  scale_shape_manual(
+    name = "",
+    values = c("STIC" = 21, "Outlet" = 22)  # circle and square
+  ) +
+  annotation_scale() +
+  labs(title = shed) +
+  theme_void() +
+  theme(
+    plot.title = element_text(
+      color = site_colors[[shed]], face = "bold", size = 14, hjust = 0.5
+    ),
+    legend.position = "bottom",
+    legend.title = element_text(size = 35),  # bigger title text
+    legend.text = element_text(size = 35),                # bigger label text
+    legend.key.height = unit(1.5, "cm"),                  # taller color bar
+    legend.key.width  = unit(2, "cm"), 
+    legend.spacing.x = unit(2, "cm")           # gap between different legend elements
+  ) +
+  guides(
+  shape = guide_legend(ncol = 1,
+                       override.aes = list(
+        size = 10,        # bigger symbols in the legend only
+        stroke = 1.5     # thicker outline in the legend (optional)
+      ))
+  )
+p
+percWet <- cowplot::get_legend(p)
+cowplot::ggsave2(
+  filename = here("Figs/Maps/legend_avg_pct_wet.png"),
+  plot = cowplot::plot_grid(percWet),
+  width = 25,
+  height = 10,
+  units = "cm",
+  dpi = 600
+)
+```
+
+## Connectivity Paper
+
+## Relative Elevation
+
+```{r}
+shed_maps <- list()
+all_dems_connectivity <- all_dems[names(all_dems) %in% connectivity_meta$watershed]
+
+for (shed in names(all_dems_connectivity)) {
+  shed_poly <- all_sheds |> filter(watershed == shed)
+  site_streams <- all_streams |> filter(watershed == shed)
+  site_stics <- all_sites |> filter(watershed == shed)
+  
+  if (nrow(shed_poly) == 0) {
+    warning("No polygon for ", shed, ", skipping...")
+    next
+  }
+  
+  crs_target <- crs(all_dems_connectivity[[shed]])
+  shed_poly <- shed_poly |> st_transform(crs_target)
+  site_streams <- site_streams |> st_transform(crs_target)
+  
+  super_sens <- site_stics |>
+    st_transform(crs_target) |>
+    filter(siteId %in% c("GSS01", "JSS01", "SFM01", "SHM01", "ENM01", "WHM01", "TLM01", "PRM01"))
+  
+  site_stics <- site_stics |>
+    st_transform(crs_target) |>
+    filter(!siteId %in% c("GSS01", "JSS01", "SFM01", "SHM01", "ENM01", "WHM01", "TLM01", "PRM01")) |>
+    drop_na(avg_pct_wet) |>
+    mutate(avg_pct_wet = as.numeric(avg_pct_wet))# |> 
+    #filter(siteId %in% connectivity_stics)
+  
+  # Crop and mask DEM
+  cropped <- all_dems_connectivity[[shed]] |>
+    crop(vect(shed_poly)) |>
+    mask(vect(shed_poly))
+  
+  # Per-watershed normalization (0-100 scale)
+  # Get min and max elevation for this watershed
+  elev_min <- min(values(cropped), na.rm = TRUE)
+  elev_max <- max(values(cropped), na.rm = TRUE)
+
+  # Create relative elevation raster (0-100 scale)
+  cropped_relative <- (cropped - elev_min) / (elev_max - elev_min) * 100
+
+  # Convert raster to data frame for ggplot
+  cropped_df <- as.data.frame(cropped_relative, xy = TRUE, na.rm = TRUE)
+  colnames(cropped_df)[3] <- "elevation"
+  
+  # Create plot with relative elevation
+  p <- ggplot() +
+    geom_spatraster(data = cropped_relative, show.legend = FALSE) +
+    scale_fill_gradient(
+      low = "white",           # 0% elevation = white
+      high = "grey20",          # 100% elevation = grey20 (dark grey)
+      na.value = "#00000000",
+      name = "Relative\nElevation (%)",
+      limits = c(0, 100),       # Fixed limits for all maps
+      breaks = c(0, 25, 50, 75, 100)  # Consistent breaks
+    ) +
+    geom_sf(data = shed_poly, fill = NA, color = site_colors_connectivity[[shed]], linewidth = 2) +
+    geom_sf(data = site_streams, color = "#1F305E", linewidth = 1) +
+    ggnewscale::new_scale_fill() +
+    geom_sf(data = site_stics, aes(fill = avg_pct_wet), shape = 21, color = "#000000", size = 5, stroke = 1, show.legend = FALSE, alpha = 0.8) +
+    geom_sf(data = super_sens, shape = 22, fill = "red", color = "red", size = 5, alpha = 0.8) +
+    viridis::scale_fill_viridis(name = "Avg. % Wet", option = "viridis", limits = c(0, 100), na.value = "grey80", direction = -1) +
+    annotation_scale(height = unit(0.35, "cm"), width_hint = 0.5, text_cex = 2) +
+    labs(
+      title = shed,
+      subtitle = paste0("Elevation: ", round(elev_min, 1), " - ", round(elev_max, 1), " m")  # Optional: show original range
+    ) +
+    theme_void() +
+    theme(
+      plot.title = element_text(
+        color = site_colors_connectivity[[shed]], face = "bold", size = 40, hjust = 0.5
+      ),
+      plot.subtitle = element_text(size = 30, hjust = 0.5, color = "grey50")  # If using subtitle
+    )
+  
+  # Save and store
+  shed_maps[[shed]] <- p
+  ggsave(
+    filename = paste0(here("Figs/Maps_Connectivity/map_"), shed, ".png"),
+    plot = p,
+    width = 20,
+    height = 20,
+    units = "cm",
+    dpi = 600
+  )
+}
+
+p <- ggplot() +
+  geom_spatraster(data = cropped_relative) +
+  scale_fill_gradient(
+    low = "white",           # 0% elevation = white
+    high = "grey20",          # 100% elevation = grey20 (dark grey)
+    na.value = "#00000000",
+    name = str_wrap("Relative Elevation (%)", 15),
+    limits = c(0, 100),       # Fixed limits for all maps
+    breaks = c(0, 25, 50, 75, 100),
+    guide = guide_colorbar(
+      barheight = unit(1.5, "cm"),
+      barwidth  = unit(10, "cm"),
+      title.position = "left",
+      title.vjust = 0.85,
+    )# Consistent breaks
+  ) +
+  geom_sf(data = shed_poly, fill = NA, color = site_colors[[shed]], linewidth = 2) +
+  geom_sf(data = site_streams, color = "#1F305E", linewidth = 1) +
+  geom_sf(data = site_stics, aes(color = avg_pct_wet), size = 5, show.legend = FALSE, alpha = 0.8) +
+  geom_sf(data = super_sens, shape = 22, fill = "red", color = "red", size = 5, alpha = 0.8) +
+  viridis::scale_color_viridis(name = "Avg. % Wet", option = "viridis", limits = c(0, 100), na.value = "grey80", direction = -1) +
+  annotation_scale(height = unit(0.35, "cm"), width_hint = 0.5, text_cex = 2) +
+  labs(
+    title = shed,
+    subtitle = paste0("Elevation: ", round(elev_min, 1), " - ", round(elev_max, 1), " m")  # Optional: show original range
+  ) +
+  theme_void() +
+  theme(
+    plot.title = element_text(
+      color = site_colors[[shed]], face = "bold", size = 40, hjust = 0.5
+    ),
+    plot.subtitle = element_text(size = 30, hjust = 0.5, color = "grey50"), # If using subtitle
+    legend.position = "bottom",
+    legend.title = element_text(size = 35, hjust = 0.5),  # bigger title text
+    legend.text = element_text(size = 35),                # bigger label text
+    legend.key.height = unit(1.5, "cm"),                  # taller color bar
+    legend.key.width  = unit(6, "cm"), 
+  )
+
+
+p  
+elevLegend <- cowplot::get_legend(p)
+cowplot::ggsave2(
+  filename = here("Figs/Maps_Connectivity/legend_elev.png"),
+  plot = cowplot::plot_grid(elevLegend),
+  width = 20,
+  height = 10,
+  units = "cm",
+  dpi = 600
+)
 ```

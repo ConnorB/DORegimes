@@ -1,0 +1,868 @@
+---
+title: "Gibson Jack DO"
+author: "CLB"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+library(here)
+source(here("Code/paths+packages.R"))
+library(preMetabolizer)
+library(terra)
+library(tidyterra)
+library(sf)
+source(here("Code/Functions/aims.R"))
+okabeIto <- c("#0072B2", "#E69F00", "#CC79A7", "#009E73", "#56B4E9", "#D55E00", "#F0E442", "#999999", "#000000")
+```
+
+# Site Info
+
+```{r}
+#| include: false
+siteInfo <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_MountainWest.gpkg", layer = "Sites") |> 
+  filter(siteId %in% c("JSS01", "DSS01", "GSS01")) |> 
+  st_transform(4326) |> 
+  mutate(
+    lon = st_coordinates(geom)[, 1],
+    lat = st_coordinates(geom)[, 2]
+  ) |> 
+  select(siteId, elev_m, lat, lon)
+#gbjShed <- st_read("~/Dropbox/AIMS/GISData/GibsonJack/GibsonJack.shp")
+#gbjNet <- st_read("~/Dropbox/AIMS/GISData/GibsonJack/Gibson_network.shp")
+```
+
+# Q Data from SG
+
+```{r}
+mwQ_sg <- read_csv(here("Data/MW/Q_SG/Qstage_21to24_all.csv")) |> 
+  mutate(dateTime = as.POSIXct(DateTime, format = "%d%b%Y %I:%M:%S %p", tz = "MST")) |> 
+  mutate(dateTime = with_tz(dateTime, tz = "UTC")) |> 
+  mutate(FS_stage = replace_na(FS_stage, 0),
+    FS_stage = if_else(FS_stage < 0, 0, FS_stage)) |> 
+  mutate(
+     wetdry = case_when(
+       FS_stage <= 0 ~ 0,
+       TRUE ~ 1))
+
+
+
+mwQ_sg |> 
+  ggplot(aes(x = dateTime, y = Q)) +
+  see::geom_point2(alpha = 0.2, size = 1.5) +
+  theme_few() +
+  facet_wrap(~site, scales = "free_y", ncol = 1) +
+  labs(
+    title = "",
+    x = "",
+    y = "Discharge",
+  ) 
+mwQ_sg |> 
+  ggplot(aes(x = dateTime, y = FS_stage)) +
+  see::geom_point2(alpha = 0.2, size = 1.5) +
+  theme_few() +
+  facet_wrap(~site, scales = "free_y", ncol = 1) +
+  labs(
+    title = "",
+    x = "",
+    y = "Stage",
+  )
+```
+
+# Field Sheets
+
+```{r}
+mwMaint <- read_sheet(
+  ss = "1XFDYFzv7UuQPKCTikZTdceA4a_65YeKFP8w-R7a4G6g",
+  sheet = "Maintenance",
+  na = c("NA", "Na", "na", ""),
+  col_types = "c"
+) |>
+  janitor::clean_names(case = "small_camel") |>
+  drop_na(watershed) |>
+  mutate(
+    time = coalesce(
+      arrivalTime,
+      departureTime,
+      startMaintenanceTime,
+      endMaintenanceTime,
+      samplingStartTime,
+      samplingEndTime,
+      timeSensorsOut,
+      timeSensorsBackIn
+    )
+  ) |>
+  mutate(
+    timeClean = case_when(
+      str_detect(time, "^\\d{1,2}:\\d{2}(:\\d{2})?$") ~ str_sub(time, 1, 5),
+      # keep only HH:MM if HH:MM:SS
+      str_detect(time, "^\\d{3}$") ~ str_c("0", str_sub(time, 1, 1), ":", str_sub(time, 2, 3)),
+      # e.g. 847 → 08:47
+      str_detect(time, "^\\d{4}$") ~ str_c(str_sub(time, 1, 2), ":", str_sub(time, 3, 4)),
+      # e.g. 1405 → 14:05
+      TRUE ~ "12:00"
+    )
+  ) |>
+  mutate(dateTime = with_tz(parse_date_time(
+    paste(date, timeClean),
+    orders = c(
+      "mdY HM",
+      "mdY HMS",
+      "%m/%d/%Y HM",
+      "%m/%d/%Y HMS",
+      "%m/%d/%y HM",
+      "%m/%d/%y HMS"
+    ),
+    tz = "MST"
+  ), tzone = "UTC"))
+
+
+mwBgc <- read_sheet(
+  ss = "1XFDYFzv7UuQPKCTikZTdceA4a_65YeKFP8w-R7a4G6g",
+  sheet = "BGC",
+  na = c("NA", "Na", "na", ""),
+  range = "A:BF",
+  col_types = "c"
+  ) |>
+  janitor::clean_names(case = "small_camel") |>
+  drop_na(watershed) |>
+  filter(site == "GSS01") |>
+  mutate(time = coalesce(
+    arrivalTime,
+    departureTime,
+    samplingStartTime,
+    samplingEndTime
+  )) |>
+  mutate(
+    timeClean = case_when(
+      str_detect(time, "^\\d{1,2}:\\d{2}(:\\d{2})?$") ~ str_sub(time, 1, 5),
+      # keep only HH:MM if HH:MM:SS
+      str_detect(time, "^\\d{3}$") ~ str_c("0", str_sub(time, 1, 1), ":", str_sub(time, 2, 3)),
+      # e.g. 847 → 08:47
+      str_detect(time, "^\\d{4}$") ~ str_c(str_sub(time, 1, 2), ":", str_sub(time, 3, 4)),
+      # e.g. 1405 → 14:05
+      TRUE ~ "12:00"
+    )
+  ) |>
+  mutate(dateTime = with_tz(parse_date_time(
+    paste(date, timeClean),
+    orders = c(
+      "mdY HM",
+      "mdY HMS",
+      "%m/%d/%Y HM",
+      "%m/%d/%Y HMS",
+      "%m/%d/%y HM",
+      "%m/%d/%y HMS"
+    ),
+    tz = "MST"
+  ), tzone = "UTC")) |> 
+  select(site, dateTime, ysiTemp = tempC,  Pressure_mmHg = pressureMmHg, waterPresent, notes)
+
+gbjMaint <- mwMaint |>
+  filter(watershed == "Gibson Jack") |>
+  select(site, dateTime, ysiTemp, DO = do, doUnits, Pressure_mmHg = pressureMmHg, SpC_uScm = spCUScm, waterPresent, notes) |> 
+  full_join(mwBgc) |> 
+  select(-site, -DO, -doUnits) |> 
+  mutate(dateTime = round_date(dateTime, unit = "15 minutes"))
+```
+
+# Get Stage
+
+```{r}
+mwStage <- read_csv(here("Data/MW/SUPERSENSOR.csv")) |> 
+  select(dateTime = datetime, siteId = siteID, waterLevel_cm = finalwaterlevel, ptTemp = tempC, wetdry) |>
+  mutate(
+    dateTime = as.POSIXct(dateTime, format = "%m/%d/%Y %H:%M"),
+    dateTime = force_tz(dateTime, tz = "MST"),
+  ) |> 
+  drop_na(dateTime) |> 
+  complete(dateTime = seq(
+    floor_date(min(dateTime), "15 min"), 
+    floor_date(max(dateTime), "15 min"), 
+    by = "15 min"
+  )) |>
+  arrange(dateTime) |>
+  mutate(
+    across(where(is.numeric), ~ na.approx(.x, na.rm = FALSE, maxgap = 8)),
+    wetdry = as.numeric(wetdry),
+    waterLevel_cm = replace_na(waterLevel_cm, 0),
+    waterLevel_cm = if_else(waterLevel_cm < 0, 0, waterLevel_cm)
+  ) |>
+  mutate(
+     wetdry = case_when(
+       waterLevel_cm <= 0 ~ 0,
+       TRUE ~ 1
+     )
+   ) |> 
+  filter(minute(dateTime) %% 15 == 0)
+
+
+mwStage |>
+  filter(!is.na(wetdry)) |>
+  ggplot(aes(dateTime, waterLevel_cm, color = as.factor(wetdry))) +
+  geom_point() +
+  ylab("Water Level (cm)") +
+  theme_few() +
+  geom_rect(
+    data = mwStage |> filter(is.na(wetdry)),
+    inherit.aes = FALSE,
+    aes(xmin = dateTime, xmax = dateTime, ymin = -Inf, ymax = Inf),
+    color = "#A6A6A620"
+  ) +
+  scale_x_datetime() +
+  facet_wrap(~siteId) +
+  theme(
+    axis.title.x = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+ 
+```
+
+# Get DO and Q Data
+
+```{r}
+gbj_do <- read_csv(here("Data/MW/GBJ/GBJ_exodata_wide_2022_24_final.csv")) |>
+  rename(dateTime = TIMESTAMP, flag = `...17`) |>
+  rename_with(~ str_replace_all(.x, "_+", "_")) |> # Collapse repeated underscores
+  rename_with(~ str_replace_all(.x, "[._]+$", "")) |> # Remove trailing underscores or dots
+  complete(dateTime = seq(min(dateTime), max(dateTime), by = "15 min")) |>
+  arrange(dateTime) |>
+  mutate(across(
+    where(is.numeric),
+    ~ na.approx(., x = dateTime, na.rm = FALSE, maxgap = 2)
+  ),
+  siteId = "GBJ") |> 
+  select(dateTime, siteId, Temp_EXO_C:ODO_mg_L)
+
+gbj_q <- mwQ_sg |> 
+  select(siteId = site, dateTime, waterDepth_cm_SW = FS_stage, Q_Ls = Q) |> 
+  filter(siteId == "GSS01") |> 
+  mutate(swDepth = waterDepth_cm_SW/100,
+         siteId = "GBJ") |> 
+  select(-waterDepth_cm_SW)
+```
+
+# WX Station Data
+
+```{r}
+gbj_ppt <- read_delim(here("Data/MW/GBJ/GJ_Wx_20241012.dat"), skip = 1) |> 
+  mutate(across(RECORD:ValveOn_Tot,~ as.numeric(.x))) |> 
+  rename(dateTime = TIMESTAMP) |> 
+  mutate(dateTime = ymd_hms(dateTime)) |> 
+  drop_na(dateTime) |> 
+  select(dateTime, PPT_mm = Rain_mm_Tot)
+
+gbj_wx <- read_delim(here("Data/MW/GBJ/GJ_Wx_20241012.dat"), skip = 1) |> 
+  mutate(across(RECORD:ValveOn_Tot,~ as.numeric(.x))) |> 
+  rename(dateTime = TIMESTAMP) |> 
+  mutate(dateTime = ymd_hms(dateTime, tz = "MST")) |> 
+  drop_na(dateTime) |> 
+  select(dateTime, AirTemp_C = AirTC_Avg, bp_kPa = BP_kPa_Avg, SolarRad_Wm2 = SlrW_Avg) |> 
+  filter(dateTime != ymd_hms("2023-05-29 09:40:00", tz = "MST")) |> 
+  complete(dateTime = seq(round_date(min(dateTime), "15 min"), round_date(max(dateTime), "15 min"), by = "15 min")) |>
+  arrange(dateTime) |> 
+  mutate(across(
+    where(is.numeric),
+    ~ na.approx(., x = dateTime, na.rm = FALSE, maxgap = 2)
+  ),
+  siteId = "GBJ") |> 
+  filter(minute(dateTime) %% 15 == 0) |> 
+  mutate(dateTime = with_tz(dateTime, tz = "UTC"))
+
+
+mwElev <- read_sheet("17olxsbbn2KQQEp_z16QZycVA8jMx72gGp6_cH4W5OC0") |> 
+  rename(siteId = LTM, elev_m = `Elevation (m)`) |> 
+  drop_na(siteId)
+
+gss01_elev <- siteInfo |> filter(siteId == "GSS01") |> pull(elev_m)
+gbjwx_elev <- mwElev |> filter(siteId == "Weather") |> pull(elev_m)
+
+gbj_wx <- gbj_wx |> 
+  mutate(bp_kPa_corr = correct_bp(bp_kPa, AirTemp_C, gbjwx_elev, gss01_elev, drop_units = TRUE),
+         bp_kPa_calc = calc_air_pressure(AirTemp_C, gss01_elev) * 0.1,
+         PAR.obs = streamMetabolizer::convert_SW_to_PAR(SolarRad_Wm2)) |> 
+  select(-SolarRad_Wm2)
+
+# Get all column names except dateTime
+vars_to_plot <- gbj_wx |>
+  select(where(is.numeric)) |>
+  names()
+
+# Create plots
+walk(vars_to_plot, function(var) {
+  p <- ggplot(gbj_wx, aes(x = dateTime, y = .data[[var]])) +
+    geom_point(na.rm = TRUE, alpha = 0.5) +
+    labs(title = var, x = "Time", y = var) +
+    theme_minimal()
+  print(p)  # Display the plot
+})
+
+
+```
+
+```{r}
+gbj_data <- gbj_wx |> 
+  full_join(gbj_q) |> 
+  full_join(gbj_do)
+
+# Get all column names except dateTime
+vars_to_plot <- gbj_data |>
+  select(where(is.numeric)) |>
+  names()
+
+# Create plots
+walk(vars_to_plot, function(var) {
+  p <- ggplot(gbj_data, aes(x = dateTime, y = .data[[var]])) +
+    geom_point(na.rm = TRUE, alpha = 0.5) +
+    labs(title = var, x = "Time", y = var) +
+    theme_minimal()
+  print(p)  # Display the plot
+})
+```
+
+# Calc DO % Sat
+
+```{r}
+distColors <- sample(c('#e6194B', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#911eb4', '#42d4f4', '#f032e6', '#bfef45', '#fabed4', '#469990', '#dcbeff', '#9A6324', '#fffac8', '#800000', '#aaffc3', '#808000', '#ffd8b1', '#000075', '#a9a9a9', '#ffffff', '#000000'))
+okabeIto <- c("#0072B2", "#E69F00", "#CC79A7", "#009E73", "#56B4E9", "#D55E00", "#F0E442", "#999999", "#000000")
+
+gbj_dates <- gbj_data |> 
+  drop_na(ODOSat) |> 
+  mutate(Date = as_date(dateTime)) |> 
+  summarise(start_date = min(Date), end_date = max(Date))
+
+gbj_data <- gbj_data |> 
+  mutate(ODOSat_mg_L = (ODO_mg_L/ODOSat) * 100,
+         DO.sat.calcBP = calc_DO_sat(Temp_EXO_C, bp_kPa_calc * 10),
+    DO.sat.corrBP = calc_DO_sat(Temp_EXO_C, bp_kPa_corr * 10),
+    DO.sat.offset = DO.sat.calcBP - ODOSat_mg_L,
+    DO.obs.corr = ODO_mg_L + DO.sat.offset,
+         DO.pctsat = (DO.obs.corr/DO.sat.corrBP)*100)
+
+gbj_data |>
+  filter(between(dateTime, gbj_dates$start_date, gbj_dates$end_date)) |> 
+  select(dateTime, siteId, starts_with("DO"), starts_with("ODO")) |>
+  pivot_longer(cols = c(starts_with("DO"), starts_with("ODO")), names_to = "type", values_to = "DO.value") |>
+  mutate(
+    units = case_when(
+      type %in% c("DO.pctsat", "ODOSat") ~ "DO\n(% sat)",
+      type %in% c("ODO_mg_L", "DO.sat", "ODOSat_mg_L", "DO.sat.offset") ~ "DO\n(mg/L)",
+      TRUE ~ "DO\n(mg/L)"
+    )
+  ) |>
+  ggplot(aes(x = dateTime, y = DO.value, color = type)) +
+  geom_line(na.rm = TRUE, alpha = 0.5) +
+  facet_grid(units ~ siteId, scales = "free_y") +
+  theme_few() +
+  scale_x_datetime(labels = date_format("%b '%y")) +
+  labs(x = "") +
+  scale_color_manual(values = distColors) +
+  theme(
+    text = element_text(size = 18),
+    legend.text = element_text(size = 16),
+    legend.title = element_blank(),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 16),
+    plot.title = element_text(size = 20, hjust = 0.5),
+    legend.position = "bottom"
+  )-> p 
+p
+ggsave(filename = "GBJ_DO_Offset.png", plot = p, path = here("Figs/"), device = "png", width = 25.4, height = 25.4, units = "cm", dpi = 600)
+
+```
+
+# Calc DO Metrics
+
+```{r}
+gbj_data <- gbj_wx |> 
+  full_join(gbj_q) |> 
+  full_join(gbj_do) |> 
+  filter(between(dateTime, gbj_dates$start_date, gbj_dates$end_date)) |> 
+  rename(DO.pctsat = ODOSat, DO.obs = ODO_mg_L, air_temp_C = AirTemp_C) |> 
+  mutate(solar.time = convert_UTC_to_solartime(dateTime, siteInfo |> filter(siteId == "GSS01") |> pull(lon)),
+         isDaytime = calc_is_daytime(solar.time, siteInfo |> filter(siteId == "GSS01") |> pull(lat)))
+
+dailyDO <- gbj_data |> 
+  #filter(wetQf != "Dry") |> 
+  mutate(Date = as_date(solar.time)) |>
+  group_by(Date) |>
+  arrange(.by_group = TRUE) |>
+  summarize(
+    maxPar = max(PAR.obs, na.rm = T),
+    avgPar = mean(PAR.obs, na.rm = T),
+    water.temp = mean(Temp_EXO_C, na.rm = T),
+    air.temp = mean(air_temp_C, na.rm = T),
+    minDO.obs = min(DO.obs, na.rm = T),
+    maxDO.obs = max(DO.obs, na.rm = T),
+    minDO.pctsat = min(DO.pctsat, na.rm = T),
+    maxDO.pctsat = max(DO.pctsat, na.rm = T),
+    avgDO.obs = mean(DO.obs, na.rm = T),
+    avgDO.pctsat = mean(DO.pctsat, na.rm = T),
+    DOSat.hyp = sum(DO.pctsat <= 50, na.rm = T),
+    DO.hyp = sum(DO.obs <= 2, na.rm = T),
+    cvDO.pctsat = (sd(DO.pctsat, na.rm = T)/mean(DO.pctsat, na.rm = T))*100,
+    sdDO.pctsat = sd(DO.pctsat, na.rm = T),
+    totalDO = n()
+    ) |> 
+  mutate(DOSat.slope = (avgDO.pctsat - lag(avgDO.pctsat))) |> 
+  mutate(across(where(is.numeric), ~ ifelse(is.finite(.), ., NA))) |> 
+  mutate(across(where(is.numeric), ~ ifelse(if_any(everything(), is.na), NA, .))) |> 
+  mutate(across(minDO.obs:avgDO.pctsat, ~ ifelse(. == 0, NA, .))) |> 
+  mutate(DO.amp = maxDO.obs - minDO.obs,
+         DOpctsat.amp = maxDO.pctsat - minDO.pctsat,
+         probHyp = DO.hyp / totalDO,
+         probHypSat = DOSat.hyp / totalDO) |> 
+  mutate(dDOpctsat.amp = DOpctsat.amp - lag(DOpctsat.amp),
+         dMinDO.pctsat = minDO.pctsat - lag(minDO.pctsat)) |> 
+  ungroup() |> 
+  mutate(
+         DOSat.exc = calc_exceedance_prob(avgDO.pctsat)) |> 
+  ungroup()
+#nighttime hypoxia ratio
+nightHypRat <- gbj_data |> 
+  #filter(wetQf != "Dry") |> 
+  mutate(across(c("DO.obs", "DO.pctsat"), ~ ifelse(. == 0, NA, .))) |> 
+  select(dateTime, solar.time, DO.obs, DO.pctsat, isDaytime) |> 
+  mutate(Date = as_date(solar.time)) |>
+  group_by(Date, isDaytime) |> 
+  summarise(DO.hyp.obs = sum(DO.obs <= 2, na.rm = TRUE),
+            DO.hyp.sat = sum(DO.pctsat <= 50, na.rm = TRUE), .groups = 'drop') |> 
+  ungroup() |> 
+  pivot_wider(names_from = isDaytime, 
+              values_from = c(DO.hyp.obs, DO.hyp.sat), 
+              names_prefix = "DO_hyp_", 
+              names_sep = "_") |> 
+  rename(DayHyp_obs = DO.hyp.obs_DO_hyp_TRUE, 
+         NightHyp_obs = DO.hyp.obs_DO_hyp_FALSE,
+         DayHyp_sat = DO.hyp.sat_DO_hyp_TRUE, 
+         NightHyp_sat = DO.hyp.sat_DO_hyp_FALSE) |> 
+  mutate(NHR_obs = NightHyp_obs / DayHyp_obs,
+         NHR_sat = NightHyp_sat / DayHyp_sat) |> 
+  mutate(across(where(is.numeric), ~ ifelse(is.finite(.), ., NA))) |> 
+  select(Date, NHR_obs, NHR_sat)
+
+
+# Calculate probabilities for daytime
+dayHypProb <- gbj_data |> 
+  #filter(wetQf != "Dry") |> 
+  mutate(across(c("DO.obs", "DO.pctsat"), ~ ifelse(. == 0, NA, .))) |> 
+  select(dateTime, solar.time, DO.obs, DO.pctsat, isDaytime) |> 
+  mutate(Date = as_date(solar.time)) |>
+  filter(isDaytime) |>
+  group_by(Date) |>
+  summarise(
+    dayProbConc = mean(DO.obs < 2, na.rm = TRUE),
+    dayProbSat = mean(DO.pctsat < 50, na.rm = TRUE),
+    .groups = 'drop'
+  ) |> 
+  ungroup()
+
+# Calculate probabilities for nighttime
+nightHypProb <- gbj_data |>
+  #filter(wetQf != "Dry") |> 
+  mutate(across(c("DO.obs", "DO.pctsat"), ~ ifelse(. == 0, NA, .))) |> 
+  select(dateTime, solar.time, DO.obs, DO.pctsat, isDaytime) |> 
+  mutate(Date = as_date(solar.time)) |>
+  filter(!isDaytime) |>
+  group_by(Date) |>
+  summarise(
+    nightProbConc = mean(DO.obs < 2, na.rm = TRUE),
+    nightProbSat = mean(DO.pctsat < 50, na.rm = TRUE),
+    .groups = 'drop'
+  ) |> 
+  ungroup()
+
+# Join the daytime and nighttime probabilities
+nightHypRat <- dayHypProb |>
+  inner_join(nightHypProb, by = "Date") |> 
+  mutate(NHR_obs = nightProbConc/dayProbConc,
+         NHR_sat = nightProbSat/dayProbSat) |> 
+  mutate(across(where(is.numeric), ~ ifelse(is.finite(.), ., NA)))
+
+
+
+#Merge DO Metrics
+doMetrics <- dailyDO |> 
+  full_join(nightHypRat)
+
+library(gghighlight)
+
+doMetrics |>
+  ggplot(aes(Date, avgDO.pctsat)) +
+  geom_point() +
+  ylab("DO (% Sat)") +
+  gghighlight(Date == as_date("2022-07-13")) +
+  theme_few() +
+  scale_x_date(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+doMetrics |>
+  ggplot(aes(Date, probHypSat)) +
+  geom_point() +
+  ylab("DO (% Sat)") +
+  gghighlight(Date == as_date("2022-07-13")) +
+  theme_few() +
+  scale_x_date(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+gbj_data |>
+  ggplot(aes(solar.time, DO.pctsat)) +
+  geom_point() +
+  ylab("DO (% Sat)") +
+  gghighlight(as_date(solar.time) == as_date("2022-07-13")) +
+  theme_few() +
+  scale_x_date(labels = date_format("%b '%y")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Daily Q
+
+```{r}
+
+dailyQ <- gbj_q |> 
+  mutate(solar.time = convert_UTC_to_solartime(dateTime, siteInfo |> filter(siteId == "GSS01") |> pull(lon))) |> 
+  mutate(Date = as_date(solar.time)) |> 
+  group_by(Date) |> 
+  summarise(minQ = min(Q_Ls, na.rm = TRUE),
+            maxQ = max(Q_Ls, na.rm = TRUE),
+            Q_1d = mean(Q_Ls, na.rm = TRUE),
+            minDepth = min(swDepth, na.rm = TRUE),
+            maxDepth = max(swDepth, na.rm = TRUE),
+            Depth_1d = mean(swDepth, na.rm = TRUE))
+```
+
+# Daily PPT
+
+```{r}
+dailyPPT <- gbj_ppt |> 
+  rename(Date = dateTime) |> 
+  mutate(Date = as_date(Date)) |> 
+  group_by(Date) |> 
+  summarise(PPT_1d = sum(PPT_mm, na.rm = TRUE))
+```
+
+# Merge All
+
+```{r}
+gbj_daily <- doMetrics |> 
+  full_join(dailyQ) |> 
+  full_join(dailyPPT) |> 
+  mutate(Site = "GBJ") |> 
+  data.table()
+
+# Define rolling window sizes
+window_sizes <- c(7, 14, 30, 60)
+
+# List of variables to compute rolling means for
+vars <- list(
+  Q_1d = "Q",
+  Depth_1d = "Depth",
+  PPT_1d = "PPT"
+)
+
+# Generate rolling means for each variable and window size
+for (var in names(vars)) {
+  prefix <- vars[[var]]  # Get the appropriate prefix for the variable
+  gbj_daily[, (paste0(prefix, "_", window_sizes, "d")) := 
+              lapply(window_sizes, function(w) frollmean(get(var), n = w, align = "right", na.rm = TRUE)),
+           by = Site]
+}
+
+# Gather the rolling mean data into a long format
+rollingCols <- grep("_(\\d+d)$", names(gbj_daily), value = TRUE)  # Select columns like Q_7d, Depth_7d, etc.
+longDat <- melt(gbj_daily, id.vars = c("Site", "Date"), measure.vars = rollingCols, 
+                variable.name = "Variable", value.name = "Value")
+
+# Extract the variable type (e.g., Q, Depth, etc.) and rolling window size (e.g., 7d, 14d)
+longDat[, c("VariableType", "Window") := tstrsplit(Variable, "_", fixed = TRUE)]
+
+# List to store plots
+plots <- list()
+
+longDat <- longDat |> 
+  group_by(Site, VariableType, Window) |> 
+  complete(Date = seq(min(Date, na.rm = TRUE), max(Date, na.rm = TRUE), by = "1 day")) |> 
+  ungroup()
+
+# Create separate plots for each VariableType
+unique_vars <- unique(longDat$VariableType)
+
+for (var in unique_vars) {
+  p <- longDat |> 
+    filter(VariableType == var) |>  # Use `filter()` instead of `[ ]`
+    ggplot(aes(x = Date, y = Value, color = Window, group = Window)) +
+    geom_line(linewidth = 0.8, linetype = "dashed", na.rm = T) +  
+    scale_color_manual(
+      values = c("1d" = "grey", "7d" = "blue", "14d" = "green", "30d" = "orange", "60d" = "red"),
+      name = "Rolling Window"
+    ) +
+    labs(x = "Date", y = var) +
+    theme_few() +
+    theme(legend.position = "bottom",
+          legend.title = element_text(size = 12),
+          legend.text = element_text(size = 10)) +
+    facet_wrap(~Site, scales = "free_y", ncol = 1)
+
+  # Store the plot
+  plots[[var]] <- p
+}
+
+# Display plots
+for (p in plots) {
+  print(p)
+}
+
+# Create an empty list to store plots
+plots <- list()
+
+# Loop through each unique variable
+for (var in unique_vars) {
+  # Center and scale the data for the current variable
+  centered_scaled_data <- longDat |>
+    filter(VariableType == var) |>
+    group_by(Site) |>  # Group by Site to center and scale within each site
+    mutate(Value = scale(Value)) |>  # Center and scale the Value column
+    ungroup() |>  # Ungroup to return to a regular data frame
+  filter(Window == "1d")
+  # Create the plot
+  p <- centered_scaled_data |> 
+    ggplot(aes(x = Date, y = Value, color = Site, group = Site)) +
+    geom_line(linewidth = 0.8, linetype = "dashed", na.rm = TRUE) +  
+    labs(x = "Date", y = paste("Centered & Scaled", var)) +  # Update y-axis label
+    theme_few() +
+    theme(legend.position = "bottom",
+          legend.title = element_text(size = 12),
+          legend.text = element_text(size = 10)) 
+  # Store the plot
+  plots[[var]] <- p
+}
+
+# Display plots
+for (p in plots) {
+  print(p)
+}
+```
+
+# Save Daily Data
+
+```{r}
+gbj_daily |> 
+  write_csv(here("Data/GBJ_dailyData.csv"))
+```
+
+# 
+
+# Get Pre AIMS Gibson Jack Data
+
+# Baro Pressure
+
+## Gibson Jack Weather Station
+
+```{r}
+# GBJ Weather station data corrected for 520 m decrease in elevation (WX station to Super Sensor)
+# so add 5.2 to Wx bp to get site bp. From Michelle S.
+# https://docs.google.com/spreadsheets/d/17olxsbbn2KQQEp_z16QZycVA8jMx72gGp6_cH4W5OC0/edit?gid=0#gid=0
+gbjWx <- read_csv(here("Data/MW/20201018_20231012_15min.csv")) |>
+   mutate(dateTime = with_tz(force_tz(mdy_hm(datetime), tzone = "US/Mountain"), tzone = "UTC")) |>
+  rename(gbjWx_kPa = baro) |>
+  select(-datetime) |>
+  complete(dateTime = seq(floor_date(min(dateTime, na.rm = T), "15 min"), floor_date(max(dateTime, na.rm = T), "15 min"), by = "15 min")) |>
+  arrange(dateTime) |>
+  mutate(gbjWx_kPa = na.approx(gbjWx_kPa, na.rm = F, maxgap = 10)) |>
+  filter(minute(dateTime) %% 15 == 0) |> 
+  mutate(gbjWx_adj_kPa = gbjWx_kPa + 5.2)
+```
+
+## NASA
+
+```{r}
+gbj <- siteInfo |>
+  filter(siteName == "Gibson Jack") |> 
+  mutate(Site = "GBJ",
+         StartDate = as_date("2020-01-01"),
+         EndDate = today()) |> 
+  select(Site, Lat, Long, Elev_m, StartDate, EndDate)
+
+# 
+# nasaBP <- get_nasa_data(gbj)
+# nasaBP <- nasaBP |> 
+#   complete(dateTime = seq(floor_date(min(dateTime, na.rm = T), "15 min"), floor_date(max(dateTime, na.rm = T), "15 min"), by = "15 min")) |>
+#   arrange(dateTime) |>
+#   mutate(bp_mbar = na.approx(bp_mbar, na.rm = F, maxgap = 10)) |>
+#   filter(minute(dateTime) %% 15 == 0) |> 
+#   mutate(nasa_kPa = bp_mbar * 0.1) |> 
+#   select(dateTime, nasa_kPa)
+```
+
+## NOAA
+
+```{r}
+#Find closest NOAA Station
+noaaStations <- get_noaa_stations(state = "ID") |> 
+  filter(END_DATE >= today()) |> 
+  select(-NAME_ALIAS, -STATE_PROV, -FIPS_COUNTRY_CODE, -FIPS_COUNTRY_NAME)
+
+closest_stations <- find_closest_station(gbj$Lat, gbj$Long, dist_km = 10)
+
+#Load data from closest station, Pocatello Regional Airport
+wbanBP <- read_csv(here("Data/MW/WBAN_24156.csv")) |>
+  select(DATE, starts_with("Hourly")) |>
+  mutate(DATE = with_tz(force_tz(ymd_hms(DATE), tzone = "America/Denver"), tzone = "UTC")) |> 
+  drop_na(DATE) |> 
+  select(
+    dateTime = DATE,
+    Altimeter_inHg = HourlyAltimeterSetting,
+    AirTemp_F = HourlyDryBulbTemperature,
+    Precipitation_in = HourlyPrecipitation,
+    SeaLevelPressure_inHg = HourlySeaLevelPressure,
+    StationPressure_inHg = HourlyStationPressure) |>
+  mutate(WBAN_ID = "24156",
+         # Convert units to metric
+    Altimeter_kPa = Altimeter_inHg * 3.3863886667,
+    SeaLevelPressure_kPa = SeaLevelPressure_inHg * 3.3863886667,
+    StationPressure_kPa = StationPressure_inHg * 3.3863886667,
+    AirTemp_C = (as.numeric(AirTemp_F) - 32) * 5/9,
+    Precipitation_mm = case_when(
+      Precipitation_in == "T" ~ 0.001,  # trace precipitation as 0.001 inches (~0.0254 mm)
+      TRUE ~ as.numeric(Precipitation_in) * 25.4)) |> 
+  left_join(closest_stations |> select(GHCND_ID, WBAN_ID, NAME_PRINCIPAL, Elev_ft = ELEV_BAROM, LAT_DEC, LON_DEC, distance_km),by = "WBAN_ID") |>
+  mutate(Elev_m = as.numeric(Elev_ft) * 0.3048) |> 
+  select(GHCND_ID,Elev_m, LAT_DEC, LON_DEC, dateTime, Altimeter_kPa, SeaLevelPressure_kPa, StationPressure_kPa, AirTemp_C, Precipitation_mm) |> 
+  mutate(site_kPa = correct_bp(StationPressure_kPa, AirTemp_C, Elev_m, gbj$Elev_m)) |> 
+  complete(dateTime = seq(floor_date(min(dateTime), "15 min"), floor_date(max(dateTime), "15 min"), by = "15 min")) |>
+  fill(where(is.character), .direction = "down") |>
+  arrange(dateTime) |> 
+   mutate(across(where(is.numeric), ~ na.approx(.x, na.rm = F, maxgap = 5))) |> 
+  filter(minute(dateTime) %% 15 == 0) |> 
+  select(dateTime, noaa_kPa = site_kPa) |> 
+  drop_na()
+```
+
+## Plot
+
+```{r}
+
+gbjBP <- gbjWx |> 
+  full_join(wbanBP) |> 
+ # full_join(nasaBP) |> 
+  pivot_longer(
+    cols = ends_with("_kPa"),
+    names_to = "Source",
+    values_to = "kPa"
+  ) |>
+  mutate(Source = str_remove(Source, "_kPa$"))
+
+gbjBP |> 
+  ggplot(aes(x = dateTime, y = kPa, color = Source, shape = Source)) +
+  geom_point(alpha = 0.3, size = 1.5) +
+  scale_color_brewer(palette = "Dark2") +
+  scale_shape_manual(values = c(16, 17, 15, 3)) +
+  theme_minimal() +
+  labs(
+    title = "",
+    x = "Date Time",
+    y = "Pressure (kPa)",
+    color = "Source",
+    shape = "Source"
+  ) 
+```
+
+## 
+
+```{r}
+gbjData <- mwDO |> 
+  left_join(gbjBP) |> 
+  mutate(DO.sat = calc_DO_sat(temp.water, kPa*10),
+         DO.pctsat = (DO.obs/DO.sat)*100)
+
+
+gbjData |> 
+  subset(select = c("dateTime", "Site", "DO.obs")) |>
+  split(~ Site) |>
+  lapply(\(df) {
+    xts::xts(df[, c("DO.obs")], order.by = df$dateTime) |>
+      dygraph(main = unique(df$Site)) |>
+      dyAxis("y", label = "DO (mg/L)") |>
+      dySeries("DO.obs", color = "#0084a8", drawPoints = TRUE) |>
+      dyRangeSelector()
+  })
+
+
+gbjData |> 
+  ggplot(aes(x = dateTime, y = DO.sat, color = Source, shape = Source)) +
+  geom_point(alpha = 0.3, size = 1.5) +
+  scale_color_brewer(palette = "Dark2") +
+  scale_shape_manual(values = c(16, 17, 15, 3, 7, 8, 0, 4, 6)) +
+  theme_few() +
+  labs(
+    title = "",
+    x = "Date Time",
+    y = "DO Saturation (mg/L)",
+    color = "Source",
+    shape = "Source"
+  ) +
+  facet_wrap(~Site, scales = "free", ncol = 1)
+
+
+
+# Get unique Source values from the data
+sources <- unique(gbjData$Source)
+
+# Assign Dark2 palette colors
+palette_colors <- brewer.pal(n = length(sources), name = "Dark2")
+source_colors <- setNames(palette_colors, sources)
+
+gbjData |>
+  subset(select = c("dateTime", "Site", "Source", "DO.pctsat")) |>
+  split(~ Site) |>
+  lapply(\(site_df) {
+    
+    # Split again by Source within each Site
+    source_series <- split(site_df, site_df$Source)
+
+    # Create a list of xts series per source
+    xts_list <- lapply(source_series, \(df) {
+      xts::xts(df$DO.pctsat, order.by = df$dateTime)
+    })
+
+    # Combine into a single xts object
+    xts_combined <- do.call(merge, xts_list)
+
+    # Assign column names to match source names
+    colnames(xts_combined) <- names(xts_list)
+
+    # Build dygraph with one series per Source
+    dy <- dygraph(xts_combined, main = unique(site_df$Site)) |>
+      dyAxis("y", label = "DO (% saturation)") |>
+      dyRangeSelector()
+
+    # Add each series with matching color
+    for (src in names(xts_combined)) {
+      dy <- dy |> dySeries(src, color = source_colors[[src]], drawPoints = TRUE)
+    }
+
+    dy
+  })
+```
+
+# Q from Evan
+
+```{r}
+mwQ <- readRDS(here("Data/MW/AIMS_ALL_Piezo_RatingCurve_datafile.rds")) |> 
+  tibble() |> 
+  write_csv(here("Data/MW/Discharge_EMB_20240220.csv"))
+
+mwQsummary <- mwQ |> 
+  group_by(site) |> 
+  summarise(
+    min_date = min(DateTime),
+    max_date = max(DateTime)
+  )
+```

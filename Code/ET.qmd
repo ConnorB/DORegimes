@@ -28,9 +28,6 @@ library(whitebox)
 wbt_init(exe_path = "~/WBT/whitebox_tools")
 # EPSG for NAD83 / UTM zone 14N
 UTM_14N <- 26914
-source(here("Code/AIMS_DAGs.R"))
-source(here("Code/Functions/aims.R"))
-source(here("Code/Functions/stic_StreamDAG.R"))
 ```
 
 # Streams and Sites
@@ -56,122 +53,200 @@ seSites <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_SouthEast.gpkg", layer = "si
     lat = st_coordinates(geom)[, 2]
   ) 
 
-mwSites <- st_read("~/Dropbox/AIMS/GIS/Results/GBJ.gpkg", layer = "Sites") |> 
-  st_transform(4326)
-
-```
-
-```{r}
-# First identify common columns we want to keep
-common_cols <- intersect(
-  names(gpSites), 
-  c("siteId", "slope", "twi", "drainage_area_sqkm", "outlet_dist_m", 
-    "elev_m", "watershed", "geom", "lon", "lat")
-)
-
-# Process seSites to match gpSites structure
-seSites <- seSites |>
+mwSites <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_MountainWest.gpkg", layer = "Sites") |> 
+  st_transform(4326) |> 
   mutate(
-    elev_m = elevation,
-    slope = slope_point,
-    outlet_dist_m = distance_from_outlet,
-    drainage_area_sqkm = drainage_area_m / 1000000  # Convert m² to km²
-  ) |>
-  # Select only the columns we want to keep
-  select(all_of(common_cols))
-
-# Process gpSites to match same column selection
-gpSites <- gpSites |>
-  select(all_of(common_cols))
-
-# Combine the two data frames
-allSites <- bind_rows(gpSites, seSites)
-
-# Add missing columns to mwSites, filled with NA
-mwSites <- mwSites |>
-  mutate(
-    slope = NA_real_,
-    twi = NA_real_,
-    drainage_area_sqkm = NA_real_,
-    outlet_dist_m = NA_real_,
-    elev_m = NA_real_,
-    watershed = as.character(watershed),  # ensure type match
     lon = st_coordinates(geom)[, 1],
     lat = st_coordinates(geom)[, 2]
-  ) |>
-  select(all_of(common_cols))  # enforce column order
+  ) 
 
-# Bind all sites together
-allSites <- bind_rows(allSites, mwSites)
-allSites <- allSites |> 
-  filter(siteId %in% c("SFM01", "SHM01", "ENM01", "TLM01", "WHM01", "PRM01", "GJ1"))
 ```
 
-# NASA Power
+```{r}
+# Select and align columns
+gpSites <- gpSites |>
+  select(siteId, watershed, lon, lat, geom)
+
+seSites <- seSites |>
+  select(siteId, watershed, lon, lat, geom)
+
+mwSites <- mwSites |>
+  select(siteId, watershed, lon, lat, geom)
+
+# Combine all into one
+allSites <- bind_rows(gpSites, seSites, mwSites)
+allSites <- allSites |> 
+  filter(siteId %in% c("SFM01", "SHM01", "ENM01", "TLM01", "WHM01", "PRM01", "GSS01", "DSS01", "JSS01"))
+```
+
+# Open ET
 
 ```{r}
-library(nasapower)
+library(httr2)
+library(jsonlite)
 
-get_et <- function(lat, lon, siteId, start_date, end_date) {
-  tryCatch({
-    et_data <- get_power(
-      community = "ag",
-      lonlat = c(lon, lat),
-      pars = c("EVPTRNS"),
-      dates = c(start_date, end_date)
-    )
-    et_data |>
-      mutate(siteId = siteId)
-  }, error = function(e) {
-    message("Error for site ", siteId, ": ", e$message)
-    return(NULL)
-  })
+
+download_openet_et <- function(
+  api_key,
+  lon, lat,
+  start_date = "2020-01-01",
+  end_date = "2020-12-31",
+  interval = "daily",
+  model = "Ensemble",
+  variable = "ET"
+) {
+  url <- "https://openet-api.org/raster/timeseries/point"
+  
+  body <- list(
+    date_range = list(start_date, end_date),
+    interval = interval,
+    geometry = list(lon, lat),
+    model = model,
+    variable = variable,
+    reference_et = "gridMET",
+    units = "mm",
+    file_format = "JSON"
+  )
+  
+  response <- request(url) |>
+    req_method("POST") |>
+    req_headers(
+      Authorization = api_key,
+      Accept = "application/json",
+      `Content-Type` = "application/json"
+    ) |>
+    req_body_json(body) |>
+    req_perform()
+  
+  # Check for HTTP error
+  if (httr2::resp_status(response) >= 400) {
+    error_details <- tryCatch({
+      httr2::resp_body_json(response)$detail
+    }, error = function(e) {
+      httr2::resp_body_string(response)
+    })
+    stop(sprintf("OpenET API request failed [%d]: %s",
+                 httr2::resp_status(response), error_details))
+  }
+
+  result <- httr2::resp_body_json(response)
+  
+  tibble::tibble(
+    Date = as.Date(sapply(result, `[[`, "time")),
+    ET_mm = as.numeric(sapply(result, `[[`, "et"))
+  )
 }
 
+
+api_key <- "NMWBgqRcOSktIVd3cWnv3uP5IjdGWGIfDIWRLtgOrTVyx1LtxC9uXeHi3JCW"
+start_date <- "2021-01-01"
+end_date <- "2025-01-01"
+
+
+et_all <- allSites |>
+  st_drop_geometry() |> 
+  mutate(
+    et_data = pmap(
+      list(lon, lat),
+      \(lon, lat) {
+        tryCatch({
+          download_openet_et(
+            api_key = api_key,
+            lon = lon,
+            lat = lat,
+            start_date = start_date,
+            end_date = end_date,
+            interval = "daily"
+          )
+        }, error = function(e) {
+          warning(paste("Download failed for", lon, lat, ":", e$message))
+          NULL
+        })
+      }
+    )
+  ) |>
+  select(siteId, watershed, et_data) |>
+  unnest(et_data)
+
+et_all <- et_all |> 
+  select(Site = watershed, Date, ET_1d = ET_mm)
+
+et_all |>
+  ggplot(aes(x = Date, y = ET_1d)) +
+  geom_line() +
+  facet_wrap(~ Site, scales = "free_y") +
+  labs(
+    title = "OpenET",
+    x = "Date",
+    y = "ET (mm/day)"
+  ) +
+  theme_few()
+```
+
+```{r}
+library(slider)
+
+et_all_means <- et_all |>
+  arrange(Site, Date) |>
+  group_by(Site) |>
+  mutate(
+    ET_7d = slide_dbl(ET_1d, mean, .before = 6, .complete = TRUE),
+    ET_14d = slide_dbl(ET_1d, mean, .before = 13, .complete = TRUE),
+    ET_30d = slide_dbl(ET_1d, mean, .before = 29, .complete = TRUE),
+    ET_60d = slide_dbl(ET_1d, mean, .before = 59, .complete = TRUE)
+  ) |>
+  ungroup()
+```
+
+```{r}
+modisET <- read_csv(here("Data/ET/MODIS_ET.csv")) |> 
+  select(siteId = ID, Date, ET_1d = MOD16A2GF_061_ET_500m) |> 
+  left_join(allSites |> st_drop_geometry() |> select(siteId, watershed)) |> 
+  select(Site = watershed, Date, ET_1d)
+
+modisET_daily <- modisET |>
+  group_by(Site) |>
+  # Fill in daily date sequence per Site
+  complete(Date = seq(min(Date), max(Date), by = "day")) |>
+  arrange(Site, Date) |>
+  # Carry forward Site name (since complete() introduces NAs)
+  fill(Site, .direction = "downup") |>
+  group_split() |>
+  map_dfr(\(df) {
+    df$ET_1d <- approx(x = df$Date, y = df$ET_1d, xout = df$Date)$y
+    df
+  })
+
+modisET_daily <- modisET_daily |>
+  arrange(Site, Date) |>
+  group_by(Site) |>
+  mutate(
+    ET_7d = slide_dbl(ET_1d, mean, .before = 6, .complete = TRUE),
+    ET_14d = slide_dbl(ET_1d, mean, .before = 13, .complete = TRUE),
+    ET_30d = slide_dbl(ET_1d, mean, .before = 29, .complete = TRUE),
+    ET_60d = slide_dbl(ET_1d, mean, .before = 59, .complete = TRUE)
+  ) |>
+  ungroup() |> 
+  write_csv(here("Data/ET/MODIS_Daily_ET.csv"))
+
+modisET_daily |>
+  ggplot(aes(x = Date, y = ET_1d)) +
+  geom_line() +
+  facet_wrap(~ Site, scales = "free_y") +
+  labs(
+    title = "MODIS ET",
+    x = "Date",
+    y = "ET (mm/day)"
+  ) +
+  theme_few()
 ```
 
 ## 
 
 ```{r}
-start_date <- as_date("2021-01-01")
-end_date <- as_date("2025-01-01")
 
-
-et_all <- allSites |>
-  st_drop_geometry() |>
-  mutate(data = pmap(list(lat, lon, siteId),
-                     ~ get_et(..1, ..2, ..3, start_date, end_date))) |>
-  select(data) |>
-  unnest(cols = c(data))
-
-
-et_all <- et_all |> 
-  mutate(
-    ET_mm_day = EVPTRNS * 0.408,
-    siteId = case_when(
-    siteId == "SFM01" ~ "KNZ",
-    siteId == "SHM01" ~ "SHN",
-    siteId == "ENM01" ~ "YMR",
-    siteId == "WHM01" ~ "WHR",
-    siteId == "TLM01" ~ "TAL",
-    siteId == "PRM01" ~ "PRF",
-    siteId == "GJ1" ~ "GBJ",
-    TRUE ~ siteId  # keep other values unchanged
-  )) |> 
-  select(Date = YYYYMMDD, Site = siteId, ET_mm_day)
 ```
 
 ```{r}
-et_all |> 
-  write_csv(here("Data/nasaET.csv"))
-et_all |>
-  ggplot(aes(x = Date, y = ET_mm_day)) +
-  geom_line() +
-  facet_wrap(~ Site, scales = "free_y") +
-  labs(
-    title = "Daily Evapotranspiration by Site",
-    x = "Date",
-    y = "ET (mm/day)"
-  ) +
-  theme_few()
+
 ```
