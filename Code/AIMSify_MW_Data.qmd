@@ -1,0 +1,856 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+#| include: false
+
+library(tidyverse)
+library(ggthemes)
+library(dygraphs)
+library(xts)
+```
+
+# EXO
+
+## JDR
+
+```{r}
+jdr <- read_csv("~/Desktop/MW_EXO_QAQC/JDR_exodata_wide_2022_23_final.csv") |>
+  rename(siteId = SiteName) |>
+  rename_with(~ str_replace_all(.x, "_+", "_")) |>
+  rename_with(~ str_replace(.x, "_$", "")) |> 
+  complete(TIMESTAMP = seq(min(TIMESTAMP), max(TIMESTAMP), by = "15 min")) |> 
+  mutate(
+    across(
+      Conductivity_uS_cm:Turbidity_NTU,
+      ~ zoo::na.approx(.x, x = TIMESTAMP, na.rm = FALSE, maxgap = 2)
+    ),
+    across(
+      contains("flag"),
+      ~ zoo::na.locf(.x, na.rm = FALSE, maxgap = 2)
+    ),
+    across(
+      Conductivity_uS_cm:Turbidity_NTU,
+      ~ round(.x, 2))
+  ) |>
+  mutate(datetime_local = force_tz(TIMESTAMP, tzone = "America/Denver"),
+         datetime_UTC = with_tz(datetime_local, tzone = "UTC"),
+         siteId = "JDR") |> 
+  select(-TIMESTAMP) |> 
+  filter(!is.na(datetime_UTC))
+
+```
+
+### Dygraph
+
+```{r}
+# DO
+jdr_clean <- jdr |>
+  arrange(datetime_local) |>
+  drop_na(ODO_mg_L)
+
+jdr_xts <- xts(jdr_clean$ODO_mg_L, order.by = jdr_clean$datetime_local)
+
+dygraph(jdr_xts, main = "JDR Dissolved Oxygen") |>
+  dyOptions(useDataTimezone = TRUE) |> 
+  dyAxis("y", label = "ODO (mg/L)") |>
+  dyAxis("x",
+    axisLabelFormatter = htmlwidgets::JS("function(d) {
+      return d.toLocaleString('en-US', {
+        month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+        hour12: false
+      });
+    }"),
+    valueFormatter = htmlwidgets::JS("function(d) {
+      return new Date(d).toLocaleString('en-US', {
+        year: 'numeric', month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+        hour12: false
+      });
+    }")
+  ) |>
+  dyRangeSelector() |> 
+  dyCSS(textConnection("
+    .dygraph-title { color: black; }
+    .dygraph-axis-label { color: black; }
+    .dygraph-ylabel { color: black; }
+    .dygraph-legend { color: black; }
+  "))
+
+# Temp
+jdr_clean <- jdr |>
+  arrange(datetime_local) |>
+  drop_na(Temp_EXO_C)
+
+jdr_xts <- xts(jdr_clean$Temp_EXO_C, order.by = jdr_clean$datetime_local)
+
+dygraph(jdr_xts, main = "JDR Temp") |>
+  dyOptions(useDataTimezone = TRUE) |> 
+  dyAxis("y", label = "Temperature (C)") |>
+  dyAxis("x",
+    axisLabelFormatter = htmlwidgets::JS("function(d) {
+      return d.toLocaleString('en-US', {
+        month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+        hour12: false
+      });
+    }"),
+    valueFormatter = htmlwidgets::JS("function(d) {
+      return new Date(d).toLocaleString('en-US', {
+        year: 'numeric', month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+        hour12: false
+      });
+    }")
+  ) |>
+  dyRangeSelector() |> 
+  dyCSS(textConnection("
+    .dygraph-title { color: black; }
+    .dygraph-axis-label { color: black; }
+    .dygraph-ylabel { color: black; }
+    .dygraph-legend { color: black; }
+  "))
+
+```
+
+```{r}
+jdr_clean <- jdr |>
+  select(-contains("Level")) |>
+  relocate(datetime_UTC, datetime_local, siteId) |>
+  mutate(
+    across(
+      ends_with("_flag"),
+      ~ case_when(
+        . == "o" ~ "Z",
+        . == "d" ~ "D",
+        . == "r" ~ "A",
+        . == "q" ~ "B",
+        TRUE ~ .
+      )
+    )
+  )
+```
+
+### Flag Plots
+
+```{r}
+# Define param -> flag mapping
+params <- c(
+  "Conductivity_uS_cm", "FDOM_QSUraw", "FDOM_QSU_temp",
+  "FDOM_QSU_tempturb", "rp", "ODO_mg_L", "ODOSat",
+  "SpCond_uS_cm", "Temp_EXO_C", "Turbidity_NTU"
+)
+flags <- c(
+  "Conductivity_uS_cm_flag", "FDOM_QSU_flag", "FDOM_QSU_flag",
+  "FDOM_QSU_flag", NA, "ODO_mg_L_flag", "ODOSat_flag",
+  "SpCond_uS_cm_flag", "Temp_EXO_C_flag", "Turbidity_NTU_flag"
+)
+
+# Build long data frame
+make_long <- function(param, flag_col) {
+  jdr_clean |>
+    transmute(
+      datetime_local,
+      param = param,
+      value = .data[[param]],
+      flag = if (!is.na(flag_col)) .data[[flag_col]] else NA_character_
+    )
+}
+
+long_data <- map2_dfr(params, flags, make_long) |>
+  mutate(
+    flag_plot = case_when(
+      is.na(flag) ~ "NA",
+      TRUE ~ flag
+    ),
+    flag_plot = factor(flag_plot, levels = c("Z", "D", "A", "B", "NA"))
+  )
+
+# Value plot
+long_data |>
+  ggplot(aes(x = datetime_local, y = value, color = flag_plot)) +
+  geom_point(alpha = 0.6) +
+  facet_wrap(~ param, scales = "free_y", ncol = 3) +
+  scale_color_manual(
+    values = c(
+      "Z" = "#CC79A7",
+      "D" = "#E69F00",
+      "A" = "#009E73",
+      "B" = "#F0E442",
+      "NA" = "grey60"
+    ),
+    breaks = c("Z", "D", "A", "B", "NA"),
+    labels = c(
+      "Z" = "Z-Score",
+      "D" = "Dry",
+      "A" = "A",
+      "B" = "B",
+      "NA" = "NA"
+    )
+  ) +
+  labs(x = NULL, y = NULL, color = "Flag") +
+  theme_bw(base_size = 11) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+
+long_flags <- map2_dfr(params, flags, make_long) |>
+  mutate(
+    flag_plot = case_when(
+      is.na(flag) ~ "NA",
+      TRUE ~ flag
+    ),
+    flag_plot = factor(flag_plot, levels = c("Z", "D", "A", "B", "NA"))
+  )
+
+long_flags |>
+  ggplot(aes(x = datetime_local, y = flag_plot, color = flag_plot)) +
+  geom_point(size = 0.7, alpha = 0.7) +
+  facet_wrap(~ param, scales = "free_x", ncol = 3) +
+  scale_color_manual(
+    values = c(
+      "Z" = "#CC79A7",
+      "D" = "#E69F00",
+      "A" = "#009E73",
+      "B" = "#F0E442",
+      "NA" = "grey60"
+    ),
+    breaks = c("Z", "D", "A", "B", "NA")
+  ) +
+  labs(x = NULL, y = "Flag", color = "Flag") +
+  theme_bw(base_size = 11) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    legend.position = "none"
+  )
+```
+
+```{r}
+long_data |> 
+  count(param, flag) |> 
+  mutate(flag = replace_na(flag, "no_flag")) |> 
+  pivot_wider(names_from = flag, values_from = n, values_fill = 0) |> 
+  arrange(param)
+
+jdr_clean |> 
+  ggplot(aes(Turbidity_NTU, rp)) +
+  geom_point()
+
+jdr_clean |> 
+  mutate(test = FDOM_QSU_temp/rp) |> 
+  select(datetime_UTC, rp, test, FDOM_QSU_tempturb)
+
+turb_coef <- coef(lm(log(rp) ~ Turbidity_NTU, data = jdr_clean))
+
+jdr_clean |> 
+  mutate(rp_test = exp(turb_coef[1] + turb_coef[2] * Turbidity_NTU)) |> 
+  select(rp, rp_test)
+
+jdr_clean <- jdr_clean |> 
+  select(-rp)
+```
+
+### AIMS-ify
+
+```{r}
+exo_vars <- c("Temp_EXO_C", "ODOSat", "ODO_mg_L", "SpCond_uS_cm",
+              "Conductivity_uS_cm", "FDOM_QSU_Raw", "FDOM_QSU_Temp",
+              "FDOM_QSU_TempTurb", "Turbidity_NTU")
+
+jdr_aims <- jdr_clean |>
+  select(datetime_UTC, datetime_local, any_of(c(params[params != "rp"], flags[!is.na(flags)]))) |>
+  rename(
+    FDOM_QSU_Raw = FDOM_QSUraw,
+    FDOM_QSU_Temp = FDOM_QSU_temp,
+    FDOM_QSU_TempTurb = FDOM_QSU_tempturb,
+    flag_Conductivity_uS_cm = Conductivity_uS_cm_flag,
+    flag_FDOM_QSU = FDOM_QSU_flag,
+    flag_ODO_mg_L = ODO_mg_L_flag,
+    flag_ODOSat = ODOSat_flag,
+    flag_SpCond_uS_cm = SpCond_uS_cm_flag,
+    flag_Temp_EXO_C = Temp_EXO_C_flag,
+    flag_Turbidity_NTU = Turbidity_NTU_flag
+  ) |> 
+    mutate(
+    project = "AIMS",
+    rType = "EXOS",
+    siteId = "JSS01",
+    appr1 = 1,
+    appr2 = 0,
+    appr3 = 0,
+    appr4 = 0,
+    sublocation = "SW"
+  ) |>
+  filter(row_number() <= max(which(if_any(all_of(exo_vars), ~ !is.na(.x))))) |> 
+  mutate(year = year(datetime_UTC)) |>
+  group_by(year) |>
+  mutate(
+    rep = {
+      non_na_rows <- if_any(all_of(exo_vars), ~ !is.na(.x))
+      first_day <- min(datetime_UTC[non_na_rows], na.rm = TRUE)
+      last_day <- max(datetime_UTC[non_na_rows], na.rm = TRUE)
+      paste0(format(first_day, "%Y%m%d"), "-", format(last_day, "%Y%m%d"))
+    }
+  ) |>
+  ungroup() |>
+  select(-year) |>
+  relocate(
+    project,
+    datetime_UTC,
+    datetime_local,
+    siteId,
+    rType,
+    appr1,
+    appr2,
+    appr3,
+    appr4,
+    rep,
+    sublocation
+  )
+
+
+jdr_aims |> janitor::get_dupes()
+
+jdr_aims |>
+  mutate(year = year(datetime_UTC)) |>
+  filter(!is.na(year)) |>
+  mutate(
+    datetime_UTC = format(datetime_UTC, "%Y-%m-%d %H:%M:%S", tz = "UTC"),
+    datetime_local = format(datetime_local, "%Y-%m-%d %H:%M:%S")
+  ) |> 
+  group_by(year) |>
+  group_walk(~ write_csv(.x, paste0("~/Desktop/MW_EXO_QAQC/Processed/JDR/EXOS_MW_JDR_JSS01_SW_", .y$year, ".csv")))
+```
+
+## GBJ
+
+```{r}
+gbj <- read_csv("~/Desktop/MW_EXO_QAQC/GBJ_exodata_wide_2022_24_final.csv") |>
+  rename(flag = `...17`) |>
+  rename_with(~ str_replace_all(.x, "_+", "_")) |> # Collapse repeated underscores
+  rename_with(~ str_replace_all(.x, "[._]+$", "")) |> # Remove trailing underscores or dots
+  complete(TIMESTAMP = seq(min(TIMESTAMP), max(TIMESTAMP), by = "15 min")) |> 
+    mutate(
+    across(
+      Temp_EXO_C:Turbidity_NTU,
+      ~ zoo::na.approx(.x, x = TIMESTAMP, na.rm = FALSE, maxgap = 2)
+    ),
+    across(
+      alphaQf:dry_flag,
+      ~ zoo::na.locf(.x, na.rm = FALSE, maxgap = 2)
+    ),
+    across(
+      c(Temp_EXO_C, ODOSat, ODO_mg_L, SpCond_uS_cm, Conductivity_uS_cm, FDOM_QSUraw, Turbidity_NTU),
+      ~ round(.x, 2))
+  ) |> 
+  mutate(datetime_local = force_tz(TIMESTAMP, tzone = "America/Denver"),
+         datetime_UTC = with_tz(datetime_local, tzone = "UTC")) |> 
+  select(-c(TIMESTAMP, ODO_MiniDOT_mg_L, ODOSat_MiniDOT, flag, wetQf)) |> 
+  relocate(datetime_UTC, datetime_local) |> 
+  filter(!is.na(datetime_UTC))
+```
+
+### Dygraph
+
+```{r}
+# DO
+gbj_clean <- gbj |>
+  arrange(datetime_local) |>
+  drop_na(ODO_mg_L)
+
+gbj_xts <- xts(gbj_clean$ODO_mg_L, order.by = gbj_clean$datetime_local)
+
+dygraph(gbj_xts, main = "GBJ Dissolved Oxygen") |>
+  dyOptions(useDataTimezone = TRUE) |> 
+  dyAxis("y", label = "ODO (mg/L)") |>
+  dyAxis("x",
+    axisLabelFormatter = htmlwidgets::JS("function(d) {
+      return d.toLocaleString('en-US', {
+        month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+        hour12: false
+      });
+    }"),
+    valueFormatter = htmlwidgets::JS("function(d) {
+      return new Date(d).toLocaleString('en-US', {
+        year: 'numeric', month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+        hour12: false
+      });
+    }")
+  ) |>
+  dyRangeSelector() |> 
+  dyCSS(textConnection("
+    .dygraph-title { color: black; }
+    .dygraph-axis-label { color: black; }
+    .dygraph-ylabel { color: black; }
+    .dygraph-legend { color: black; }
+  "))
+
+# Temp
+gbj_clean <- gbj |>
+  arrange(datetime_local) |>
+  drop_na(Temp_EXO_C)
+
+gbj_xts <- xts(gbj_clean$Temp_EXO_C, order.by = gbj_clean$datetime_local)
+
+dygraph(jdr_xts, main = "GBJ Temp") |>
+  dyOptions(useDataTimezone = TRUE) |> 
+  dyAxis("y", label = "Temperature (C)") |>
+  dyAxis("x",
+    axisLabelFormatter = htmlwidgets::JS("function(d) {
+      return d.toLocaleString('en-US', {
+        month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+        hour12: false
+      });
+    }"),
+    valueFormatter = htmlwidgets::JS("function(d) {
+      return new Date(d).toLocaleString('en-US', {
+        year: 'numeric', month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+        hour12: false
+      });
+    }")
+  ) |>
+  dyRangeSelector() |> 
+  dyCSS(textConnection("
+    .dygraph-title { color: black; }
+    .dygraph-axis-label { color: black; }
+    .dygraph-ylabel { color: black; }
+    .dygraph-legend { color: black; }
+  "))
+
+```
+
+### Flag Plots
+
+```{r}
+gbj <- gbj |>
+  relocate(datetime_UTC, datetime_local)
+
+# Parameters to plot
+params <- c(
+  "Conductivity_uS_cm", "FDOM_QSUraw", "FDOM_QSU_temp",
+  "FDOM_QSU_tempturb", "ODO_mg_L", "ODOSat",
+  "SpCond_uS_cm", "Temp_EXO_C", "Turbidity_NTU"
+)
+
+# Build long data frame using shared GBJ flags
+make_long <- function(param) {
+  gbj |>
+    transmute(
+      datetime_local,
+      param = param,
+      value = .data[[param]],
+      flag = case_when(
+        dry_flag == 1 ~ "D",
+        alphaQf == 1 ~ "alpha",
+        betaQfSd == 1 ~ "beta",
+        TRUE ~ NA_character_
+      )
+    )
+}
+
+long_data <- map_dfr(params, make_long) |>
+  mutate(
+    flag_plot = case_when(
+      is.na(flag) ~ "NA",
+      TRUE ~ flag
+    ),
+    flag_plot = factor(flag_plot, levels = c("D", "alpha", "beta", "NA"))
+  )
+
+# Value plot
+long_data |>
+  ggplot(aes(x = datetime_local, y = value, color = flag_plot)) +
+  geom_point(alpha = 0.6) +
+  facet_wrap(~ param, scales = "free_y", ncol = 3) +
+  scale_color_manual(
+    values = c(
+      "D" = "#E69F00",
+      "alpha" = "#009E73",
+      "beta" = "#F0E442",
+      "NA" = "grey60"
+    ),
+    breaks = c("D", "alpha", "beta", "NA"),
+    labels = c(
+      "D" = "Dry",
+      "alpha" = "alphaQf",
+      "beta" = "betaQfSd",
+      "NA" = "NA"
+    )
+  ) +
+  labs(x = NULL, y = NULL, color = "") +
+  theme_bw(base_size = 11) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+# Flag-only timeline plot
+long_flags <- map_dfr(params, make_long) |>
+  mutate(
+    flag_plot = case_when(
+      is.na(flag) ~ "NA",
+      TRUE ~ flag
+    ),
+    flag_plot = factor(flag_plot, levels = c("D", "alpha", "beta", "NA"))
+  )
+
+long_flags |>
+  ggplot(aes(x = datetime_local, y = flag_plot, color = flag_plot)) +
+  geom_point(size = 0.7, alpha = 0.7) +
+  facet_wrap(~ param, scales = "free_x", ncol = 3) +
+  scale_color_manual(
+    values = c(
+      "D" = "#E69F00",
+      "alpha" = "#009E73",
+      "beta" = "#F0E442",
+      "NA" = "grey60"
+    ),
+    breaks = c("D", "alpha", "beta", "NA")
+  ) +
+  labs(x = NULL, y = "Flag", color = "") +
+  theme_bw(base_size = 11) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+### Fix Flags
+
+```{r}
+exo_vars <- c("Temp_EXO_C", "ODOSat", "ODO_mg_L", "SpCond_uS_cm",
+              "Conductivity_uS_cm", "FDOM_QSUraw", "FDOM_QSU_temp",
+              "FDOM_QSU_tempturb", "Turbidity_NTU")
+
+gbj_clean <- gbj |>
+  mutate(
+    dry_flag = if_else(
+      year(datetime_local) == 2022 & month(datetime_local) == 12 |
+      year(datetime_local) == 2023 & month(datetime_local) == 1,
+      1, dry_flag
+    ),
+    alphaQf = if_else(
+      year(datetime_local) == 2022 & month(datetime_local) == 12 |
+      year(datetime_local) == 2023 & month(datetime_local) == 1,
+      0, alphaQf
+    ),
+    betaQfSd = if_else(
+      year(datetime_local) == 2022 & month(datetime_local) == 12 |
+      year(datetime_local) == 2023 & month(datetime_local) == 1,
+      0, betaQfSd
+    )
+  ) |>
+  mutate(
+    across(
+      all_of(exo_vars),
+      \(x) case_when(
+        is.na(x) & is.na(dry_flag) & is.na(alphaQf) & is.na(betaQfSd) ~ "M",
+        replace_na(dry_flag, 0) == 1 ~ "D",
+        replace_na(alphaQf, 0) == 1 ~ "A",
+        replace_na(betaQfSd, 0) == 1 ~ "B",
+        is.na(x) ~ "M",
+        TRUE ~ ""
+      ),
+      .names = "flag_{.col}"
+    )
+  )
+```
+
+```{r}
+make_long <- function(param) {
+  gbj_clean |>
+    transmute(
+      datetime_local,
+      param = param,
+      value = .data[[param]],
+      flag = .data[[paste0("flag_", param)]]
+    )
+}
+
+long_flags <- map_dfr(exo_vars, make_long) |>
+  mutate(flag = if_else(flag == "", "none", flag)) |>
+  mutate(individual_flag = str_split(flag, "")) |>
+  unnest(individual_flag) |>
+  mutate(
+    individual_flag = factor(individual_flag, levels = c("D", "A", "B", "M", "none"))
+  )
+
+long_flags |>
+  ggplot(aes(x = datetime_local, y = individual_flag, color = individual_flag)) +
+  geom_point(alpha = 0.7) +
+  facet_wrap(~ param, scales = "free_x", ncol = 3) +
+  scale_color_manual(
+    values = c(
+      "D" = "#E69F00",
+      "A" = "#009E73",
+      "B" = "#F0E442",
+      "M" = "#CC79A7",
+      "none" = "grey60"
+    )
+  ) +
+  labs(x = NULL, y = "Flag", color = "Flag") +
+  theme_bw(base_size = 11) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+long_data <- map_dfr(params, make_long) |>
+  mutate(
+    color_flag = case_when(
+      str_detect(flag, "D") ~ "D",
+      str_detect(flag, "A") ~ "A",
+      str_detect(flag, "B") ~ "B",
+      str_detect(flag, "M") ~ "M",
+      TRUE ~ "none"
+    ),
+    color_flag = factor(color_flag, levels = c("D", "A", "B", "M", "none"))
+  )
+
+long_data |>
+  ggplot(aes(x = datetime_local, y = value, color = color_flag)) +
+  geom_point(alpha = 0.6) +
+  facet_wrap(~ param, scales = "free_y", ncol = 3) +
+  scale_color_manual(
+    values = c(
+      "D" = "#E69F00",
+      "A" = "#009E73",
+      "B" = "#F0E442",
+      "M" = "#CC79A7",
+      "none" = "grey60"
+    ),
+    labels = c(
+      "D" = "Dry",
+      "A" = "alphaQf",
+      "B" = "betaQfSd",
+      "M" = "Missing",
+      "none" = "None"
+    )
+  ) +
+  labs(x = NULL, y = NULL, color = "") +
+  theme_bw(base_size = 11) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+### AIMS-ify
+
+```{r}
+exo_vars <- c("Temp_EXO_C", "ODOSat", "ODO_mg_L", "SpCond_uS_cm",
+              "Conductivity_uS_cm", "FDOM_QSU_Raw", "FDOM_QSU_Temp",
+              "FDOM_QSU_TempTurb", "Turbidity_NTU")
+
+gbj_aims <- gbj_clean |>
+  rename(
+    FDOM_QSU_Raw = FDOM_QSUraw,
+    FDOM_QSU_Temp = FDOM_QSU_temp,
+    FDOM_QSU_TempTurb = FDOM_QSU_tempturb,
+    flag_FDOM_QSU = flag_FDOM_QSUraw,
+    flag_FDOM_QSU_Temp = flag_FDOM_QSU_temp,
+    flag_FDOM_QSU_TempTurb = flag_FDOM_QSU_tempturb
+  ) |> 
+  select(-c(alphaQf, betaQfSd, dry_flag)) |>
+  mutate(
+    project = "AIMS",
+    rType = "EXOS",
+    siteId = "GSS01",
+    appr1 = 1,
+    appr2 = 0,
+    appr3 = 0,
+    appr4 = 0,
+    sublocation = "SW"
+  ) |>
+  filter(row_number() <= max(which(if_any(all_of(exo_vars), ~ !is.na(.x))))) |> 
+  mutate(year = year(datetime_UTC)) |>
+  group_by(year) |>
+  mutate(
+    rep = {
+      non_na_rows <- if_any(all_of(exo_vars), ~ !is.na(.x))
+      first_day <- min(datetime_UTC[non_na_rows], na.rm = TRUE)
+      last_day <- max(datetime_UTC[non_na_rows], na.rm = TRUE)
+      paste0(format(first_day, "%Y%m%d"), "-", format(last_day, "%Y%m%d"))
+    }
+  ) |>
+  ungroup() |>
+  select(-year) |>
+  relocate(
+    project,
+    datetime_UTC,
+    datetime_local,
+    siteId,
+    rType,
+    appr1,
+    appr2,
+    appr3,
+    appr4,
+    rep,
+    sublocation
+  )
+
+gbj_aims |> janitor::get_dupes()
+
+gbj_aims |>
+  mutate(year = year(datetime_UTC)) |>
+  filter(!is.na(year)) |>
+  mutate(
+    datetime_UTC = format(datetime_UTC, "%Y-%m-%d %H:%M:%S", tz = "UTC"),
+    datetime_local = format(datetime_local, "%Y-%m-%d %H:%M:%S")
+  ) |> 
+  group_by(year) |>
+  group_walk(~ write_csv(.x, paste0("~/Desktop/MW_EXO_QAQC/Processed/GBJ/EXOS_MW_GBJ_GSS01_SW_", .y$year, ".csv")))
+```
+
+# Discharge
+
+## Get Dry Flags From Exo
+
+```{r}
+gbj_dry <- gbj_aims |>
+  filter(
+    if_any(starts_with("flag_"), ~ . == "D")
+  ) |>
+  select(datetime_UTC, siteId)
+  
+
+jdr_dry <- jdr_aims |>
+  filter(
+    if_any(starts_with("flag_"), ~ . == "D")
+  ) |>
+  select(datetime_UTC, siteId)
+
+mw_dry <- rbind(gbj_dry, jdr_dry)
+```
+
+```{r}
+mw_q <- read_csv("~/Desktop/MW_EXO_QAQC/Qstage_21to24_all.csv") |>
+  mutate(datetime_MST = as.POSIXct(DateTime, format = "%d%b%Y %I:%M:%S %p", tz = "MST")) |>
+  group_by(site) |>
+  complete(datetime_MST = seq(min(datetime_MST), max(datetime_MST), by = "15 min")) |>
+  ungroup() |> 
+  mutate(datetime_UTC = with_tz(datetime_MST, tz = "UTC")) |> 
+  rename(Q_Ls = Q, siteId = site) |> 
+  mutate(waterDepth_m_SW = FS_stage/100) |> 
+  select(-c(DateTime, FS_stage))
+
+
+mw_q |> 
+  ggplot(aes(x = datetime_MST, y = Q_Ls)) +
+  see::geom_point2(alpha = 0.2, size = 1.5) +
+  theme_few() +
+  facet_wrap(~siteId, scales = "free_y", ncol = 1) +
+  labs(
+    title = "",
+    x = "",
+    y = "Discharge (L/s)",
+  ) 
+mw_q |> 
+  ggplot(aes(x = datetime_MST, y = waterDepth_m_SW)) +
+  see::geom_point2(alpha = 0.2, size = 1.5) +
+  theme_few() +
+  facet_wrap(~siteId, scales = "free_y", ncol = 1) +
+  labs(
+    title = "",
+    x = "",
+    y = "Stage (m)",
+  )
+```
+
+```{r}
+mw_q_aims <- mw_q |>
+  mutate(
+    project = "AIMS",
+    rType = "DISC",
+    appr1 = 1,
+    appr2 = 0,
+    appr3 = 0,
+    appr4 = 0,
+    sublocation = "SW"
+    ) |>
+  filter(
+    row_number() <= max(which(if_any(c(Q_Ls, waterDepth_m_SW), ~ !is.na(.x))))
+  ) |>
+  mutate(year = lubridate::year(datetime_UTC)) |>
+  group_by(year, siteId) |>
+  mutate(
+    rep = {
+      non_na_rows <- if_any(c(Q_Ls, waterDepth_m_SW), ~ !is.na(.x))
+      first_day <- min(datetime_UTC[non_na_rows], na.rm = TRUE)
+      last_day <- max(datetime_UTC[non_na_rows], na.rm = TRUE)
+      paste0(format(first_day, "%Y%m%d"), "-", format(last_day, "%Y%m%d"))
+    }
+  ) |>
+  ungroup() |>
+  select(-year) |>
+  relocate(
+    project,
+    datetime_UTC,
+    datetime_MST,
+    siteId,
+    rType,
+    appr1,
+    appr2,
+    appr3,
+    appr4,
+    rep,
+    sublocation
+  )
+
+
+base_dir <- "~/Desktop/MW_EXO_QAQC/Processed/Q"
+
+mw_q_aims |>
+  mutate(
+    year = lubridate::year(datetime_UTC),
+    watershed = case_when(
+      siteId == "JSS01" ~ "JDR",
+      siteId == "DSS01" ~ "DRC",
+      siteId == "GSS01" ~ "GBJ",
+      TRUE ~ NA_character_
+    )
+  ) |>
+  filter(!is.na(watershed)) |>
+  mutate(
+    datetime_UTC = format(datetime_UTC, "%Y-%m-%d %H:%M:%S", tz = "UTC"),
+    datetime_MST = format(datetime_MST, "%Y-%m-%d %H:%M:%S", tz = "MST")
+  ) |> 
+  group_by(watershed, siteId, year) |>
+  group_walk(\(df, key) {
+    
+    folder <- file.path(base_dir, key$watershed)
+    
+    fname <- paste0(
+      "DISC_MW_",
+      key$watershed,
+      "_",
+      key$siteId,
+      "_SW_",
+      key$year,
+      ".csv"
+    )
+    
+    full_path <- file.path(folder, fname)
+    
+    write_csv(df, file = full_path)
+  })
+```
