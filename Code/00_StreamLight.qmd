@@ -179,17 +179,17 @@ driverFile <- StreamLightUtils::make_driver(site_locs = siteInfo,
 
 We need to make a parameter file for streamLight, parameters include:
 
--   Lat: The site latitude
--   Lon: The site longitude
--   channel_azimuth: Channel azimuth
--   bottom_width: Bottom width (m)
--   BH: Bank height (m)
--   BS: Bank slope
--   WL: Water level (m)
--   TH: Tree height (m)
--   overhang: Maximum canopy overhang (m)
--   overhang_height: Height of the maximum canopy overhang (m). If overhang_height = NA, then the model defaults to a value of 75% of tree height.
--   x_LAD: Leaf angle distribution, default = 1
+- Lat: The site latitude
+- Lon: The site longitude
+- channel_azimuth: Channel azimuth
+- bottom_width: Bottom width (m)
+- BH: Bank height (m)
+- BS: Bank slope
+- WL: Water level (m)
+- TH: Tree height (m)
+- overhang: Maximum canopy overhang (m)
+- overhang_height: Height of the maximum canopy overhang (m). If overhang_height = NA, then the model defaults to a value of 75% of tree height.
+- x_LAD: Leaf angle distribution, default = 1
 
 ```{r}
 extract_height <- function(Site_ID, Lat, Lon, site_crs){

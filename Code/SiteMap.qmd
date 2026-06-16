@@ -900,3 +900,116 @@ cowplot::ggsave2(
   dpi = 600
 )
 ```
+
+# Watershed Slopes
+
+```{r}
+
+avg_stream_slope <- function(streams_ws, dem) {
+  # Same CRS; buffering needs the projected DEM CRS
+  streams_ws <- st_transform(streams_ws, crs(dem))
+  
+  # Terrain slope surface from the DEM (degrees, to match all_sheds$slope_mean)
+  slope_rast <- terra::terrain(dem, v = "slope", unit = "degrees")
+  
+  # Buffer lines to ~1 cell wide so exact_extract has polygons to weight
+  cell <- mean(terra::res(slope_rast))
+  streams_buf <- st_buffer(streams_ws, dist = cell)
+  streams_buf$line_id <- seq_len(nrow(streams_buf))
+  streams_buf$len_m <- as.numeric(st_length(streams_ws))
+  
+  # Coverage-weighted mean slope along each stream segment
+  streams_buf$slope <- exactextractr::exact_extract(slope_rast, streams_buf, "mean", progress = FALSE)
+  
+  per_line <- streams_buf |>
+    st_drop_geometry() |>
+    filter(!is.na(slope))
+  
+  tibble(
+    slope_mean = mean(per_line$slope, na.rm = TRUE),
+    slope_wtd = weighted.mean(per_line$slope, per_line$len_m, na.rm = TRUE),
+    n_lines = nrow(per_line),
+    total_len_m = sum(per_line$len_m, na.rm = TRUE)
+  )
+}
+
+stream_slopes <- map_dfr(names(all_dems), function(ws) {
+  streams_ws <- all_streams |> filter(watershed == ws)
+  avg_stream_slope(streams_ws, all_dems[[ws]]) |>
+    mutate(watershed = ws, .before = 1)
+})
+
+stream_slopes
+
+
+downstream_slope <- all_sites |>
+  st_drop_geometry() |>
+  filter(!is.na(elev_m), !is.na(outlet_dist_m)) |>
+  group_by(watershed) |>
+  filter(n() >= 2) |>
+  arrange(outlet_dist_m, .by_group = TRUE) |>
+  slice_head(n = 2) |>
+  summarise(
+    site_down = siteId[1],
+    site_up = siteId[2],
+    dist_m = abs(outlet_dist_m[2] - outlet_dist_m[1]),
+    rise_m = abs(elev_m[2] - elev_m[1]),
+    slope = rise_m / dist_m,
+    slope_pct = 100 * (rise_m / dist_m),
+    .groups = "drop"
+  )
+
+downstream_slope
+```
+
+```{r}
+all_dems$DRC <- NULL
+all_streams <- all_streams |> 
+  filter(watershed != "DRC")
+
+
+stream_slope <- lapply(names(all_dems), function(w) {
+  dem <- all_dems[[w]]
+  
+  # slope surface in degrees (use unit = "percent" if you prefer rise/run %)
+  slp <- terra::terrain(dem, v = "slope", unit = "degrees", neighbors = 8)
+  
+  # this watershed's streams, reprojected into the DEM's CRS
+  st <- all_streams |>
+    filter(watershed == w) |>
+    st_transform(crs(dem))
+  
+  # dissolve to one geometry, then buffer ~1 cell so exact_extract has a polygon
+  st_poly <- st |>
+    st_union() |>
+    st_buffer(dist = res(dem)[1]) |>
+    st_sf(geometry = _)
+  
+  tibble(
+    watershed = w,
+    mean_stream_slope_deg = exactextractr::exact_extract(slp, st_poly, fun = "mean")
+  )
+})
+
+stream_slope <- do.call(rbind, stream_slope)
+
+site_slope <- all_sites |>
+  st_drop_geometry() |>
+  filter(!is.na(outlet_dist_m), !is.na(elev_m)) |>
+  group_by(watershed) |>
+  arrange(outlet_dist_m, .by_group = TRUE) |>
+  slice_head(n = 2) |>
+  summarise(
+    rise_m = elev_m[2] - elev_m[1],
+    run_m = outlet_dist_m[2] - outlet_dist_m[1],
+    site_slope_m_per_m = rise_m / run_m,
+    site_slope_pct = site_slope_m_per_m * 100,
+    site_slope_deg = atan(site_slope_m_per_m) * 180 / pi,
+    .groups = "drop"
+  )
+
+result <- stream_slope |>
+  left_join(site_slope, by = "watershed")
+
+result
+```
