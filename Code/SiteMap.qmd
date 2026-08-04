@@ -362,6 +362,161 @@ ggsave(ecoregions_legend, filename = here("Figs/Maps/Ecoregions_Legend.png"), wi
 ```
 
 ```{r}
+koppen_path <- file.path("~/Dropbox/GIS/rasters/koppen_geiger_tif")
+# Load raster (most recent historical normal, ~1 km resolution) and legend
+kg_rast <- rast(file.path(koppen_path, "1991_2020", "koppen_geiger_0p00833333.tif"))
+
+kg_legend <- file.path(koppen_path, "legend.txt") |>
+  readLines() |>
+  grep("^\\s*[0-9]+:", x = _, value = TRUE) |>
+  tibble(raw = _) |>
+  transmute(
+    code = as.integer(str_extract(raw, "^\\s*[0-9]+")),
+    zone = str_match(raw, "^\\s*[0-9]+:\\s*(\\S+)")[, 2],
+    zone_name = str_match(
+      raw,
+      "^\\s*[0-9]+:\\s*\\S+\\s*(.*?)\\s*\\[.*\\]\\s*$"
+    )[, 2] |>
+      trimws()
+  )
+
+# Reproject to WGS84
+shed_points_wgs84 <- shed_points |>
+  st_as_sf(coords = c("lon", "lat"), crs = 5070) |> 
+  st_transform(4326) |>
+  mutate(
+    lon_84 = st_coordinates(geometry)[, "X"],
+    lat_84 = st_coordinates(geometry)[, "Y"]
+  )
+aims_kg <- shed_points_wgs84 |> 
+  st_drop_geometry() |> 
+  select(Site = watershed, kg_zone = zone, kg_zone_name = zone_name) |> 
+  write_csv(here("Metadata/aims_koppen_geiger.csv"))
+# Extract Koppen-Geiger codes and join to zone labels
+shed_points_wgs84 <- shed_points_wgs84 |>
+  mutate(
+    kg_code = extract(
+      kg_rast,
+      vect(shed_points_wgs84)
+    ) |>
+      pull(2)
+  ) |>
+  left_join(
+    kg_legend,
+    by = c("kg_code" = "code")
+  ) |>
+  arrange(
+    factor(
+      watershed,
+      levels = c("JDR", "GBJ", "KNZ", "SHN", "YMR", "WHR", "PRF", "TAL")
+    )
+  )
+
+# Koppen Map
+# Transform the state boundaries to the raster CRS
+us_vect <- us_shp |> 
+  st_transform(crs(kg_rast)) |> 
+  vect()
+
+# Crop to the US bounding box and mask outside state boundaries
+kg_us <- kg_rast |> 
+  crop(us_vect, mask = TRUE)
+#kg_us <- mask(kg_us, us_vect)
+
+# Since this is a categorical raster, aggregate using the modal class
+# This makes plotting faster and preserves the dominant climate class
+kg_us_plot <- aggregate(kg_us, fact = 5, fun = "modal", na.rm = TRUE)
+
+# Convert raster to a data frame for ggplot
+kg_df <- as.data.frame(kg_us_plot, xy = TRUE, na.rm = TRUE)
+
+# Rename the raster-value column
+names(kg_df)[3] <- "climate_class"
+kg_df$climate_class <- factor(kg_df$climate_class)
+
+# Values actually present in the cropped/aggregated raster
+cropped_classes <- sort(unique(kg_df$climate_class))
+
+# Extract the raster color table
+ct <- coltab(kg_rast)[[1]]
+
+# Keep only classes present in the cropped raster
+ct_crop <- ct |>
+  filter(value %in% cropped_classes)
+
+# Create named colors
+kg_colors <- rgb(
+  red = ct_crop$red,
+  green = ct_crop$green,
+  blue = ct_crop$blue,
+  maxColorValue = 255
+)
+
+names(kg_colors) <- as.character(ct_crop$value)
+
+# Ensure the raster values are factors with only cropped classes
+kg_df$climate_class <- factor(
+  kg_df$climate_class,
+  levels = as.numeric(names(kg_colors))
+)
+
+# Keep only corresponding legend rows
+kg_legend_crop <- kg_legend |>
+  filter(code %in% cropped_classes) |>
+  arrange(match(code, as.numeric(names(kg_colors))))
+
+# Use zone names
+legend_labels <- setNames(
+  paste(kg_legend_crop$zone, kg_legend_crop$zone_name),
+  kg_legend_crop$code
+)
+
+# Plot
+koppen_map <- ggplot() +
+  geom_raster(
+    data = kg_df,
+    aes(
+      x = x,
+      y = y,
+      fill = climate_class
+    )
+  ) +
+  geom_sf(
+    data = us_vect,
+    fill = NA,
+    color = "white",
+    linewidth = 0.2
+  ) +
+  scale_fill_manual(
+    values = kg_colors,
+    breaks = as.numeric(names(kg_colors)),
+    labels = legend_labels,
+    name = "Climate class",
+    na.value = NA,
+    drop = TRUE
+  ) +
+  ggnewscale::new_scale_fill() +
+  geom_sf(
+    data = shed_points_wgs84,
+    aes(fill = watershed),
+    color = "#000000", size = 4, stroke = 1, shape = 21, show.legend = FALSE
+  ) +
+  scale_fill_manual(values = site_colors, name = "Watershed") +
+  coord_sf(
+    crs = st_crs(4326),
+    expand = FALSE
+  ) +
+  labs(
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme_void() +
+  theme(legend.position = "none")
+
+ggsave(koppen_map, filename = here("Figs/Maps/Koppen_StateMap.png"), width = 40, height = 20, units = "cm")
+```
+
+```{r}
 state_map <- ggplot() +
   geom_sf(data = us_shp, fill = "#ffffff", color = "#000000") +
   geom_point(
@@ -964,40 +1119,40 @@ downstream_slope
 
 ```{r}
 all_dems$DRC <- NULL
-all_streams <- all_streams |> 
+all_streams <- all_streams |>
   filter(watershed != "DRC")
 
-
-stream_slope <- lapply(names(all_dems), function(w) {
-  dem <- all_dems[[w]]
-  
-  # slope surface in degrees (use unit = "percent" if you prefer rise/run %)
-  slp <- terra::terrain(dem, v = "slope", unit = "degrees", neighbors = 8)
-  
-  # this watershed's streams, reprojected into the DEM's CRS
-  st <- all_streams |>
-    filter(watershed == w) |>
-    st_transform(crs(dem))
-  
-  # dissolve to one geometry, then buffer ~1 cell so exact_extract has a polygon
-  st_poly <- st |>
-    st_union() |>
-    st_buffer(dist = res(dem)[1]) |>
-    st_sf(geometry = _)
-  
-  tibble(
-    watershed = w,
-    mean_stream_slope_deg = exactextractr::exact_extract(slp, st_poly, fun = "mean")
-  )
-})
-
-stream_slope <- do.call(rbind, stream_slope)
+stream_slope <- names(all_dems) |>
+  purrr::map(function(w) {
+    dem <- all_dems[[w]]
+    
+    # slope surface in degrees (use unit = "percent" if you prefer rise/run %)
+    slp <- terra::terrain(dem, v = "slope", unit = "degrees", neighbors = 8)
+    
+    # this watershed's streams, reprojected into the DEM's CRS
+    w_streams <- all_streams |>
+      filter(watershed == w) |>
+      st_transform(terra::crs(dem))
+    
+    # dissolve to one geometry, then buffer ~1 cell so exact_extract has a polygon
+    w_poly <- w_streams |>
+      st_union() |>
+      st_buffer(dist = terra::res(dem)[1]) |>
+      st_sf(geometry = _)
+    
+    tibble(
+      watershed = w,
+      mean_stream_slope_deg = exactextractr::exact_extract(slp, w_poly, fun = "mean")
+    )
+  }) |>
+  purrr::list_rbind()
 
 site_slope <- all_sites |>
   st_drop_geometry() |>
   filter(!is.na(outlet_dist_m), !is.na(elev_m)) |>
   group_by(watershed) |>
   arrange(outlet_dist_m, .by_group = TRUE) |>
+  filter(n() >= 2) |>
   slice_head(n = 2) |>
   summarise(
     rise_m = elev_m[2] - elev_m[1],
@@ -1012,4 +1167,89 @@ result <- stream_slope |>
   left_join(site_slope, by = "watershed")
 
 result
+result_table <- result |>
+  mutate(watershed = name_map[watershed]) |>
+  gt() |>
+  cols_label(
+    watershed = "Site",
+    mean_stream_slope_deg = "Mean Channel Slope (°)",
+    rise_m = "Elevation Change (m)",
+    run_m = "Longitudinal Distance (m)",
+    site_slope_m_per_m = "Site Slope (m m⁻¹)",
+    site_slope_pct = "Site Slope (%)",
+    site_slope_deg = "Site Slope (°)"
+  ) |>
+  fmt_number(
+    columns = c(mean_stream_slope_deg, site_slope_deg, site_slope_pct),
+    decimals = 2
+  ) |>
+  fmt_number(
+    columns = c(rise_m, run_m, site_slope_m_per_m),
+    decimals = 3
+  )
+
+result_table
+
+result_table |>
+  gtsave(filename = here("Figs/Supplement/slope_table.docx"))
+
+```
+
+```{r}
+result_table <- result |>
+  mutate(watershed = name_map[watershed]) |>
+  gt() |>
+  tab_header(
+    title = "Channel and Site Slope by Watershed",
+    subtitle = "Mean channel slope derived from DEM; site slope from paired outlet distance and elevation"
+  ) |>
+  cols_label(
+    watershed = "Site",
+    mean_stream_slope_deg = md("Mean Channel<br>Slope (°)"),
+    rise_m = md("Elevation<br>Change (m)"),
+    run_m = md("Longitudinal<br>Distance (m)"),
+    site_slope_m_per_m = md("Slope<br>(m m⁻¹)"),
+    site_slope_pct = md("Slope<br>(%)"),
+    site_slope_deg = md("Slope<br>(°)")
+  ) |>
+  tab_spanner(
+    label = "Site Slope",
+    columns = c(rise_m, run_m, site_slope_m_per_m, site_slope_pct, site_slope_deg)
+  ) |>
+  fmt_number(
+    columns = c(mean_stream_slope_deg, site_slope_deg, site_slope_pct),
+    decimals = 2
+  ) |>
+  fmt_number(
+    columns = c(rise_m, run_m, site_slope_m_per_m),
+    decimals = 3
+  ) |>
+  sub_missing(missing_text = "—") |>
+  cols_align(align = "center", columns = -watershed) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_title(groups = "title")
+  ) |>
+  tab_style(
+    style = cell_borders(sides = "left", color = "grey80", weight = px(1)),
+    locations = cells_body(columns = rise_m)
+  ) |>
+  opt_row_striping() |>
+  tab_options(
+    table.font.size = px(12),
+    heading.align = "left",
+    column_labels.font.weight = "bold",
+    table.border.top.width = px(2),
+    table.border.bottom.width = px(2)
+  )
+
+result_table
+
+result_table |>
+  gtsave(filename = here("Figs/Supplement/slope_table.png"))
+
 ```

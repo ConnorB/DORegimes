@@ -1,54 +1,3 @@
-# Variable Labels ---------------------------------------------------------
-var_names <- c(
-  "water.temp" = "Water Temp",
-  "water.temp_19d" = "19 Day Water Temp",
-  "water.temp_26d" = "26 Day Water Temp",
-  "Q_0d" = "Q",
-  "Q_1d" = "Q",
-  "Q_7d" = "7 Day Q",
-  "Q_19d" = "19 Day Q",
-  "Q_60d" = "60 Day Q",
-  "PPT_1d" = "PPT",
-  "PPT_7d" = "7 Day PPT",
-  "PPT_14d" = "14 Day PPT",
-  "PPT_43d" = "43 Day PPT",
-  "PPT_60d" = "60 Day PPT",
-  "PPT_56d" = "56 Day PPT",
-  "PPT_59d" = "59 Day PPT",
-  "Depth_60d" = "60 Day Depth",
-  "ET_1d" = "ET",
-  "ET_7d" = "7 Day ET",
-  "ET_13d" = "13 Day ET",
-  "ET_14d" = "14 Day ET",
-  "ET_52d" = "52 Day ET",
-  "ET_53d" = "53 Day ET",
-  "Depth_1d" = "Depth",
-  "Depth_7d" = "7 Day Depth",
-  "Depth_13d" = "13 Day Depth",
-  "Depth_41d" = "41 Day Depth",
-  "Depth_45d" = "45 Day Depth",
-  "Depth_60d" = "60 Day Depth",
-  "headGradient" = "Head Gradient",
-  "headGradient_1d" = "Head Gradient",
-  "headGradient_7d" = "7 Day Head Gradient",
-  "headGradient_14d" = "14 Day Head Gradient",
-  "headGradient_30d" = "30 Day Head Gradient",
-  "headGradient_42d" = "42 Day Head Gradient",
-  "headGradient_45d" = "45 Day Head Gradient",
-  "headGradient_60d" = "60 Day Head Gradient",
-  "excProb" = "Exceedance Prob.",
-  "avgPar" = "Light",
-  "avgPar_7d" = "7 Day Light",
-  "avgPar_14d" = "14 Day Light",
-  "avgPar_43d" = "43 Day Light",
-  "avgPar_44d" = "44 Day Light",
-  "a_cent" = "Alpha Centrality",
-  "active_network_length_m" = "ASDN",
-  "active_network_length_m_0d" = "ASDN",
-  "percent_network_wet" = "% Wet",
-  "water.temp_7d" = "7 Day Water Temp",
-  "water.temp_60d" = "60 Day Water Temp"
-)
 # Fit Full Model ----------------------------------------------------------
 fit_full_model <- function(df, response = "Cluster", label = "all_clusters") {
   suppressPackageStartupMessages({
@@ -180,7 +129,7 @@ fit_full_model <- function(df, response = "Cluster", label = "all_clusters") {
   #   min_n(range = c(2, 40)),
   #   levels = 4
   # )
-  metrics <- metric_set(roc_auc, pr_auc, mn_log_loss, kap, f_meas)
+  metrics <- metric_set(f_meas, roc_auc, pr_auc, mn_log_loss, kap)
 
   cli::cli_alert_info("Starting hyperparameter tuning...")
   # tune_res <- tune_wf |>
@@ -284,190 +233,7 @@ fit_full_model <- function(df, response = "Cluster", label = "all_clusters") {
   ))
 }
 
-# fit_lagged_model <- function(df, response = "Cluster", label = "all_clusters") {
-#   suppressPackageStartupMessages({
-#     library(tidyverse)
-#     library(tidymodels)
-#     library(themis)
-#     library(colino)
-#     library(ranger)
-#     library(caret)
-#     library(future)
-#     library(doFuture)
-#     library(here)
-#     library(cli)
-#   })#
-#   set.seed(42)
-
-#   registerDoFuture()
-#   plan(multisession, workers = parallel::detectCores() - 1)
-#   on.exit(
-#     {
-#       plan(sequential)
-#     },
-#     add = TRUE
-#   )
-##   cli::cli_alert_info("Starting full model fit for {.val {label}}")
-#
-#data_split <- initial_split(df, prop = 0.8)
-#   train_data <- training(data_split)
-#   test_data <- testing(data_split)
-#
-#  # Recipe
-#   base_recipe <- recipe(
-#     as.formula(paste(response, "~ .")),
-#     data = train_data
-#   ) |>
-#     step_rm(all_date(), any_of(c("Site", "name"))) |>
-#     update_role(all_of(response), new_role = "outcome") |>
-#     step_string2factor(all_nominal()) |>
-#     step_naomit(all_predictors(), all_outcomes(), skip = FALSE) |>
-#     #step_corr(all_numeric_predictors(), threshold = 0.7) |>
-#     #step_normalize(all_numeric_predictors()) |>
-#     step_smote(all_outcomes(), over_ratio = 1)
-#
-#  cli::cli_alert_info("Prepping recipe...")
-#   prep_recipe <- prep(base_recipe)
-#   predictor_names <- juice(prep_recipe) |> select(-all_of(response)) |> names()
-#   n_predictors <- length(predictor_names)
-#
-#  # Recursive Feature Elimination (RFE)
-#   cli::cli_alert_info("Starting RFE...")
-#
-#   trl <- rfeControl(
-#     functions = rfFuncs,
-#     method = "repeatedcv",
-#     repeats = 5,
-#     verbose = FALSE,
-#     returnResamp = "final",
-#     allowParallel = TRUE
-#   )
-#
-#   re_fit <- suppressMessages(
-#     suppressWarnings(
-#       withDoRNG(rfe(
-#         base_recipe,
-#         train_data,
-#         sizes = c(1:n_predictors),
-#         rfeControl = ctrl,
-#         metric = "Kappa"
-#       ))
-#     )
-#   )
-#
-#   seected_vars <- rfe_fit$optVariables
-#   cli::cli_alert_success(
-#     "RFE selected {.val {length(selected_vars)}} features from {.val {n_predictors}} predictors"
-#   )
-#   writeLines(
-#     selected_vars,
-#     here("Results/rf", paste0(label, "_selected_predictors.txt"))
-#   )
-#   cli::cli_alert_info(
-#     "Selected variables: {.val {paste(selected_vars, collapse = ', ')}}"
-#   )
-#
-#   finl_recipe <- recipe(
-#     as.formula(paste(response, "~", paste(selected_vars, collapse = " + "))),
-#     data = train_data
-#   )
-#
-#   tunespec <- rand_forest(
-#     mtry = tune(),
-#     trees = tune(),
-#     min_n = tune()
-#   ) |>
-#     set_mode("classification") |>
-#     set_engine("ranger", importance = "permutation", seed = 42, num.threads = 1)
-#
-#   tune_f <- workflow() |> add_recipe(final_recipe) |> add_model(tune_spec)
-#   tune_folds <- vfold_cv(train_data, v = 5, strata = response)
-#   rf_tune_grid <- grid_regular(
-#     trees(range = c(100, 1000)),
-#     mtry(range = c(2, length(selected_vars))),
-#     min_n(range = c(2, 40)),
-#     levels = 4
-#   )
-#   metrics <- metric_set(roc_auc, pr_auc, mn_log_loss, kap, f_meas)
-#
-#   cli::ci_alert_info("Starting hyperparameter tuning...")
-#   tune_res <- tune_wf |>
-#     tune_grid(resamples = tune_folds, grid = rf_tune_grid, metrics = metrics)
-#
-#   cli::cl_alert_success("Tuning completed.")
-#   write_csv(
-#     tune_res |>
-#       collect_metrics() |>
-#       filter(.metric == "kap") |>
-#       select(mean, min_n, mtry, trees),
-#     here("Results/rf", paste0(label, "_tune_results.csv"))
-#   )
-#
-#   best_parms <- tune_res |> select_best(metric = "kap")
-#   write_csv(
-#     tibble(best_params),
-#     here("Results/rf", paste0(label, "_best_params.csv"))
-#   )
-#
-#   final_modl <- rand_forest(
-#     trees = best_params$trees,
-#     mtry = best_params$mtry,
-#     min_n = best_params$min_n
-#   ) |>
-#     set_mode("classification") |>
-#     set_engine("ranger", importance = "permutation", seed = 42, num.threads = 1)
-#
-#   final_wf < workflow() |> add_recipe(final_recipe) |> add_model(final_model)
-#   final_fit <- final_wf |> fit(data = train_data)
-#
-#   cli::cli_alrt_success("Final model fit completed.")
-#
-#   train_pred < predict(final_fit, train_data)
-#   test_pred <- predict(final_fit, test_data)
-#   # Confusion Matrix
-#   conf_test <- confusionMatrix(test_pred$.pred_class, test_data[[response]])
-#   write_csv(
-#     as_tibble(conf_test$table),
-#     here("Results/rf", paste0(label, "_confusion_matrix.csv"))
-#   )
-#   write_csv(
-#     as_tibble(conf_test$overall),
-#     here("Results/rf", paste0(label, "_overall_preformance.csv"))
-#   )
-#   write_csv(
-#     as_tibble(conf_test$byClass),
-#     here("Results/rf", paste0(label, "_class_preformance.csv"))
-#   )
-#
-#   bind_rows(
-#    train_data |> mutate(.pred_class = train_pred$.pred_class, .set = "train"),
-#     test_data |> mutate(.pred_class = test_pred$.pred_class, .set = "test")
-#   ) |>
-#     write_csv(here("Results/rf", paste0(label, "_predictions.csv")))
-#
-#   tibble(
-#     redictor = names(extract_fit_parsnip(final_fit)$fit$variable.importance),
-#     importance = extract_fit_parsnip(final_fit)$fit$variable.importance,
-#     oobMSE = extract_fit_parsnip(final_fit)$fit$prediction.error
-#   ) |>
-#     arrange(desc(importance)) |>
-#     write_csv(here("Results/rf", paste0(label, "_importance.csv")))
-#
-#   plan(sequential
-#
-#   return(list(
-#    rfe_fit = rfe_fit,
-#     final_fit = final_fit,
-#     final_wf = final_wf,
-#     selected_vars = selected_vars,
-#     response = response,
-#     best_params = best_params,
-#     train_data = train_data,
-#     confusion_matrix = conf_test
-#   ))
-# }
-
-# Function to extract LE data for plotting
+# Function to extract ALE data for plotting ----------------------------------------------------------
 get_ale_data <- function(ale_object) {
   # Get the raw ALE effect data
   ale_effects <- get(ale_object, what = "ale")
@@ -498,7 +264,7 @@ get_ale_data <- function(ale_object) {
   return(all_data)
 }
 
-
+# Var Names  ----------------------------------------------------------
 var_names <- c(
   "water.temp" = "Water Temp",
   "water.temp_0d" = "Water Temp",
@@ -997,3 +763,54 @@ var_names <- c(
   "active_network_length_m_59d" = "59 Day ASDN",
   "active_network_length_m_60d" = "60 Day ASDN"
 )
+# Variable Labels ---------------------------------------------------------
+# var_names <- c(
+#   "water.temp" = "Water Temp",
+#   "water.temp_19d" = "19 Day Water Temp",
+#   "water.temp_26d" = "26 Day Water Temp",
+#   "Q_0d" = "Q",
+#   "Q_1d" = "Q",
+#   "Q_7d" = "7 Day Q",
+#   "Q_19d" = "19 Day Q",
+#   "Q_60d" = "60 Day Q",
+#   "PPT_1d" = "PPT",
+#   "PPT_7d" = "7 Day PPT",
+#   "PPT_14d" = "14 Day PPT",
+#   "PPT_43d" = "43 Day PPT",
+#   "PPT_60d" = "60 Day PPT",
+#   "PPT_56d" = "56 Day PPT",
+#   "PPT_59d" = "59 Day PPT",
+#   "Depth_60d" = "60 Day Depth",
+#   "ET_1d" = "ET",
+#   "ET_7d" = "7 Day ET",
+#   "ET_13d" = "13 Day ET",
+#   "ET_14d" = "14 Day ET",
+#   "ET_52d" = "52 Day ET",
+#   "ET_53d" = "53 Day ET",
+#   "Depth_1d" = "Depth",
+#   "Depth_7d" = "7 Day Depth",
+#   "Depth_13d" = "13 Day Depth",
+#   "Depth_41d" = "41 Day Depth",
+#   "Depth_45d" = "45 Day Depth",
+#   "Depth_60d" = "60 Day Depth",
+#   "headGradient" = "Head Gradient",
+#   "headGradient_1d" = "Head Gradient",
+#   "headGradient_7d" = "7 Day Head Gradient",
+#   "headGradient_14d" = "14 Day Head Gradient",
+#   "headGradient_30d" = "30 Day Head Gradient",
+#   "headGradient_42d" = "42 Day Head Gradient",
+#   "headGradient_45d" = "45 Day Head Gradient",
+#   "headGradient_60d" = "60 Day Head Gradient",
+#   "excProb" = "Exceedance Prob.",
+#   "avgPar" = "Light",
+#   "avgPar_7d" = "7 Day Light",
+#   "avgPar_14d" = "14 Day Light",
+#   "avgPar_43d" = "43 Day Light",
+#   "avgPar_44d" = "44 Day Light",
+#   "a_cent" = "Alpha Centrality",
+#   "active_network_length_m" = "ASDN",
+#   "active_network_length_m_0d" = "ASDN",
+#   "percent_network_wet" = "% Wet",
+#   "water.temp_7d" = "7 Day Water Temp",
+#   "water.temp_60d" = "60 Day Water Temp"
+# )
