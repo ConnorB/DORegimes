@@ -55,3 +55,6 @@ Results/
 
 # DEMs
 *.tif
+
+# Rds
+*.rds

@@ -5,6 +5,8 @@ format: html
 ---
 
 ```{r}
+#| label: Libraries
+#| output: false
 #| include: false
 library(here)
 source(here("Code/paths+packages.R"))
@@ -25,12 +27,6 @@ library(gt)
 set.seed(4) # For reproducibility
 gpSites <- c("#1b9e77", "#d95f02", "#7570b3")
 cluster_colors <- c("1" = "#0072B2", "2" = "#009E73", "3" = "#E69F00")
-#cluster_colors <- c("1" = "#4A6B7C","2" = "#5A7A5A","3" = "#B8834A")
-
-# site_colors <- tibble(Site = c("JDR", "GBJ", "KNZ", "SHN", "YMR", "WHR", "PRF", "TAL"),
-#                       color = c("#0072B2", "#E69F00", "#CC79A7", "#009E73", "#56B4E9", "#D55E00", "#F0E442", "#999999"))
-# site_colors <- tibble(Site = c("JDR", "GBJ", "KNZ", "SHN", "YMR", "WHR", "PRF", "TAL"),
-#                       color = c("#006475", "#56CFD8", "#613921", "#F2C27B", "#A77652", "#345022", "#5A6C0A", "#83A102"))
 site_colors <- tibble(
   Site = c("JDR", "GBJ", "KNZ", "SHN", "YMR", "WHR", "PRF", "TAL"),
   color = c(
@@ -47,6 +43,7 @@ site_colors <- tibble(
 ```
 
 ```{r}
+#| label: Set Theme
 theme_set(
   theme_bw() +
     theme(
@@ -633,7 +630,7 @@ flow_prop <- dailyDat |>
 
 flow_prop |>
   ggplot(aes(x = kg_name, y = prop_flowing, fill = kg_name)) +
-  geom_col() +
+  geom_col(na.rm = TRUE) +
   scale_fill_manual(
     values = setNames(site_meta$color, site_meta$kg_name),
     breaks = levels(site_meta$kg_name)
@@ -669,7 +666,7 @@ q50 <- dailyDat |>
 
 q50 |>
   ggplot(aes(x = kg_name, y = days_below_50th, fill = kg_name)) +
-  geom_col() +
+  geom_col(na.rm = TRUE) +
   scale_fill_manual(
     values = setNames(site_meta$color, site_meta$kg_name),
     breaks = levels(site_meta$kg_name)
@@ -714,7 +711,7 @@ dailyDat |>
   ) |>
   ungroup() |>
   ggplot(aes(x = active_network_length_m, fill = kg_name)) +
-  geom_density(alpha = 0.5) +
+  geom_density(alpha = 0.5, na.rm = TRUE) +
   scale_fill_manual(
     values = setNames(site_meta$color, site_meta$kg_name),
     breaks = levels(site_meta$kg_name)
@@ -933,7 +930,7 @@ runoff50 <- dailyDat |>
 
 runoff50 |>
   ggplot(aes(x = kg_name, y = days_below_50th, fill = kg_name)) +
-  geom_col() +
+  geom_col(na.rm = TRUE) +
   scale_fill_manual(
     values = setNames(site_meta$color, site_meta$kg_name),
     breaks = levels(site_meta$kg_name)
@@ -1029,7 +1026,7 @@ dailyDat |>
   #mutate(active_network_length_m = active_network_length_m/max(active_network_length_m, na.rm = T)*100) |>
   ungroup() |>
   ggplot(aes(x = Date, y = percent_network_wet, color = kg_name)) +
-  geom_line(alpha = 1) +
+  geom_line(alpha = 1, na.rm = TRUE) +
   # Add vertical lines
   geom_vline(
     data = vline_dat,
@@ -1055,6 +1052,7 @@ dailyDat |>
     linetype = guide_legend(title = NULL)
   ) +
   theme(legend.title = element_blank())
+
 ggsave(
   filename = "peak_to_dry_overtime.png",
   path = here("Figs/"),
@@ -1073,7 +1071,7 @@ peak_to_dry <- peakDry |>
 
 peak_to_dry |>
   ggplot(aes(x = kg_name, y = mean_days_peak_to_min, fill = kg_name)) +
-  geom_col() +
+  geom_col(na.rm = TRUE) +
   scale_fill_manual(
     values = setNames(site_meta$color, site_meta$kg_name),
     breaks = levels(site_meta$kg_name)
@@ -2855,16 +2853,19 @@ majority_rule <- tibble(
 
 # Cluster stability via bootstrap (Jaccard similarity per cluster)
 set.seed(42)
-clusterboot_res <- feature_matrix |>
-  fpc::clusterboot(
-    B = 500,
-    bootmethod = "boot",
-    clustermethod = fpc::kmeansCBI,
-    k = majority_rule,
-    runs = 100,
-    seed = 42,
-    count = FALSE
-  )
+suppressMessages({
+  clusterboot_res <- feature_matrix |>
+    fpc::clusterboot(
+      B = 500,
+      bootmethod = "boot",
+      clustermethod = fpc::kmeansCBI,
+      k = majority_rule,
+      runs = 100,
+      seed = 42,
+      count = FALSE
+    )
+})
+
 
 #K-means clustering
 kmeans_result <- feature_matrix |>
@@ -2875,6 +2876,7 @@ kmeans_result <- feature_matrix |>
     graph = FALSE,
     nboot = 500
   )
+
 performance::model_performance(kmeans_result)
 # Davies-Bouldin and WCSS lower-is-better, Silhouette and Calinski-Harabasz higher-is-better.
 internal_summary <- tibble(
@@ -5224,7 +5226,7 @@ for (i in seq_len(nrow(best_lag))) {
 best_lags_data <- best_lags_data |>
   select(-any_of(best_lag$variable)) |>
   drop_na(Cluster) |>
-  group_by(Site, kg_name) |>
+  group_by(Site) |>
   mutate(across(
     where(is.numeric) & !active_network_length_m_0d,
     ~ scale(.) |> as.numeric()
@@ -5251,7 +5253,7 @@ best_lags_data |>
       number.cex = 4,
       cl.cex = 3,
       col = colorRampPalette(c("#e8000d", "#dde5ed", "#0051ba"))(200),
-      cl.lim = c(-1, 1),
+      col.lim = c(-1, 1),
     )
   })()
 
@@ -5422,7 +5424,7 @@ shap_bootstrap_input <- make_shap_bootstrap_input(
   rf_lagged_mod,
   best_lags_data
 )
-
+load(here("Results/rf/model_objects_lag_rounded_scaled.RData"))
 save(
   rf_lagged_mod,
   fitted_model,
@@ -5439,71 +5441,83 @@ beep(2)
 ```
 
 ```{r}
+# How distinct is class 2 in the selected feature space?
+train_data |>
+  select(all_of(rf_lagged_mod$selected_vars), Cluster) |>
+  pivot_longer(-Cluster) |>
+  ggplot(aes(value, fill = Cluster)) +
+  geom_density(alpha = 0.4) +
+  facet_wrap(~name, scales = "free")
 
-#source(here("Code/Functions/rf_testing2.R"))
-#
-# rf_lagged_mod <- fit_full_model_new(
-#   df = best_lags_data,
-#   label = "best_lag_rounded_scaled",
-#   class_weights = c("1" = 0.2, "2" = 0.6, "3" = 0.5)
-# )
+set.seed(42)
+random_split <- initial_split(
+  best_lags_data |> select(all_of(selected_vars)),
+  prop = 0.8
+)
+random_train <- training(random_split)
+random_test <- testing(random_split)
 
-# rf_lagged_mod <- fit_full_model_enhanced(
-#   df = best_lags_data,
-#   label = "best_lag_rounded_scaled",
-#   class_weight_candidates = list(
-#     unweighted = c("1" = 1, "2" = 1, "3" = 1),
-#     # current = c("1" = 0.2, "2" = 0.3, "3" = 0.5),
-#     current = c("1" = 0.2, "2" = 0.6, "3" = 0.5),
-#     class2_focus = c("1" = 0.2, "2" = 0.6, "3" = 0.4)
-#   )
-# )
+tb_split_plt <- train_data |>
+  mutate(source = "Train") |>
+  bind_rows(test_data |> mutate(source = "Test")) |>
+  select(source, all_of(selected_vars)) |>
+  pivot_longer(-source, names_to = "variable", values_to = "value") |>
+  mutate(
+    variable = case_when(
+      variable %in% names(var_names) ~ var_names[variable],
+      TRUE ~ variable # Keep original if not found in var_names
+    )
+  ) |>
+  ggplot(aes(x = value, fill = source)) +
+  geom_density(alpha = 0.5, na.rm = TRUE) +
+  facet_wrap(~variable, scales = "free") +
+  labs(title = "Time Block Split") +
+  scale_fill_manual(values = c(Train = "#CB7223", Test = "#289A84")) +
+  theme(legend.title = element_blank())
 
-#
-# final_wf <- rf_lagged_mod$final_wf
-# final_fit <- rf_lagged_mod$final_fit
-# fitted_model <- extract_fit_parsnip(final_fit)$fit
-# train_data <- rf_lagged_mod$train_data
-# test_data <- rf_lagged_mod$test_data
-#
-# selected_vars <- rf_lagged_mod$selected_vars
-# tune_res <- rf_lagged_mod$tune_results
-# best_params <- rf_lagged_mod$best_params
-# print(best_params)
-# tune_plt <- autoplot(tune_res)
-# tune_plt
-# ggsave(
-#   filename = "tune_res.png",
-#   plot = tune_plt,
-#   path = here("Figs/RF_Models/"),
-#   device = "png",
-#   width = 40,
-#   height = 20,
-#   units = "cm",
-#   dpi = "retina"
-# )
-#
-# site_metrics <- rf_lagged_mod$site_metrics
-# conf_matrix <- rf_lagged_mod$confusion_matrix
-# print(conf_matrix)
-#
-# save(
-#   fitted_model,
-#   selected_vars,
-#   test_data,
-#   file = here("Results/rf/model_objects_lag_rounded_scaled.RData")
-# )
-# beep(2)
-#
-# # How distinct is class 2 in the selected feature space?
-# train_data |>
-#   select(all_of(rf_lagged_mod$selected_vars), Cluster) |>
-#   pivot_longer(-Cluster) |>
-#   ggplot(aes(value, fill = Cluster)) +
-#   geom_density(alpha = 0.4) +
-#   facet_wrap(~name, scales = "free")
 
+rnd_split_plt <- random_train |>
+  mutate(source = "Train") |>
+  bind_rows(random_test |> mutate(source = "Test")) |>
+  select(source, where(is.numeric)) |>
+  pivot_longer(-source, names_to = "variable", values_to = "value") |>
+  mutate(
+    variable = case_when(
+      variable %in% names(var_names) ~ var_names[variable],
+      TRUE ~ variable # Keep original if not found in var_names
+    )
+  ) |>
+  ggplot(aes(x = value, fill = source)) +
+  geom_density(alpha = 0.5, na.rm = TRUE) +
+  facet_wrap(~variable, scales = "free") +
+  labs(title = "Random 80/20 split") +
+  scale_fill_manual(values = c(Train = "#CB7223", Test = "#289A84")) +
+  theme(legend.title = element_blank())
+
+tb_split_plt
+rnd_split_plt
+ggsave(
+  filename = "tb_split_plt.png",
+  plot = tb_split_plt,
+  path = here("Figs/Supplement/"),
+  device = "png",
+  width = 40,
+  height = 20,
+  units = "cm",
+  dpi = 600
+)
+ggsave(
+  filename = "rnd_split_plt.png",
+  plot = rnd_split_plt,
+  path = here("Figs/Supplement/"),
+  device = "png",
+  width = 40,
+  height = 20,
+  units = "cm",
+  dpi = 600
+)
 ```
+
 
 ```{r}
 # List of cluster labels
@@ -5546,7 +5560,7 @@ impVars <- importance_df |>
   )
 impVars
 conf_mat <- read_csv(here(
-  "Results/rf/best_lag_rounded_scaled_loso_confusion_matrix.csv"
+  "Results/rf/best_lag_rounded_scaled_temporal_confusion_matrix.csv"
 )) |>
   group_by(Prediction) |>
   mutate(precision = n / sum(n), freq.Perc = round(n / sum(n), 3)) |>
@@ -5682,9 +5696,8 @@ corrplot(
 dev.off()
 ```
 
-### SHAP w/ weighted model
-
-### 05_calc_bootstrapped_shap.R
+# SHAP
+05_calc_bootstrapped_shap.R
 
 ```{r}
 # Read all saved kernelshap objects
@@ -5928,177 +5941,6 @@ ggsave(
 )
 ```
 
-```{r}
-# # Region-level SHAP with 95% CI
-# region_shap <- seq_along(shap_list) |>
-#   lapply(\(b) {
-#     ks <- shap_list[[b]]
-#     names(ks$S) |>
-#       lapply(\(clust_name) {
-#         shap_mat <- ks$S[[clust_name]]
-#         as_tibble(shap_mat) |>
-#           cbind(ks$X |> select(Site, Date)) |>
-#           transform(Cluster = clust_name, Boot = b)
-#       }) |>
-#       do.call(what = rbind)
-#   }) |>
-#   do.call(what = rbind) |>
-#   as_tibble() |>
-#   left_join(site_info |> select(Site, Region)) |>
-#   mutate(across(where(is.numeric) & !matches("Boot"), abs)) |>
-#   # summarise per bootstrap × region × cluster
-#   group_by(Boot, Region, Cluster) |>
-#   summarise(
-#     across(where(is.numeric) & !matches("Boot"), mean),
-#     .groups = "drop"
-#   ) |>
-#   pivot_longer(
-#     -c(Cluster, Region, Boot),
-#     names_to = "predictor",
-#     values_to = "shap"
-#   ) |>
-#   # normalise within each bootstrap × region × cluster
-#   group_by(Boot, Cluster, Region) |>
-#   mutate(norm_shap = shap / sum(shap)) |>
-#   ungroup() |>
-#   # summarise across bootstraps
-#   group_by(Cluster, Region, predictor) |>
-#   summarise(
-#     lo = quantile(norm_shap, 0.025),
-#     hi = quantile(norm_shap, 0.975),
-#     norm_shap = mean(norm_shap),
-#     .groups = "drop"
-#   ) |>
-#   mutate(
-#     ClusterLabel = paste("State", Cluster),
-#     predictor = case_when(
-#       predictor %in% names(var_names) ~ var_names[predictor],
-#       TRUE ~ predictor
-#     )
-#   ) |>
-#   group_by(Region, predictor) |>
-#   mutate(pred_mean_region = mean(norm_shap, na.rm = TRUE)) |>
-#   ungroup() |>
-#   mutate(
-#     predictor = reorder(predictor, pred_mean_region),
-#     Cluster = factor(Cluster, levels = c("1", "2", "3"))
-#   )
-#
-#
-# zero_trim <- function(x) {
-#   ifelse(x == 0, "0", label_number(accuracy = 0.01)(x))
-# }
-#
-# region_cluster_var_imp <- ggplot(
-#   region_shap,
-#   aes(x = predictor, y = norm_shap, fill = Cluster)
-# ) +
-#   geom_col(
-#     position = position_dodge(width = 0.8, reverse = TRUE),
-#     width = 0.75,
-#     alpha = 0.9
-#   ) +
-#   geom_errorbar(
-#     aes(ymin = lo, ymax = hi),
-#     position = position_dodge(width = 0.8, reverse = TRUE),
-#     width = 0.25
-#   ) +
-#   facet_wrap(~Region, scales = "fixed") +
-#   coord_flip() +
-#   scale_fill_manual(values = cluster_colors) +
-#   scale_y_continuous(
-#     labels = zero_trim,
-#     expand = expansion(mult = c(0, 0.05))
-#   ) +
-#   labs(x = NULL, y = "Proportion of Total |SHAP|", fill = "State") +
-#   theme(
-#     panel.spacing.x = unit(2.0, "lines"),
-#     strip.text = element_text(face = "bold", size = 20)
-#   )
-#
-# region_cluster_var_imp
-#
-# ggsave(
-#   filename = "rounded_lags_region_shap.png",
-#   plot = region_cluster_var_imp,
-#   path = here("Figs/RF_Models/"),
-#   device = "png",
-#   width = 40,
-#   height = 20,
-#   units = "cm",
-#   dpi = "retina"
-# )
-```
-
-
-```{r}
-# Read all saved kernelshap objects
-# files <- list.files(path = "~/Desktop/SHAP_Rounded_Lags_Scaled/", pattern = "kernelshap_iter_\\d+\\.rds", full.names = TRUE)
-# shap_list <- lapply(files, readRDS)
-
-# # Build long-format individual observation SHAP values with feature values
-# shap_beeswarm <- seq_along(shap_list) |>
-#   lapply(\(b) {
-#     ks <- shap_list[[b]]
-#     # identify predictor columns from the SHAP matrix
-#     pred_cols <- colnames(ks$S[[1]])
-#     names(ks$S) |>
-#       lapply(\(clust_name) {
-#         shap_mat <- ks$S[[clust_name]]
-#         feat_mat <- ks$X |> select(all_of(pred_cols)) # predictors only
-#         as_tibble(shap_mat) |>
-#           rename_with(\(nm) paste0("shap__", nm)) |>
-#           bind_cols(
-#             feat_mat |>
-#               rename_with(\(nm) paste0("feat__", nm))
-#           ) |>
-#           bind_cols(ks$X |> select(Site, Date)) |> # keep identifiers separate
-#           mutate(Cluster = clust_name, Boot = b)
-#       }) |>
-#       do.call(what = rbind)
-#   }) |>
-#   do.call(what = rbind) |>
-#   as_tibble() |>
-#   # average over bootstraps per observation (Site × Date × Cluster)
-#   group_by(across(c(starts_with("feat__"), Site, Date, Cluster))) |>
-#   summarise(across(starts_with("shap__"), mean), .groups = "drop") |>
-#   # pivot shap values long
-#   pivot_longer(
-#     cols = starts_with("shap__"),
-#     names_to = "predictor",
-#     names_prefix = "shap__",
-#     values_to = "shap"
-#   ) |>
-#   # bring in matching feature value for colour scale
-#   pivot_longer(
-#     cols = starts_with("feat__"),
-#     names_to = "feat_name",
-#     names_prefix = "feat__",
-#     values_to = "feat_value"
-#   ) |>
-#   filter(predictor == feat_name) |>
-#   drop_na(feat_value) |>
-#   select(-feat_name) |>
-#   # rescale feature value 0–1 within each predictor
-#   group_by(predictor) |>
-#   mutate(
-#     feat_scaled = (feat_value - min(feat_value, na.rm = TRUE)) /
-#       (max(feat_value, na.rm = TRUE) - min(feat_value, na.rm = TRUE))
-#   ) |>
-#   ungroup() |>
-#   mutate(
-#     predictor = case_when(
-#       predictor %in% names(var_names) ~ var_names[predictor],
-#       TRUE ~ predictor
-#     ),
-#     ClusterLabel = paste("State", Cluster),
-#     Cluster = factor(Cluster, levels = c("1", "2", "3"))
-#   ) |>
-#   group_by(predictor) |>
-#   mutate(pred_order = mean(abs(shap), na.rm = TRUE)) |>
-#   ungroup() |>
-#   mutate(predictor = reorder(predictor, pred_order))
-```
 
 ```{r}
 # Individual-observation SHAP values from a representative bootstrap draw
@@ -6268,7 +6110,7 @@ ggsave(
 )
 ```
 
-### Conf Mat
+## SHAP + Confusion Matrix
 
 ```{r}
 # List of cluster labels
@@ -6277,7 +6119,7 @@ cluster_colors <- c("1" = "#0072B2", "2" = "#009E73", "3" = "#E69F00")
 
 # Read all importance files into one long dataframe
 importance_df <- read_csv(here(
-  "Results/rf/best_lag_rounded_scaled_timeblock_loo_importance.csv"
+  "Results/rf/best_lag_rounded_scaled_importance.csv"
 )) |>
   #mutate(Cluster = label) |>
   mutate(
@@ -6314,7 +6156,7 @@ impVars
 
 
 conf_mat <- read_csv(here(
-  "Results/rf/best_lag_rounded_scaled_timeblock_loo_confusion_matrix.csv"
+  "Results/rf/best_lag_rounded_scaled_temporal_confusion_matrix.csv"
 )) |>
   group_by(Prediction) |>
   mutate(precision = n / sum(n), freq.Perc = round(n / sum(n), 3)) |>
@@ -6329,7 +6171,7 @@ conf_mat <- read_csv(here(
 
 conf_mat_plt <- ggplot(conf_mat) +
   geom_tile(aes(x = Reference, y = Prediction, fill = freq.Perc)) +
-  scale_fill_viridis_c(option = "viridis", direction = 1) +
+  scale_fill_viridis_c(option = "viridis", direction = 1, limits = c(0, 1)) +
   geom_text(
     aes(
       x = Reference,
@@ -6390,9 +6232,97 @@ ggsave(
   units = "cm",
   dpi = 600
 )
+
+ggsave(
+  filename = "conf_mat.png",
+  plot = conf_mat_plt,
+  path = here("Figs/RF_Models/"),
+  device = "png",
+  width = 20,
+  height = 20,
+  units = "cm",
+  dpi = 600
+)
 ```
 
-## ALE
+### Temporal LOSO
+
+```{r}
+conf_mat_loso <- read_csv(here(
+  "Results/rf/best_lag_rounded_scaled_site_loso_confusion_matrix.csv"
+)) |>
+  group_by(Prediction) |>
+  mutate(precision = n / sum(n), freq.Perc = round(n / sum(n), 3)) |>
+  ungroup() |>
+  group_by(Reference) |>
+  mutate(recall = n / sum(n)) |>
+  ungroup() |>
+  mutate(
+    label = paste0("(", round(precision, 2), " / ", round(recall, 2), ")")
+  ) |>
+  mutate(label = if_else(Prediction == Reference, label, NA_character_))
+
+conf_mat_loso_plt <- ggplot(conf_mat_loso) +
+  geom_tile(aes(x = Reference, y = Prediction, fill = freq.Perc)) +
+  scale_fill_viridis_c(option = "viridis", direction = 1, limits = c(0, 1)) +
+  geom_text(
+    aes(
+      x = Reference,
+      y = Prediction,
+      label = n,
+      color = Prediction == Reference
+    ),
+    size = 8
+  ) +
+  scale_color_manual(
+    values = c("TRUE" = "black", "FALSE" = "white"),
+    guide = "none"
+  ) +
+  geom_text(
+    aes(x = Reference, y = Prediction + 0.2, label = label),
+    color = "black",
+    size = 6
+  ) +
+  scale_y_continuous(
+    trans = "reverse",
+    expand = c(0, 0),
+    breaks = 1:3,
+    labels = paste("State", 1:3)
+  ) +
+  scale_x_continuous(
+    position = "top",
+    expand = c(0, 0),
+    breaks = 1:3,
+    labels = paste("State", 1:3)
+  ) +
+  labs(
+    fill = "Fraction Predicted",
+    x = "Actual",
+    y = "Predicted"
+  ) +
+  theme(
+    panel.background = element_rect(fill = NA, colour = "black", linewidth = 1),
+    axis.line = element_line(colour = "black"),
+    legend.position = "bottom",
+    legend.key.width = unit(1.5, "cm"),
+    legend.key.height = unit(0.3, "cm"),
+    legend.title = element_text(vjust = 1),
+    axis.text.y = element_text(angle = 90, hjust = .5)
+  )
+
+ggsave(
+  filename = "conf_mat_loso.png",
+  plot = conf_mat_loso_plt,
+  path = here("Figs/RF_Models/"),
+  device = "png",
+  width = 20,
+  height = 20,
+  units = "cm",
+  dpi = 600
+)
+```
+
+# ALE
 ```{r}
 library(ale)
 
@@ -6474,223 +6404,14 @@ rescale_against_ale <- function(x, ale_values) {
   (x - limits[[1]]) / diff(limits)
 }
 
-ale_plot_data <- ale::get(ale_rf, simplify = FALSE) |>
-  purrr::imap(\(category_data, cluster) {
-    category_data$d1 |>
-      purrr::imap(\(effect_data, variable) {
-        x_column <- setdiff(
-          names(effect_data),
-          c(".n", ".y", ".y_lo", ".y_mean", ".y_median", ".y_hi")
-        )[[1]]
-
-        effect_data |>
-          transmute(
-            Cluster = cluster,
-            variable = variable,
-            x_values = .data[[x_column]],
-            ale_values = .data[[".y"]],
-            ale_lower = .data[[".y_lo"]],
-            ale_upper = .data[[".y_hi"]]
-          )
-      }) |>
-      purrr::list_rbind()
-  }) |>
-  purrr::list_rbind() |>
-  mutate(
-    ale_scaled = rescale_against_ale(ale_values, ale_values),
-    ale_lower_scaled = rescale_against_ale(ale_lower, ale_values),
-    ale_upper_scaled = rescale_against_ale(ale_upper, ale_values),
-    .by = c(Cluster, variable)
-  ) |>
-  mutate(
-    variable = case_when(
-      variable %in% names(var_names) ~ var_names[variable],
-      TRUE ~ variable
-    ),
-    Cluster = factor(Cluster, levels = c("1", "2", "3"))
-  )
-
 var_order <- overall_mean_abs_shap |>
   arrange(desc(mean_abs_shap)) |>
   pull(predictor)
-
-ale_plot_data <- ale_plot_data |>
-  mutate(variable = factor(variable, levels = var_order))
-
-# Plot scaled ALE effects
-ale_scaled <- ale_plot_data |>
-  filter(!is.na(x_values), !is.na(ale_scaled)) |>
-  ggplot(aes(x = x_values, y = ale_scaled, color = Cluster, fill = Cluster)) +
-  geom_ribbon(
-    aes(ymin = ale_lower_scaled, ymax = ale_upper_scaled),
-    alpha = 0.2,
-    color = NA,
-    na.rm = FALSE
-  ) +
-  geom_line(linewidth = 1.3, alpha = 0.9) +
-  geom_hline(yintercept = 0.5, linetype = "dashed", alpha = 0.5) +
-  scale_color_manual(values = cluster_colors) +
-  scale_fill_manual(values = cluster_colors) +
-  facet_wrap(~variable, scales = "free_x", nrow = 2) +
-  labs(
-    x = "Feature Values",
-    y = "Normalized ALE Values (0–1)",
-    fill = "Regime",
-    color = "Regime"
-  ) +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1),
-    strip.text = element_text(face = "bold")
-  ) +
-  coord_cartesian(ylim = c(0, 1))
-ale_scaled
-ggsave(
-  filename = "scaled_ale_plt.png",
-  plot = ale_scaled,
-  path = here("Figs/"),
-  device = "png",
-  width = 40,
-  height = 20,
-  units = "cm",
-  dpi = "retina"
-)
-beepr::beep(2)
 ```
 
 
 ```{r}
-# library(ale)
-# rf_pred_fun <- function(object, newdata, type = "response") {
-#   predict(object, data = newdata)$predictions
-# }
-# plan(sequential)
-# plan(multisession, workers = parallel::detectCores() - 1)
-# # Create ALE plots with the custom prediction function
-# if (file.exists(here("Results/rf/ale_env.rds"))) {
-#   ale_rf <- read_rds(here("Results/rf/ale_env.rds"))
-# } else {
-#   ale_rf <- ale::ALE(
-#     model = fitted_model,
-#     data = train_data |> select(selected_vars, Cluster) |> drop_na(),
-#     y_col = "Cluster",
-#     # y_type = "categorical",
-#     pred_fun = rf_pred_fun,
-#     x_cols = list(d1 = TRUE), # All 1D effects
-#     boot_it = 1000,
-#     parallel = "all but one",
-#     seed = 42
-#   )
-#   write_rds(ale_rf, here("Results/rf/ale_env.rds"))
-# }
-# plan(sequential)
-#
-# ale_plts <- suppressWarnings(plot(ale_rf))
-# ale_plts
-# for (i in selected_vars) {
-#   get(ale_plts, i) |> print(ncol = 2)
-# }
-#
-#
-# # Extract the data
-# ale_plot_data <- get_ale_data(ale_rf) |>
-#   mutate(
-#     variable = case_when(
-#       variable %in% names(var_names) ~ var_names[variable],
-#       TRUE ~ variable # Keep original if not found in var_names
-#     )
-#   ) |>
-#   # Normalize to 0-1 scale for each cluster-variable combination
-#   group_by(Cluster, variable) |>
-#   mutate(
-#     # Scale to 0-1 range
-#     ale_scaled = (ale_values - min(ale_values, na.rm = TRUE)) /
-#       (max(ale_values, na.rm = TRUE) - min(ale_values, na.rm = TRUE)),
-#     ale_lower_scaled = (ale_lower - min(ale_values, na.rm = TRUE)) /
-#       (max(ale_values, na.rm = TRUE) - min(ale_values, na.rm = TRUE)),
-#     ale_upper_scaled = (ale_upper - min(ale_values, na.rm = TRUE)) /
-#       (max(ale_values, na.rm = TRUE) - min(ale_values, na.rm = TRUE))
-#   ) |>
-#   # mutate(
-#   #   ale_lower_scaled = pmax(ale_lower_scaled, -0.01),
-#   #   ale_upper_scaled = pmin(ale_upper_scaled, 1.01)
-#   # ) |>
-#   ungroup()
-
-# # Reorder variables by SHAP importance
-# var_order <- overall_mean_abs_shap |>
-#   arrange(desc(mean_abs_shap)) |>
-#   pull(predictor)
-#
-# ale_plot_data <- ale_plot_data |>
-#   mutate(variable = factor(variable, levels = var_order))
-
-# ale_plot_data |>
-#   ggplot(aes(x = x_values, y = ale_values, color = Cluster)) +
-#   scale_color_manual(values = cluster_colors) +
-#   scale_fill_manual(values = cluster_colors) +
-#   # Add confidence intervals as ribbons (behind the lines)
-#   geom_ribbon(aes(ymin = ale_lower, ymax = ale_upper, fill = Cluster), alpha = 0.4) +
-#   # Add the main ALE lines
-#   geom_line(linewidth = 1.2, alpha = 0.9) +
-#   geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
-#   facet_wrap(~variable, scales = "free", ncol = 3) +
-#   labs(
-#     title = "ALE Effects Across All Clusters and Variables",
-#     x = "Feature Values",
-#     y = "ALE Values",
-#     subtitle = paste("Based on", nrow(train_data), "observations with",
-#                     length(unique(train_data$Cluster)), "clusters")
-#   ) +
-#   theme_minimal() +
-#   theme(
-#     strip.text = element_text(size = 10, face = "bold"),
-#     legend.position = "bottom",
-#     panel.grid.minor = element_blank(),
-#     axis.text.x = element_text(angle = 45, hjust = 1)
-#   )
-#
-# # Plot scaled ALE effects
-# ale_scaled <- ale_plot_data |>
-#   filter(!is.na(x_values), !is.na(ale_scaled)) |>
-#   ggplot(aes(x = x_values, y = ale_scaled, color = Cluster, fill = Cluster)) +
-#   geom_ribbon(
-#     aes(ymin = ale_lower_scaled, ymax = ale_upper_scaled),
-#     alpha = 0.2,
-#     color = NA,
-#     na.rm = FALSE
-#   ) +
-#   geom_line(linewidth = 1.3, alpha = 0.9) +
-#   geom_hline(yintercept = 0.5, linetype = "dashed", alpha = 0.5) +
-#   scale_color_manual(values = cluster_colors) +
-#   scale_fill_manual(values = cluster_colors) +
-#   facet_wrap(~variable, scales = "free_x", nrow = 2) +
-#   labs(
-#     x = "Feature Values",
-#     y = "Normalized ALE Values (0–1)",
-#     fill = "Regime",
-#     color = "Regime"
-#   ) +
-#   theme(
-#     axis.text.x = element_text(angle = 45, hjust = 1),
-#     strip.text = element_text(face = "bold")
-#   ) +
-#   coord_cartesian(ylim = c(0, 1))
-# ale_scaled
-# ggsave(
-#   filename = "scaled_ale_plt.png",
-#   plot = ale_scaled,
-#   path = here("Figs/"),
-#   device = "png",
-#   width = 40,
-#   height = 20,
-#   units = "cm",
-#   dpi = "retina"
-# )
-# beepr::beep(2)
-
-```
-
-```{r}
+#| label: Ale Plot
 # Extract ALE data for all clusters and variables
 vars <- c(
   "Depth_0d",
@@ -6757,42 +6478,8 @@ rug_data <- map_dfr(vars_ordered, function(var) {
     mutate(variable = factor(var, levels = vars_ordered))
 })
 
-# Plot with facet_wrap
-test_ale <- ale_data |>
-  filter(!is.na(x_ceil), !is.na(.y)) |>
-  ggplot(aes(x = x_ceil, color = cluster, fill = cluster)) +
-  geom_ribbon(aes(ymin = .y_lo, ymax = .y_hi), alpha = 0.15, color = NA) +
-  geom_line(aes(y = .y), linewidth = 0.8) +
-  geom_rug(
-    data = rug_data,
-    aes(x = x, y = NULL),
-    inherit.aes = FALSE,
-    sides = "b",
-    alpha = 0.2,
-    linewidth = 0.3,
-    color = "grey30"
-  ) +
-  geom_hline(
-    yintercept = 0,
-    linetype = "dashed",
-    color = "grey40",
-    linewidth = 0.5
-  ) +
-  scale_color_manual(values = cluster_colors, name = "State") +
-  scale_fill_manual(values = cluster_colors, name = "State") +
-  facet_wrap(~variable, scales = "free_x", ncol = 4) +
-  labs(x = "Feature Values", y = "ALE Effect") +
-  # coord_cartesian(clip = "off") +
-  theme(
-    #axis.text.x = element_text(angle = 45, hjust = 1),
-    strip.text = element_text(face = "bold"),
-    plot.margin = ggplot2::margin(5, 6, 5, 5, "mm") # extra right margin
-  )
-
-library()
-library(scales)
-
-test_ale <- ale_data |>
+# ALE Plot
+ale_plt <- ale_data |>
   filter(!is.na(x_ceil), !is.na(.y)) |>
   ggplot(aes(x = x_ceil, color = cluster, fill = cluster)) +
   geom_ribbon(
@@ -6829,27 +6516,19 @@ test_ale <- ale_data |>
     scales = "free_x",
     ncol = 4
   ) +
-  ggh4x::facetted_pos_scales(
-    x = list(
-      variable == "Discharge" ~
-        scale_x_continuous(
-          trans = scales::pseudo_log_trans(base = 10),
-          name = "Feature values"
-        )
-    )
-  ) +
   labs(
     x = "Feature values",
     y = "ALE effect"
   ) +
   theme(
     strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
     plot.margin = ggplot2::margin(5, 6, 5, 5, "mm")
   )
-test_ale
+ale_plt
 ggsave(
   filename = "ale_plt.png",
-  plot = test_ale,
+  plot = ale_plt,
   here("Figs/"),
   device = "png",
   width = 40,
@@ -6857,534 +6536,4 @@ ggsave(
   units = "cm",
   dpi = "retina"
 )
-```
-
-```{r}
-site_shap <- names(all_shap$S) |>
-  lapply(\(clust_name) {
-    shap_mat <- all_shap$S[[clust_name]]
-    as_tibble(shap_mat) |>
-      cbind(all_shap$X |> select(Site, Date)) |>
-      transform(Cluster = clust_name)
-  }) |>
-  do.call(what = rbind) |>
-  as_tibble() |>
-  left_join(site_info |> select(Site, Region)) |>
-  mutate(across(where(is.numeric), abs)) |>
-  group_by(Region, Cluster) |>
-  summarise(across(where(is.numeric), mean)) |>
-  pivot_longer(
-    -c(Cluster, Region),
-    names_to = "predictor",
-    values_to = "shap"
-  ) |>
-  group_by(Cluster, Region) |>
-  #mutate(norm_shap = shap / max(shap)) |>
-  mutate(norm_shap = shap / sum(shap)) |>
-  ungroup() |>
-  mutate(
-    ClusterLabel = paste("Cluster", Cluster),
-    predictor = case_when(
-      predictor %in% names(var_names) ~ var_names[predictor],
-      TRUE ~ predictor # Keep original if not found in var_names
-    )
-  )
-
-site_cluster_var_imp <- site_shap |>
-  ggplot(aes(x = reorder(predictor, -shap), y = norm_shap, fill = Region)) +
-  geom_col(position = "dodge", alpha = 0.8) +
-  facet_grid(Region ~ Cluster, scales = "free_x") +
-  #coord_flip() +
-  scale_fill_manual(
-    values = c("#613921", "#83A102", "#006475"),
-    breaks = c(
-      "Great Plains",
-      "Eastern Temperate Forests",
-      "North American Deserts"
-    )
-  ) +
-  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
-  labs(
-    x = "Predictor",
-    y = "Proportion of Total |SHAP|"
-  ) +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1),
-    legend.position = "none"
-  )
-
-site_cluster_var_imp
-
-
-# Check if the sum of the normalized shap is 1
-norm_check <- site_shap |>
-  group_by(Cluster, Region) |>
-  summarise(
-    sum_shap = sum(shap, na.rm = TRUE),
-    sum_norm_shap = sum(norm_shap, na.rm = TRUE)
-  )
-
-site_cluster_var_imp <- site_shap |>
-  ggplot(aes(x = reorder(predictor, -shap), y = norm_shap, fill = Region)) +
-  geom_col(position = "dodge", alpha = 0.8) +
-  facet_wrap(~Cluster, scales = "free_x") +
-  #coord_flip() +
-  scale_fill_manual(
-    values = c("#613921", "#83A102", "#006475"),
-    breaks = c(
-      "Great Plains",
-      "Eastern Temperate Forests",
-      "North American Deserts"
-    )
-  ) +
-  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
-  labs(
-    x = "Predictor",
-    y = "Proportion of Total |SHAP|"
-  ) +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1),
-    legend.position = "none"
-  )
-
-site_cluster_var_imp
-
-
-site_cluster_var_imp <- site_shap |>
-  ggplot(aes(x = reorder(predictor, -shap), y = norm_shap, fill = Cluster)) +
-  geom_col(position = "dodge", alpha = 0.8) +
-  facet_wrap(~Region, scales = "free_x") +
-  #coord_flip() +
-  # scale_fill_manual(
-  #   values = c("#613921", "#83A102", "#006475"),
-  #   breaks = c("Great Plains", "Eastern Temperate Forests", "North American Deserts")
-  # ) +
-  scale_fill_manual(values = cluster_colors) +
-  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
-  labs(
-    x = "Predictor",
-    y = "Proportion of Total |SHAP|",
-    fill = "Regime"
-  ) +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1),
-  )
-site_cluster_var_imp
-
-site_shap |>
-  group_by(Region) |>
-  summarise(
-    sum_shap = sum(shap, na.rm = TRUE),
-    sum_norm_shap = sum(norm_shap, na.rm = TRUE)
-  )
-
-ggsave(
-  filename = "site_shap.png",
-  plot = site_cluster_var_imp,
-  path = here("Figs/Supplement/"),
-  device = "png",
-  width = 40,
-  height = 20,
-  units = "cm",
-  dpi = "retina"
-)
-
-# order predictors by overall mean importance (across all region-regime combos)
-pred_order <- site_shap |>
-  group_by(predictor) |>
-  summarise(m = mean(norm_shap, na.rm = TRUE), .groups = "drop") |>
-  arrange(desc(m)) |>
-  pull(predictor)
-
-site_shap |>
-  mutate(
-    predictor = factor(predictor, levels = rev(pred_order)),
-    Cluster = factor(Cluster, levels = c("1", "2", "3"))
-  ) |>
-  ggplot(aes(x = Cluster, y = predictor, fill = norm_shap)) +
-  geom_tile(color = "white", linewidth = 0.2) +
-  facet_wrap(~Region, nrow = 1) +
-  scale_y_discrete(drop = FALSE) +
-  scale_fill_viridis_c(option = "viridis", direction = 1) +
-  labs(x = "Regime", y = NULL, fill = "Proportion of\nTotal |SHAP|") +
-  theme_minimal(base_size = 11) +
-  theme(panel.grid = element_blank())
-
-site_shap_ranked <- site_shap |>
-  group_by(Region, predictor) |>
-  mutate(pred_mean_region = mean(norm_shap, na.rm = TRUE)) |>
-  ungroup() |>
-  mutate(
-    predictor = reorder(predictor, pred_mean_region),
-    Cluster = factor(Cluster, levels = c("1", "2", "3"))
-  )
-
-
-zero_trim <- function(x) {
-  ifelse(x == 0, "0", label_number(accuracy = 0.01)(x))
-}
-
-site_cluster_var_imp <- ggplot(
-  site_shap_ranked,
-  aes(x = predictor, y = norm_shap, fill = Cluster)
-) +
-  geom_col(
-    position = position_dodge(width = 0.8, reverse = TRUE),
-    width = 0.75,
-    alpha = 0.9
-  ) +
-  facet_wrap(~Region, scales = "fixed") +
-  coord_flip() +
-  scale_fill_manual(values = cluster_colors) +
-  scale_y_continuous(
-    labels = zero_trim,
-    expand = expansion(mult = c(0, 0.05))
-  ) +
-  labs(x = NULL, y = "Proportion of Total |SHAP|", fill = "Regime") +
-  theme(
-    panel.spacing.x = unit(2.0, "lines"),
-    # plot.margin = ggplot2::margin(5.5, 20, 5.5, 5.5),
-    # axis.text.y = element_text(margin = ggplot2::margin(r = 6)),
-    strip.text = element_text(face = "bold", size = 20)
-  )
-
-site_cluster_var_imp
-ggsave(
-  filename = "site_shap.png",
-  plot = site_cluster_var_imp,
-  path = here("Figs/Supplement/"),
-  device = "png",
-  width = 40,
-  height = 20,
-  units = "cm",
-  dpi = "retina"
-)
-```
-
-### PDP
-
-```{r}
-# classes <- levels(train_data$Cluster)
-#
-# pdp_out <- list()
-#
-# sites <- train_data |>
-#   select(all_of(selected_vars), Site) |>
-#   drop_na() |>
-#   pull(Site) |>
-#   unique()
-#
-# unscalled_lag <- lagged_data |>
-#   group_by(Site, name) |>
-#   arrange(Date) |>
-#   mutate(
-#     across(
-#       all_of(best_lag$variable),
-#       ~ {
-#         this_lag <- best_lag$lag[best_lag$variable == cur_column()]
-#         slider::slide_dbl(
-#           .x,
-#           mean,
-#           .before = this_lag,
-#           .after = 0,
-#           .complete = TRUE
-#         )
-#       },
-#       .names = "{.col}_lag"
-#     )
-#   ) |>
-#   ungroup()
-# unscalled_lag <- rename_lagged(unscalled_lag, best_lag)
-#
-# var_ranges <- unscalled_lag |>
-#   group_by(Site) |>
-#   summarise(across(all_of(selected_vars),
-#                    \(x) list(c(min(x, na.rm = TRUE), max(x, na.rm = TRUE)))))
-#
-#
-# for (var in selected_vars) {
-#   for (cl in classes) {
-#     for (s in sites) {
-#       # site training data
-#       train_s <- train_data |>
-#         filter(Site == s) |>
-#         select(all_of(selected_vars)) |>
-#         drop_na()
-#       # if a site has zero or 1 rows, skip it
-#       if (nrow(train_s) < 2) next
-#
-#       pd <- pdp::partial(
-#         object = fitted_model,
-#         pred.var = var,
-#         train = train_s,
-#         prob = TRUE,
-#         which.class = cl
-#       ) |>
-#         mutate(
-#           variable = var,
-#           cluster = cl,
-#           Site = s
-#         ) |>
-#         rename(predictor_value = !!sym(var))
-#
-#       pdp_out[[paste(var, cl, s, sep = "_")]] <- pd
-#     }
-#   }
-# }
-# pdp_df <- bind_rows(pdp_out)
-#
-# p <- list()
-#
-# for (var in selected_vars) {
-#
-#   df_var <- pdp_df |>
-#     filter(variable == var) |>
-#     group_by(Site, cluster, variable) |>
-#     mutate(prob_scale = rescale(yhat, to = c(0, 1))) |>
-#     ungroup()
-#
-#
-#     df_var <- df_var |>
-#       left_join(var_ranges, by = "Site") |>
-#       rowwise() |>
-#       mutate(
-#         predictor_orig =
-#           (predictor_value / 100) *
-#           (get(variable)[[2]] - get(variable)[[1]]) +
-#           get(variable)[[1]]
-#       ) |>
-#       ungroup() |>
-#       mutate(
-#       variable = case_when(
-#         variable %in% names(var_names) ~ var_names[variable],
-#         TRUE ~ variable
-#       )
-#     )
-#
-#   p[[var]] <- df_var |>
-#     ggplot(aes(x = predictor_orig, y = prob_scale, color = cluster)) +
-#     geom_line(linewidth = 0.8) +
-#     scale_color_manual(values = cluster_colors) +
-#     facet_wrap(~ Site, scales = "free_x") +
-#     labs(
-#       x = var_names[var],
-#       y = "Scaled probability (0–1 within Regime)",
-#       color = "Regime",
-#       title = "PDP by Regime × Site",
-#       subtitle = paste("Predictor:", var_names[var])
-#     ) +
-#     theme_few()
-# }
-#
-# p
-#
-#
-# ggsave(
-#   filename = "site_pdp_asdn.png",
-#   plot = p$active_network_length_m_0d,
-#   path = here("Figs/Supplement/"),
-#   device = "png",
-#   width = 40,
-#   height = 20,
-#   units = "cm",
-#   dpi = "retina"
-# )
-```
-
-```{r}
-#
-# classes <- levels(train_data$Cluster)
-#
-# pdp_out <- list()
-#
-# regions <- train_data |>
-#   select(all_of(selected_vars), Site) |>
-#   left_join(site_info |> select(Site, Region)) |>
-#   pull(Region) |>
-#   unique()
-#
-# train_data <- train_data |>
-#   left_join(site_info |> select(Site, Region))
-#
-# for (var in selected_vars) {
-#   for (cl in classes) {
-#     for (region in regions) {
-#       # region training data
-#       train_region <- train_data |>
-#         filter(Region == region) |>
-#         select(all_of(selected_vars))
-#
-#       # must have enough rows
-#       if (nrow(train_region) < 2) next
-#
-#       # drop rows where this var is NA (prevents min/max Inf/-Inf)
-#       train_region_nonmiss <- train_region |>
-#         filter(!is.na(.data[[var]]))
-#
-#       if (nrow(train_region_nonmiss) < 2) next
-#
-#       # need some variation; constant predictor can also cause trouble/useless PD
-#       if (length(unique(train_region_nonmiss[[var]])) < 2) next
-#
-#       pd <- pdp::partial(
-#         object = fitted_model,
-#         pred.var = var,
-#         train = train_region,
-#         prob = TRUE,
-#         which.class = cl
-#       ) |>
-#         mutate(
-#           variable = var,
-#           cluster = cl,
-#           Region = region
-#         ) |>
-#         rename(predictor_value = !!sym(var))
-#
-#       pdp_out[[paste(var, cl, region, sep = "_")]] <- pd
-#     }
-#   }
-# }
-# pdp_df <- bind_rows(pdp_out)
-#
-# p <- list()
-#
-# for (var in selected_vars) {
-#
-#   df_var <- pdp_df |>
-#     filter(variable == var) |>
-#     group_by(Region, cluster, variable) |>
-#     mutate(prob_scale = rescale(yhat, to = c(0, 1))) |>
-#     ungroup() |>
-#     mutate(
-#       variable = case_when(
-#         variable %in% names(var_names) ~ var_names[variable],
-#         TRUE ~ variable
-#       )
-#     )
-#
-#   p[[var]] <- df_var |>
-#     ggplot(aes(x = predictor_value, y = prob_scale, color = cluster)) +
-#     geom_line(linewidth = 0.8) +
-#     scale_color_manual(values = cluster_colors) +
-#     facet_wrap(~ Region, scales = "free_x") +
-#     labs(
-#       x = var_names[var],
-#       y = "Scaled probability (0–1 within Regime)",
-#       color = "Regime",
-#       title = "PDP by Regime × Region",
-#       subtitle = paste("Predictor:", var_names[var])
-#     ) +
-#     theme_few()
-# }
-#
-# p
-#
-#
-# ggsave(
-#   filename = "site_pdp_asdn.png",
-#   plot = p$active_network_length_m_0d,
-#   path = here("Figs/Supplement/"),
-#   device = "png",
-#   width = 40,
-#   height = 20,
-#   units = "cm",
-#   dpi = "retina"
-# )
-
-```
-
-```{r}
-classes <- levels(train_data$Cluster)
-
-pdp_out <- list()
-
-sites <- train_data |>
-  select(all_of(selected_vars), Site) |>
-  left_join(site_info |> select(Site, Region)) |>
-  pull(Site) |>
-  unique()
-
-for (var in selected_vars) {
-  for (cl in classes) {
-    for (s in sites) {
-      # region training data
-      train_site <- train_data |>
-        filter(Site == s) |>
-        select(all_of(selected_vars))
-
-      # must have enough rows
-      if (nrow(train_site) < 2) {
-        next
-      }
-
-      # drop rows where this var is NA (prevents min/max Inf/-Inf)
-      train_site_nonmiss <- train_site |>
-        filter(!is.na(.data[[var]]))
-
-      if (nrow(train_site_nonmiss) < 2) {
-        next
-      }
-
-      # need some variation; constant predictor can also cause trouble/useless PD
-      if (length(unique(train_site_nonmiss[[var]])) < 2) {
-        next
-      }
-
-      pd <- pdp::partial(
-        object = fitted_model,
-        pred.var = var,
-        train = train_site,
-        prob = TRUE,
-        which.class = cl
-      ) |>
-        mutate(
-          variable = var,
-          cluster = cl,
-          Site = s
-        ) |>
-        rename(predictor_value = !!sym(var))
-
-      pdp_out[[paste(var, cl, s, sep = "_")]] <- pd
-    }
-  }
-}
-pdp_df <- bind_rows(pdp_out)
-
-p <- list()
-
-for (var in selected_vars) {
-  df_var <- pdp_df |>
-    filter(variable == var) |>
-    group_by(Site, cluster, variable) |>
-    mutate(prob_scale = rescale(yhat, to = c(0, 1))) |>
-    ungroup() |>
-    mutate(
-      variable = case_when(
-        variable %in% names(var_names) ~ var_names[variable],
-        TRUE ~ variable
-      )
-    )
-
-  p[[var]] <- df_var |>
-    ggplot(aes(x = predictor_value, y = prob_scale, color = cluster)) +
-    geom_line(linewidth = 0.8) +
-    scale_color_manual(values = cluster_colors) +
-    facet_wrap(~Site, scales = "free_x") +
-    labs(
-      x = var_names[var],
-      y = "Scaled probability (0–1 within Regime)",
-      color = "Regime",
-      title = "PDP by Regime × Site",
-      subtitle = paste("Predictor:", var_names[var])
-    ) +
-    theme_few()
-}
-
-p
-```
-
-```{r}
-beepr::beep(2)
-# unlink(here("Results/rf/lagged_rf_exact_shap.rds"))
-# unlink(here("Results/rf/ale_env.rds"))
 ```
