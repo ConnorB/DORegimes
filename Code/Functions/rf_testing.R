@@ -10,6 +10,7 @@ fit_full_model_new <- function(
   tune_initial = 20,
   tune_iter = 500,
   validate_sites = TRUE,
+  quiet = FALSE,
   seed = 42L
 ) {
   suppressPackageStartupMessages({
@@ -338,25 +339,35 @@ fit_full_model_new <- function(
   )
 
   tune_model <- function(recipe, resamples, context) {
-    cli::cli_alert_info("Tuning hyperparameters: {.val {context}}")
+    if (!quiet) {
+      cli::cli_alert_info("Tuning hyperparameters: {.val {context}}")
+    }
     set.seed(seed)
-    make_tune_workflow(recipe) |>
-      tune_bayes(
-        resamples = resamples,
-        metrics = metrics,
-        initial = tune_initial,
-        iter = tune_iter,
-        param_info = parameters(
-          trees(range = c(500L, 2000L)),
-          mtry(range = c(min(2L, n_predictors), n_predictors)),
-          min_n(range = c(1L, 20L))
-        ),
-        control = control_bayes(
-          no_improve = 15L,
-          verbose = TRUE,
-          save_pred = TRUE
+    run_tune_bayes <- function() {
+      make_tune_workflow(recipe) |>
+        tune_bayes(
+          resamples = resamples,
+          metrics = metrics,
+          initial = tune_initial,
+          iter = tune_iter,
+          param_info = parameters(
+            trees(range = c(500L, 2000L)),
+            mtry(range = c(min(2L, n_predictors), n_predictors)),
+            min_n(range = c(1L, 20L))
+          ),
+          control = control_bayes(
+            no_improve = 15L,
+            verbose = !quiet,
+            save_pred = TRUE
+          )
         )
-      )
+    }
+    if (quiet) {
+      result <- suppressMessages(suppressWarnings(run_tune_bayes()))
+    } else {
+      result <- run_tune_bayes()
+    }
+    result
   }
 
   build_final_workflow <- function(recipe, best_params) {
@@ -384,7 +395,9 @@ fit_full_model_new <- function(
     resamples = make_time_folds(train_data, time_folds),
     context = "temporal training set"
   )
-  cli::cli_alert_success("Temporal tuning completed.")
+  if (!quiet) {
+    cli::cli_alert_success("Temporal tuning completed.")
+  }
   best_params <- tune_res |> select_best(metric = "macro_f1")
 
   final_wf <- build_final_workflow(final_recipe, best_params)

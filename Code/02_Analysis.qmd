@@ -5,6 +5,7 @@ format: html
 ---
 
 ```{r}
+#| echo: false
 #| label: Libraries
 #| output: false
 #| include: false
@@ -5410,7 +5411,8 @@ source(here("Code/Functions/rf_testing.R"))
 rf_lagged_mod <- fit_full_model_new(
   df = best_lags_data |> select(-kg_name),
   label = "best_lag_rounded_scaled",
-  class_weights = c("1" = 0.2, "2" = 0.6, "3" = 0.5)
+  class_weights = c("1" = 0.2, "2" = 0.6, "3" = 0.5),
+  quiet = TRUE
 )
 
 fitted_model <- extract_fit_parsnip(rf_lagged_mod$final_fit)$fit
