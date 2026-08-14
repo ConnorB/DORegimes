@@ -41,7 +41,6 @@ site_colors <- tibble(
     "#83A102"
   )
 )
-
 ```
 
 ```{r}
@@ -85,7 +84,7 @@ update_geom_defaults("text_repel", list(family = "Helvetica"))
 gpSheds <- st_read(
   "~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg",
   layer = "Watersheds",
-  quiet = T
+  quiet = TRUE
 ) |>
   filter(watershed %in% c("KNZ", "SHN", "YMR")) |>
   st_transform(crs = 4326)
@@ -588,7 +587,7 @@ site_info |>
   gtsave(here("Figs/site_info.docx"), zoom = 6, vwidth = 2000, vheight = 1200)
 ```
 
-## Add Name to DailyDat
+## Add Name to `DailyDat`
 
 ```{r}
 dailyDat <- dailyDat |>
@@ -5664,6 +5663,10 @@ avg_autocorr_length_by_site <- autocorr_length_by_series |>
 ```
 
 
+```{r}
+plan(sequential)
+```
+
 # Random Forest
 
 ```{r}
@@ -6416,7 +6419,8 @@ dev.off()
 ```
 
 # SHAP
-05_calc_bootstrapped_shap.R
+
+Run `05_calc_bootstrapped_shap.R`
 
 ```{r}
 # Read all saved kernelshap objects
