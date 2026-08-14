@@ -1,0 +1,164 @@
+---
+title: "KFH01 Konza Prairie Fire History"
+subtitle: "Package ID knb-lter-knz.42.25 (EDI / PASTA)"
+format: html
+---
+
+
+```{r}
+library(tidyverse)
+library(sf)
+library(httr2)
+
+options(HTTPUserAgent = "EDI_CodeGen")
+```
+
+## Authentication
+
+PASTA now authenticates through the EDI Identity and Access Manager. Anonymous
+requests return `403` because the `Public Access` profile has no read permission.
+```{r}
+#| label: auth
+edi_token <- function(key = Sys.getenv("EDI_API_KEY")) {
+  if (!nzchar(key)) {
+    stop("EDI_API_KEY is not set. See the setup steps above.")
+  }
+  request("https://auth.edirepository.org/auth/v1/key") |>
+    req_body_json(list(key = key)) |>
+    req_perform() |>
+    # The endpoint returns JSON but sends no Content-Type header.
+    resp_body_json(check_type = FALSE) |>
+    pluck("edi-token")
+}
+```
+
+## Read the data
+Downloaded once and cached locally, so a later PASTA outage doesn't break the render.
+
+```{r}
+#| label: read-data
+infile1 <- "https://pasta.lternet.edu/package/data/eml/knb-lter-knz/42/25/3565885edc7640f2276174ca1f00240b"
+cache_file <- tempfile(fileext = ".csv")
+
+
+if (!file.exists(cache_file)) {
+  request(infile1) |>
+    req_headers(Cookie = paste0("edi-token=", edi_token())) |>
+    req_perform(path = cache_file)
+}
+
+burn_history <- read_csv(cache_file, na = c(" ", ".", "NA", "")) |>
+  mutate(Date = as_date(Date, format = "%Y/%m/%d"))
+
+glimpse(burn_history)
+```
+
+## Summaries
+
+```{r}
+#| label: summary
+summary(burn_history)
+```
+
+
+## Watershed boundaries
+
+```{r}
+#| label: watershed-boundaries
+konza_watersheds <- function(layer = "GIS030") {
+  str_glue(
+    "https://services3.arcgis.com/NLHBHJt7gvEcsduu/arcgis/rest/services/",
+    "{layer}/FeatureServer/0/query",
+    "?where=1%3D1&outFields=*&outSR=26914&f=geojson"
+  ) |>
+    st_read(quiet = TRUE)
+}
+
+knz_sheds <- konza_watersheds("GIS030")
+knz_sheds |>
+  st_drop_geometry() |>
+  select(NAME, CODE, HECTARES) |>
+  arrange(NAME)
+```
+
+### Join fire history to geometry
+
+```{r}
+#| label: join-spatial
+burns_per_watershed <- burn_history |>
+  count(Watershed, name = "n_burns")
+
+knz_sheds_burns <- knz_sheds |>
+  left_join(burns_per_watershed, by = join_by(NAME == Watershed))
+
+# Watersheds in the fire record with no matching polygon in this era.
+anti_join(
+  burns_per_watershed,
+  st_drop_geometry(knz_sheds),
+  by = join_by(Watershed == NAME)
+)
+```
+
+```{r}
+#| label: map-burns
+knz_sheds_burns |>
+  mutate(
+    NAME = na_if(trimws(NAME), "")
+  ) |>
+  ggplot() +
+  geom_sf(aes(fill = n_burns), color = "white", linewidth = 0.2) +
+  geom_sf_text(
+    aes(label = paste(NAME, " - ", CODE)),
+    size = 3,
+    color = "white"
+  ) +
+  scale_fill_viridis_c(option = "inferno", na.value = "grey90") +
+  labs(
+    fill = "Burns Recorded",
+    title = "Konza Burns by Watershed"
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+
+
+```{r}
+#| label: shane-creek-watershed
+
+aims_sheds <- st_read(
+  "/Users/connor/Library/CloudStorage/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg",
+  layer = "Watersheds",
+  quiet = TRUE
+) |>
+  st_transform(crs = st_crs(knz_sheds_burns)) |>
+  filter(watershed %in% c("KNZ", "SHN"))
+```
+
+
+```{r}
+knz_sheds_burns |>
+  mutate(
+    NAME = na_if(trimws(NAME), "")
+  ) |>
+  ggplot() +
+  geom_sf(aes(fill = n_burns), color = "white", linewidth = 0.2) +
+  geom_sf(
+    data = aims_sheds,
+    fill = NA,
+    color = "cyan",
+    linewidth = 1
+  ) +
+  geom_sf_text(
+    aes(label = paste(NAME, "-", CODE)),
+    size = 3,
+    color = "white"
+  ) +
+  scale_fill_viridis_c(option = "inferno", na.value = "grey90") +
+  labs(
+    fill = "Burns Recorded",
+    title = "Konza Burns by Watershed"
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```

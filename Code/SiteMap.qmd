@@ -151,6 +151,18 @@ mw_sheds <- st_read(
 all_sheds <- bind_rows(gp_sheds, mw_sheds, se_sheds) |>
   st_transform("EPSG:5070")
 
+all_sheds |>
+  select(watershed) |>
+  st_simplify(dTolerance = 30) |> # 30 m, roughly Landsat pixel
+  st_transform(4326) |>
+  st_cast("MULTIPOLYGON") |>
+  st_write(
+    here("Data/all_sheds.geojson"),
+    driver = "GeoJSON",
+    layer_options = "COORDINATE_PRECISION=6",
+    delete_dsn = TRUE
+  )
+
 # Read and transform USA shapefile
 us_shp <- st_read(here("Data/USA_Shp/cb_2018_us_state_500k.shp")) |>
   filter(!STUSPS %in% c("AK", "AS", "VI", "HI", "GU", "MP", "PR")) |>
@@ -294,7 +306,7 @@ state_map <- ggplot() +
   scale_fill_manual(values = site_colors_connectivity, name = "Watershed") +
   coord_sf() +
   labs(x = "", y = "") +
-  theme_void() +
+  theme_void(base_family = "Helvetica") +
   theme(legend.position = "none")
 arid_legend <- state_map +
   theme(
@@ -355,13 +367,16 @@ state_map <- ggplot() +
   scale_fill_manual(values = site_colors, name = "Watershed") +
   coord_sf() +
   labs(x = "", y = "") +
-  theme_void() +
-  theme(legend.position = "none")
+  theme_void(base_family = "Helvetica") +
+  theme(
+    legend.position = "none",
+    text = element_text(family = "Helvetica")
+  )
 arid_legend <- state_map +
   theme(
     legend.position = "bottom",
-    legend.title = element_text(size = 35, hjust = 0.5), # bigger title text
-    legend.text = element_text(size = 25), # bigger label text
+    legend.title = element_text(size = 35, hjust = 0.5, family = "Helvetica"), # bigger title text
+    legend.text = element_text(size = 25, family = "Helvetica"), # bigger label text
     legend.key.height = unit(1.5, "cm"), # taller color bar
     legend.key.width = unit(6, "cm"), # longer color bar
   )
@@ -998,17 +1013,27 @@ nDays_watershed |>
 #   "TAL" = "EF-1", "PRF" = "EF-2", "WHR" = "EF-3",
 #   "GBJ" = "ND-1", "JDR" = "ND-2"
 # )
-
+# name_map <- c(
+#   "KNZ" = "DFA-1",
+#   "SHN" = "DFA-2",
+#   "YMR" = "CFA-1",
+#   "TAL" = "CFA-4",
+#   "PRF" = "CFA-3",
+#   "WHR" = "CFA-2",
+#   "GBJ" = "DFB-1",
+#   "JDR" = "DSB-1"
+# )
 name_map <- c(
-  "KNZ" = "DFA-1",
-  "SHN" = "DFA-2",
-  "YMR" = "CFA-1",
-  "TAL" = "CFA-4",
-  "PRF" = "CFA-3",
-  "WHR" = "CFA-2",
-  "GBJ" = "DFB-1",
-  "JDR" = "DSB-1"
+  JDR = "SA-1",
+  GBJ = "SA-2",
+  KNZ = "SP-1",
+  SHN = "SP-2",
+  YMR = "SP-3",
+  WHR = "HF-1",
+  PRF = "HF-2",
+  TAL = "HF-3"
 )
+
 
 shed_maps <- list()
 for (shed in names(all_dems)) {
@@ -1108,13 +1133,14 @@ for (shed in names(all_dems)) {
       text_cex = 2
     ) +
     labs(title = shed_title) +
-    theme_void() +
+    theme_void(base_family = "Helvetica") +
     theme(
       plot.title = element_text(
         color = site_colors[[shed]],
         face = "bold",
         size = 40,
-        hjust = 0.5
+        hjust = 0.5,
+        family = "Helvetica"
       )
     )
 
@@ -1216,17 +1242,18 @@ p <- ggplot() +
   ) +
   annotation_scale() +
   labs(title = shed) +
-  theme_void() +
+  theme_void(base_family = "Helvetica") +
   theme(
     plot.title = element_text(
       color = site_colors[[shed]],
       face = "bold",
       size = 14,
-      hjust = 0.5
+      hjust = 0.5,
+      text = element_text(family = "Helvetica")
     ),
     legend.position = "bottom",
-    legend.title = element_text(size = 35), # bigger title text
-    legend.text = element_text(size = 35), # bigger label text
+    legend.title = element_text(size = 35, family = "Helvetica"), # bigger title text
+    legend.text = element_text(size = 35, family = "Helvetica"), # bigger label text
     legend.key.height = unit(1.5, "cm"), # taller color bar
     legend.key.width = unit(2, "cm"),
     legend.spacing.x = unit(2, "cm") # gap between different legend elements

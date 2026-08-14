@@ -33,33 +33,41 @@ UTM_14N <- 26914
 # Streams and Sites
 
 ```{r}
-# knzS <- st_read("~/Desktop/AIMS_GreatPlains.gpkg", layer = "Streams") |> 
+# knzS <- st_read("~/Desktop/AIMS_GreatPlains.gpkg", layer = "Streams") |>
 #   st_transform(crs = 4326)
 
 # Load sites
-gpSites <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg", layer = "Sites") |> 
-  filter(watershed %in% c("KNZ", "SHN", "YMR")) |> 
-  st_transform(crs = 4326) |> 
+gpSites <- st_read(
+  "~/Dropbox/AIMS/GIS/Results/AIMS_GreatPlains.gpkg",
+  layer = "Sites"
+) |>
+  filter(watershed %in% c("KNZ", "SHN", "YMR")) |>
+  st_transform(crs = 4326) |>
   mutate(
     lon = st_coordinates(geom)[, "X"],
-    lat  = st_coordinates(geom)[, "Y"]
-  ) 
+    lat = st_coordinates(geom)[, "Y"]
+  )
 
-seSites <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_SouthEast.gpkg", layer = "sites") |> 
-  filter(!sublocation == "HW") |> 
+seSites <- st_read(
+  "~/Dropbox/AIMS/GIS/Results/AIMS_SouthEast.gpkg",
+  layer = "sites"
+) |>
+  filter(!sublocation == "HW") |>
   st_transform(4326) |>
   mutate(
     lon = st_coordinates(geom)[, 1],
     lat = st_coordinates(geom)[, 2]
-  ) 
+  )
 
-mwSites <- st_read("~/Dropbox/AIMS/GIS/Results/AIMS_MountainWest.gpkg", layer = "Sites") |> 
-  st_transform(4326) |> 
+mwSites <- st_read(
+  "~/Dropbox/AIMS/GIS/Results/AIMS_MountainWest.gpkg",
+  layer = "Sites"
+) |>
+  st_transform(4326) |>
   mutate(
     lon = st_coordinates(geom)[, 1],
     lat = st_coordinates(geom)[, 2]
-  ) 
-
+  )
 ```
 
 ```{r}
@@ -75,8 +83,21 @@ mwSites <- mwSites |>
 
 # Combine all into one
 allSites <- bind_rows(gpSites, seSites, mwSites)
-allSites <- allSites |> 
-  filter(siteId %in% c("SFM01", "SHM01", "ENM01", "TLM01", "WHM01", "PRM01", "GSS01", "DSS01", "JSS01"))
+allSites <- allSites |>
+  filter(
+    siteId %in%
+      c(
+        "SFM01",
+        "SHM01",
+        "ENM01",
+        "TLM01",
+        "WHM01",
+        "PRM01",
+        "GSS01",
+        "DSS01",
+        "JSS01"
+      )
+  )
 ```
 
 # Open ET
@@ -87,16 +108,43 @@ library(jsonlite)
 
 
 download_openet_et <- function(
-  api_key,
-  lon, lat,
+  lon,
+  lat,
   start_date = "2020-01-01",
   end_date = "2020-12-31",
   interval = "daily",
   model = "Ensemble",
-  variable = "ET"
+  variable = "ET",
+  cache_dir = here::here("Data", ".cache"),
+  refresh = FALSE
 ) {
+  dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+
+  cache_name <- sprintf(
+    "openet_%0.8f_%0.8f_%s_%s_%s_%s_%s.rds",
+    lon,
+    lat,
+    start_date,
+    end_date,
+    interval,
+    model,
+    variable
+  ) |>
+    gsub(
+      pattern = "[^A-Za-z0-9._-]",
+      replacement = "_",
+      x = _
+    )
+
+  cache_file <- file.path(cache_dir, cache_name)
+
+  # Return the cached result unless a fresh download is requested
+  if (file.exists(cache_file) && !refresh) {
+    return(readRDS(cache_file))
+  }
+
   url <- "https://openet-api.org/raster/timeseries/point"
-  
+
   body <- list(
     date_range = list(start_date, end_date),
     interval = interval,
@@ -107,74 +155,88 @@ download_openet_et <- function(
     units = "mm",
     file_format = "JSON"
   )
-  
-  response <- request(url) |>
-    req_method("POST") |>
-    req_headers(
-      Authorization = api_key,
+
+  response <- httr2::request(url) |>
+    httr2::req_method("POST") |>
+    httr2::req_headers(
+      Authorization = Sys.getenv("OPENET_API_KEY"),
       Accept = "application/json",
       `Content-Type` = "application/json"
     ) |>
-    req_body_json(body) |>
-    req_perform()
-  
-  # Check for HTTP error
+    httr2::req_body_json(body) |>
+    httr2::req_error(is_error = \(resp) FALSE) |>
+    httr2::req_perform()
+
   if (httr2::resp_status(response) >= 400) {
-    error_details <- tryCatch({
-      httr2::resp_body_json(response)$detail
-    }, error = function(e) {
-      httr2::resp_body_string(response)
-    })
-    stop(sprintf("OpenET API request failed [%d]: %s",
-                 httr2::resp_status(response), error_details))
+    error_details <- tryCatch(
+      httr2::resp_body_json(response)$detail,
+      error = function(e) httr2::resp_body_string(response)
+    )
+
+    stop(sprintf(
+      "OpenET API request failed [%d]: %s",
+      httr2::resp_status(response),
+      error_details
+    ))
   }
 
   result <- httr2::resp_body_json(response)
-  
-  tibble::tibble(
-    Date = as.Date(sapply(result, `[[`, "time")),
-    ET_mm = as.numeric(sapply(result, `[[`, "et"))
+
+  et_data <- tibble::tibble(
+    Date = as.Date(vapply(result, `[[`, character(1), "time")),
+    ET_mm = as.numeric(vapply(result, `[[`, numeric(1), "et"))
   )
+
+  saveRDS(et_data, cache_file)
+
+  et_data
 }
 
 
-api_key <- "NMWBgqRcOSktIVd3cWnv3uP5IjdGWGIfDIWRLtgOrTVyx1LtxC9uXeHi3JCW"
 start_date <- "2021-01-01"
 end_date <- "2025-01-01"
 
-
-et_all <- allSites |>
-  st_drop_geometry() |> 
-  mutate(
-    et_data = pmap(
+open_et <- allSites |>
+  sf::st_drop_geometry() |>
+  dplyr::mutate(
+    et_data = purrr::pmap(
       list(lon, lat),
       \(lon, lat) {
-        tryCatch({
+        tryCatch(
           download_openet_et(
-            api_key = api_key,
             lon = lon,
             lat = lat,
             start_date = start_date,
             end_date = end_date,
             interval = "daily"
-          )
-        }, error = function(e) {
-          warning(paste("Download failed for", lon, lat, ":", e$message))
-          NULL
-        })
+          ),
+          error = function(e) {
+            warning(
+              sprintf(
+                "Download failed for %s, %s: %s",
+                lon,
+                lat,
+                e$message
+              )
+            )
+            NULL
+          }
+        )
       }
     )
   ) |>
-  select(siteId, watershed, et_data) |>
-  unnest(et_data)
+  dplyr::select(siteId, watershed, et_data) |>
+  tidyr::unnest(et_data)
+```
 
-et_all <- et_all |> 
+```{r}
+et_all <- open_et |>
   select(Site = watershed, Date, ET_1d = ET_mm)
 
 et_all |>
   ggplot(aes(x = Date, y = ET_1d)) +
   geom_line() +
-  facet_wrap(~ Site, scales = "free_y") +
+  facet_wrap(~Site, scales = "free_y") +
   labs(
     title = "OpenET",
     x = "Date",
@@ -199,9 +261,9 @@ et_all_means <- et_all |>
 ```
 
 ```{r}
-modisET <- read_csv(here("Data/ET/MODIS_ET.csv")) |> 
-  select(siteId = ID, Date, ET_1d = MOD16A2GF_061_ET_500m) |> 
-  left_join(allSites |> st_drop_geometry() |> select(siteId, watershed)) |> 
+modisET <- read_csv(here("Data/ET/MODIS_ET.csv")) |>
+  select(siteId = ID, Date, ET_1d = MOD16A2GF_061_ET_500m) |>
+  left_join(allSites |> st_drop_geometry() |> select(siteId, watershed)) |>
   select(Site = watershed, Date, ET_1d)
 
 modisET_daily <- modisET |>
@@ -226,13 +288,13 @@ modisET_daily <- modisET_daily |>
     ET_30d = slide_dbl(ET_1d, mean, .before = 29, .complete = TRUE),
     ET_60d = slide_dbl(ET_1d, mean, .before = 59, .complete = TRUE)
   ) |>
-  ungroup() |> 
+  ungroup() |>
   write_csv(here("Data/ET/MODIS_Daily_ET.csv"))
 
 modisET_daily |>
   ggplot(aes(x = Date, y = ET_1d)) +
   geom_line() +
-  facet_wrap(~ Site, scales = "free_y") +
+  facet_wrap(~Site, scales = "free_y") +
   labs(
     title = "MODIS ET",
     x = "Date",
@@ -241,12 +303,370 @@ modisET_daily |>
   theme_few()
 ```
 
-## 
+##
 
 ```{r}
 
+modisET_daily <- modisET_daily |>
+  select(Site, Date, modisET = ET_1d)
+
+et_all <- et_all |>
+  select(Site, Date, openET = ET_1d)
+
+et <- modisET_daily |>
+  left_join(et_all, by = c("Site", "Date"))
 ```
 
 ```{r}
 
+et |>
+  ggplot(aes(openET, modisET)) +
+  geom_point() +
+  facet_wrap(~Site) +
+  theme_bw()
+```
+
+
+
+```{r}
+library(httr2)
+library(jsonlite)
+
+
+if (!nzchar(Sys.getenv("OPENET_API_KEY"))) {
+  stop("Set the OPENET_API_KEY environment variable first.")
+}
+
+all_sheds <- read_sf(here("Data/all_sheds.geojson"))
+
+# Validate and standardize the geometry
+all_sheds <- all_sheds |>
+  st_transform(4326) |>
+  st_make_valid()
+
+
+# Check request-area limits
+area_check <- tibble(
+  watershed = all_sheds$watershed,
+  area_acres = as.numeric(
+    units::set_units(
+      st_area(st_transform(all_sheds, 5070)),
+      "acre"
+    )
+  )
+)
+
+print(area_check)
+
+if (any(area_check$area_acres > 50000)) {
+  warning(
+    "At least one watershed exceeds the standard 50,000-acre ",
+    "OpenET per-request area limit. Check your account tier."
+  )
+}
+```
+
+```{r}
+geojson_file <- tempfile(fileext = ".geojson")
+
+st_write(
+  all_sheds |> select(watershed),
+  geojson_file,
+  driver = "GeoJSON",
+  quiet = TRUE
+)
+
+geojson <- read_json(geojson_file, simplifyVector = FALSE)
+unlink(geojson_file)
+
+# Give each request a complete, one-feature GeoJSON FeatureCollection
+watershed_geojson <- map(
+  geojson$features,
+  \(feature) {
+    list(
+      type = "FeatureCollection",
+      features = list(feature)
+    )
+  }
+)
+```
+
+```{r}
+get_openet_et <- function(
+  i,
+  year,
+  cache_dir = here::here("Data", ".cache"),
+  refresh = FALSE
+) {
+  watershed_id <- all_sheds$watershed[[i]]
+
+  dir.create(
+    cache_dir,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+
+  safe_watershed_id <- gsub(
+    "[^A-Za-z0-9._-]",
+    "_",
+    as.character(watershed_id)
+  )
+
+  cache_file <- file.path(
+    cache_dir,
+    sprintf(
+      "openet_polygon_%s_%d.rds",
+      safe_watershed_id,
+      year
+    )
+  )
+
+  # Return the saved result when it is already available
+  if (file.exists(cache_file) && !refresh) {
+    return(readRDS(cache_file))
+  }
+
+  request_body <- list(
+    date_range = c(
+      sprintf("%d-01-01", year),
+      sprintf("%d-12-31", year)
+    ),
+    interval = "daily",
+    overpass = FALSE,
+    geojson = watershed_geojson[[i]],
+    model = "Ensemble",
+    variable = "ET",
+    reference_et = "gridMET",
+    reducer = "mean",
+    version = 2.1,
+    units = "mm",
+    file_format = "JSON"
+  )
+
+  response <- httr2::request(
+    "https://openet-api.org/raster/timeseries/polygon"
+  ) |>
+    httr2::req_headers(
+      Authorization = Sys.getenv("OPENET_API_KEY"),
+      Accept = "application/json"
+    ) |>
+    httr2::req_body_json(request_body) |>
+    httr2::req_timeout(seconds = 600) |>
+    httr2::req_throttle(
+      capacity = 1,
+      fill_time_s = 3.1,
+      realm = "openet-api"
+    ) |>
+    httr2::req_retry(
+      max_tries = 5,
+      is_transient = \(resp) {
+        status <- httr2::resp_status(resp)
+
+        status %in%
+          c(429, 503) ||
+          (status == 400 &&
+            stringr::str_detect(
+              httr2::resp_body_string(resp),
+              stringr::fixed("Invalid geometry")
+            ))
+      },
+      backoff = \(failed_attempts) {
+        delay_cap <- min(
+          300,
+          15 * 2^(failed_attempts - 1)
+        )
+
+        stats::runif(
+          n = 1,
+          min = 0,
+          max = delay_cap
+        )
+      }
+    ) |>
+    httr2::req_error(
+      body = \(resp) {
+        paste0(
+          "OpenET response: ",
+          httr2::resp_body_string(resp)
+        )
+      }
+    ) |>
+    httr2::req_perform()
+
+  result <- httr2::resp_body_json(
+    response,
+    simplifyVector = TRUE
+  )
+
+  if (
+    is.list(result) &&
+      !is.data.frame(result) &&
+      "data" %in% names(result)
+  ) {
+    result <- result$data
+  }
+
+  result <- tibble::as_tibble(result)
+  names(result) <- tolower(names(result))
+
+  if (!all(c("time", "et") %in% names(result))) {
+    stop(
+      "Unexpected OpenET response for ",
+      watershed_id,
+      " in ",
+      year,
+      ". Columns returned: ",
+      paste(names(result), collapse = ", ")
+    )
+  }
+
+  et_data <- result |>
+    dplyr::transmute(
+      watershed = watershed_id,
+      date = as.Date(time),
+      et_mm = as.numeric(et)
+    )
+
+  saveRDS(et_data, cache_file)
+
+  et_data
+}
+```
+
+
+```{r}
+jobs <- tidyr::crossing(
+  watershed_index = seq_len(nrow(all_sheds)),
+  year = 2021:2025
+)
+
+results <- vector("list", nrow(jobs))
+
+for (j in 2:nrow(jobs)) {
+  i <- jobs$watershed_index[[j]]
+  year <- jobs$year[[j]]
+
+  cli::cli_alert_info(
+    "{.strong [{j}/{nrow(jobs)}]} {all_sheds$watershed[[i]]}, {year}"
+  )
+
+  Sys.sleep(5)
+  results[[j]] <- get_openet_et(i, year)
+}
+```
+
+
+```{r}
+
+openet_et <- purrr::list_rbind(results) |>
+  arrange(watershed, date)
+
+
+openet_et |>
+  ggplot(aes(x = date, y = et_mm)) +
+  geom_line() +
+  facet_wrap(~watershed, scales = "free_y") +
+  labs(
+    title = "openET",
+    x = "Date",
+    y = "ET (mm/day)"
+  ) +
+  theme_few()
+```
+
+
+
+```{r}
+et_compare <- modisET_daily |>
+  transmute(
+    site = Site,
+    date = Date,
+    modis_et_mm = modisET
+  ) |>
+  inner_join(
+    openet_et |>
+      transmute(
+        site = watershed,
+        date = date,
+        openet_et_mm = et_mm
+      ),
+    by = c("site", "date")
+  ) |>
+  filter(
+    is.finite(modis_et_mm),
+    is.finite(openet_et_mm)
+  ) |>
+  mutate(
+    difference_mm = openet_et_mm - modis_et_mm
+  )
+
+ggplot(
+  et_compare,
+  aes(x = modis_et_mm, y = openet_et_mm)
+) +
+  geom_hex() +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    color = "red"
+  ) +
+  facet_wrap(~site) +
+  labs(
+    x = "MODIS ET (mm/day)",
+    y = "OpenET ET (mm/day)",
+    fill = "Count"
+  ) +
+  theme_bw()
+```
+
+
+```{r}
+
+r2_labels <- et_compare |>
+  group_by(site) |>
+  summarise(
+    r_squared = summary(
+      lm(openet_et_mm ~ modis_et_mm)
+    )$r.squared,
+    .groups = "drop"
+  ) |>
+  mutate(
+    label = sprintf("R² = %.3f", r_squared)
+  )
+
+ggplot(
+  et_compare,
+  aes(x = modis_et_mm, y = openet_et_mm)
+) +
+  geom_hex() +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    color = "red",
+    linetype = "dashed"
+  ) +
+  geom_smooth(
+    method = "lm",
+    formula = y ~ x,
+    se = FALSE,
+    color = "blue"
+  ) +
+  geom_text(
+    data = r2_labels,
+    aes(
+      x = -Inf,
+      y = Inf,
+      label = label
+    ),
+    inherit.aes = FALSE,
+    hjust = -0.2,
+    vjust = 1.3
+  ) +
+  facet_wrap(~site) +
+  labs(
+    x = "MODIS ET (mm/day)",
+    y = "OpenET ET (mm/day)",
+    fill = "Count"
+  ) +
+  theme_bw()
 ```

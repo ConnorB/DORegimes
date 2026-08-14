@@ -41,25 +41,42 @@ site_colors <- tibble(
     "#83A102"
   )
 )
+
 ```
 
 ```{r}
 #| label: Set Theme
 theme_set(
-  theme_bw() +
+  theme_bw(base_family = "Helvetica") +
     theme(
-      text = element_text(size = 20), # overall text size
-      legend.text = element_text(size = 20), # legend entries
-      legend.title = element_text(size = 20), # legend title
-      axis.title.x = element_text(size = 20, face = "bold"), # axis titles
-      axis.title.y = element_text(size = 20, face = "bold"), # axis titles
-      axis.text = element_text(size = 20), # axis tick labels
-      plot.title = element_text(size = 20, hjust = 0.5, face = "bold"),
+      text = element_text(size = 20, family = "Helvetica"), # overall text size
+      legend.text = element_text(size = 20, family = "Helvetica"), # legend entries
+      legend.title = element_text(size = 20, family = "Helvetica"), # legend title
+      axis.title.x = element_text(
+        size = 20,
+        face = "bold",
+        family = "Helvetica"
+      ), # axis titles
+      axis.title.y = element_text(
+        size = 20,
+        face = "bold",
+        family = "Helvetica"
+      ), # axis titles
+      axis.text = element_text(size = 20, family = "Helvetica"), # axis tick labels
+      plot.title = element_text(
+        size = 20,
+        hjust = 0.5,
+        face = "bold",
+        family = "Helvetica"
+      ),
       legend.position = "bottom",
-      plot.tag = element_text(size = 20, face = "bold"),
+      plot.tag = element_text(size = 20, face = "bold", family = "Helvetica"),
       strip.background = element_blank()
     )
 )
+update_geom_defaults("text", list(family = "Helvetica"))
+update_theme(geom = element_geom(family = "Helvetica"))
+update_geom_defaults("text_repel", list(family = "Helvetica"))
 ```
 
 # Load Data
@@ -435,10 +452,10 @@ n_days <- dailyDat |>
   )
 site_koppen <- read_csv(here("Metadata/aims_koppen_geiger.csv")) |>
   mutate(
-    hydro_clim = case_when(
-      Site %in% c("KNZ", "SHN", "YMR") ~ "Cold Humid",
-      Site %in% c("TAL", "WHR", "PRF") ~ "Warm Humid",
-      Site %in% c("GBJ", "JDR") ~ "Cold Dry"
+    kg_zone = case_when(
+      Site %in% c("KNZ", "SHN", "YMR") ~ "SP",
+      Site %in% c("TAL", "WHR", "PRF") ~ "HF",
+      Site %in% c("GBJ", "JDR") ~ "SA"
     )
   ) |>
   group_by(kg_zone) |>
@@ -477,14 +494,17 @@ site_meta <- site_meta |>
     kg_name = fct_reorder(kg_name, lon)
   )
 
+site_meta |>
+  write_csv(here("Data/site_meta.csv"))
+
 site_info <- site_meta |>
   left_join(n_days) |>
   mutate(
     n_years = n_days_upstream / 365.25,
     Region = case_when(
-      Site %in% c("KNZ", "SHN", "YMR") ~ "Great Plains",
-      Site %in% c("TAL", "WHR", "PRF") ~ "Eastern Temperate Forests",
-      Site %in% c("GBJ", "JDR") ~ "North American Deserts"
+      Site %in% c("KNZ", "SHN", "YMR") ~ "Subhumid Prairie",
+      Site %in% c("TAL", "WHR", "PRF") ~ "Humid Subtropical Forests",
+      Site %in% c("GBJ", "JDR") ~ "Semi-Arid"
     )
   )
 
@@ -626,7 +646,8 @@ flow_prop <- dailyDat |>
   summarise(
     total_days = n(),
     days_with_flow = sum(Q_1d > 0, na.rm = TRUE),
-    prop_flowing = days_with_flow / total_days
+    prop_flowing = days_with_flow / total_days,
+    .groups = "drop"
   )
 
 flow_prop |>
@@ -646,7 +667,7 @@ flow_prop |>
 ggsave(
   filename = "flowProp.png",
   path = here("Figs/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 20,
   height = 20,
   units = "cm",
@@ -662,7 +683,8 @@ q50 <- dailyDat |>
   summarize(
     days_below_50th = sum(Q_1d < median(Q_1d, na.rm = TRUE), na.rm = TRUE),
     total_days = sum(!is.na(Q_1d)),
-    median_Q = median(Q_1d, na.rm = TRUE)
+    median_Q = median(Q_1d, na.rm = TRUE),
+    .groups = "drop_last"
   )
 
 q50 |>
@@ -681,7 +703,7 @@ q50 |>
 ggsave(
   filename = "q50.png",
   path = here("Figs/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 20,
   height = 20,
   units = "cm",
@@ -691,9 +713,9 @@ ggsave(
 dailyDat |>
   mutate(
     Region = case_when(
-      Site %in% c("KNZ", "SHN", "YMR") ~ "Great Plains",
-      Site %in% c("TAL", "WHR", "PRF") ~ "Eastern Temperate Forests",
-      Site %in% c("GBJ", "JDR") ~ "North American Deserts"
+      Site %in% c("KNZ", "SHN", "YMR") ~ "Subhumid Prairie",
+      Site %in% c("TAL", "WHR", "PRF") ~ "Humid Subtropical Forests",
+      Site %in% c("GBJ", "JDR") ~ "Semi-Arid"
     ),
     Region = factor(
       Region,
@@ -728,7 +750,7 @@ dailyDat |>
 ggsave(
   filename = "asdnPerc.png",
   path = here("Figs/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 20,
   height = 20,
   units = "cm",
@@ -738,9 +760,9 @@ ggsave(
 dailyDat |>
   mutate(
     Region = case_when(
-      Site %in% c("KNZ", "SHN", "YMR") ~ "Great Plains",
-      Site %in% c("TAL", "WHR", "PRF") ~ "Eastern Temperate Forests",
-      Site %in% c("GBJ", "JDR") ~ "North American Deserts"
+      Site %in% c("KNZ", "SHN", "YMR") ~ "Subhumid Prairie",
+      Site %in% c("TAL", "WHR", "PRF") ~ "Humid Subtropical Forests",
+      Site %in% c("GBJ", "JDR") ~ "Semi-Arid"
     ),
     Region = factor(
       Region,
@@ -775,7 +797,7 @@ dailyDat |>
 ggsave(
   filename = "audnPerc.png",
   path = here("Figs/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 20,
   height = 20,
   units = "cm",
@@ -785,9 +807,9 @@ ggsave(
 dailyDat |>
   mutate(
     Region = case_when(
-      Site %in% c("KNZ", "SHN", "YMR") ~ "Great Plains",
-      Site %in% c("TAL", "WHR", "PRF") ~ "Eastern Temperate Forests",
-      Site %in% c("GBJ", "JDR") ~ "North American Deserts"
+      Site %in% c("KNZ", "SHN", "YMR") ~ "Subhumid Prairie",
+      Site %in% c("TAL", "WHR", "PRF") ~ "Humid Subtropical Forests",
+      Site %in% c("GBJ", "JDR") ~ "Semi-Arid"
     ),
     Region = factor(
       Region,
@@ -817,7 +839,7 @@ dailyDat |>
 ggsave(
   filename = "PercNetWet.png",
   path = here("Figs/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 20,
   height = 20,
   units = "cm",
@@ -827,9 +849,9 @@ ggsave(
 dailyDat |>
   mutate(
     Region = case_when(
-      Site %in% c("KNZ", "SHN", "YMR") ~ "Great Plains",
-      Site %in% c("TAL", "WHR", "PRF") ~ "Eastern Temperate Forests",
-      Site %in% c("GBJ", "JDR") ~ "North American Deserts"
+      Site %in% c("KNZ", "SHN", "YMR") ~ "Subhumid Prairie",
+      Site %in% c("TAL", "WHR", "PRF") ~ "Humid Subtropical Forests",
+      Site %in% c("GBJ", "JDR") ~ "Semi-Arid"
     ),
     Region = factor(
       Region,
@@ -859,7 +881,7 @@ dailyDat |>
 ggsave(
   filename = "AlphaCentrality.png",
   path = here("Figs/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 20,
   height = 20,
   units = "cm",
@@ -869,9 +891,9 @@ ggsave(
 dailyDat |>
   mutate(
     Region = case_when(
-      Site %in% c("KNZ", "SHN", "YMR") ~ "Great Plains",
-      Site %in% c("TAL", "WHR", "PRF") ~ "Eastern Temperate Forests",
-      Site %in% c("GBJ", "JDR") ~ "North American Deserts"
+      Site %in% c("KNZ", "SHN", "YMR") ~ "Subhumid Prairie",
+      Site %in% c("TAL", "WHR", "PRF") ~ "Humid Subtropical Forests",
+      Site %in% c("GBJ", "JDR") ~ "Semi-Arid"
     ),
     Region = factor(
       Region,
@@ -901,7 +923,7 @@ dailyDat |>
 ggsave(
   filename = "AlphaCentralityWeighted.png",
   path = here("Figs/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 20,
   height = 20,
   units = "cm",
@@ -926,7 +948,8 @@ runoff50 <- dailyDat |>
   summarize(
     days_below_50th = sum(runoff < median(runoff, na.rm = TRUE), na.rm = TRUE),
     total_days = sum(!is.na(runoff)),
-    median_runoff = median(runoff, na.rm = TRUE)
+    median_runoff = median(runoff, na.rm = TRUE),
+    .groups = "drop_last"
   )
 
 runoff50 |>
@@ -945,7 +968,7 @@ runoff50 |>
 ggsave(
   filename = "runoff50.png",
   path = here("Figs/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 20,
   height = 20,
   units = "cm",
@@ -986,9 +1009,9 @@ peakDry <- dailyDat |>
 vline_dat <- peakDry |>
   mutate(
     Region = case_when(
-      Site %in% c("KNZ", "SHN", "YMR") ~ "Great Plains",
-      Site %in% c("TAL", "WHR", "PRF") ~ "Eastern Temperate Forests",
-      Site %in% c("GBJ", "JDR") ~ "North American Deserts",
+      Site %in% c("KNZ", "SHN", "YMR") ~ "Subhumid Prairie",
+      Site %in% c("TAL", "WHR", "PRF") ~ "Humid Subtropical Forests",
+      Site %in% c("GBJ", "JDR") ~ "Semi-Arid",
       TRUE ~ NA_character_
     ),
     Region = factor(
@@ -1010,9 +1033,9 @@ vline_dat <- peakDry |>
 dailyDat |>
   mutate(
     Region = case_when(
-      Site %in% c("KNZ", "SHN", "YMR") ~ "Great Plains",
-      Site %in% c("TAL", "WHR", "PRF") ~ "Eastern Temperate Forests",
-      Site %in% c("GBJ", "JDR") ~ "North American Deserts"
+      Site %in% c("KNZ", "SHN", "YMR") ~ "Subhumid Prairie",
+      Site %in% c("TAL", "WHR", "PRF") ~ "Humid Subtropical Forests",
+      Site %in% c("GBJ", "JDR") ~ "Semi-Arid"
     ),
     Region = factor(
       Region,
@@ -1057,17 +1080,17 @@ dailyDat |>
 ggsave(
   filename = "peak_to_dry_overtime.png",
   path = here("Figs/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 40,
   height = 20,
   units = "cm",
   dpi = 600
 )
 peak_to_dry <- peakDry |>
-  group_by(Site, kg_name) |>
   summarise(
     mean_days_peak_to_min = mean(days_peak_to_min, na.rm = TRUE),
-    n_years = n()
+    n_years = n(),
+    .by = c(Site, kg_name)
   )
 
 peak_to_dry |>
@@ -1086,7 +1109,7 @@ peak_to_dry |>
 ggsave(
   filename = "peak_to_dry.png",
   path = here("Figs/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 20,
   height = 20,
   units = "cm",
@@ -1100,9 +1123,9 @@ mw_q_plt <- dailyDat |>
   mutate(
     Year = lubridate::year(Date),
     Region = case_when(
-      Site %in% c("KNZ", "SHN", "YMR") ~ "Great Plains",
-      Site %in% c("TAL", "WHR", "PRF") ~ "Eastern Temperate Forests",
-      Site %in% c("GBJ", "JDR") ~ "North American Deserts"
+      Site %in% c("KNZ", "SHN", "YMR") ~ "Subhumid Prairie",
+      Site %in% c("TAL", "WHR", "PRF") ~ "Humid Subtropical Forests",
+      Site %in% c("GBJ", "JDR") ~ "Semi-Arid"
     )
   ) |>
   filter(Site %in% c("GBJ", "JDR")) |>
@@ -1149,7 +1172,7 @@ ggsave(
   filename = "MW_Q.png",
   plot = mw_q_plt,
   path = here("Figs/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 40,
   height = 20,
   units = "cm",
@@ -1204,7 +1227,7 @@ ggsave(
   filename = "runoff_excProb.png",
   plot = runoff_expProb,
   path = here("Figs/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 20,
   height = 20,
   units = "cm",
@@ -1237,7 +1260,7 @@ ggsave(
   filename = "runoff.png",
   plot = runoff_plt,
   path = here("Figs/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 40,
   height = 20,
   units = "cm",
@@ -1296,7 +1319,7 @@ ggsave(
   filename = "doExcProb.png",
   plot = doExcProb,
   path = here("Figs/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 20,
   height = 20,
   units = "cm",
@@ -1311,7 +1334,7 @@ ggsave(
   filename = "excProb.png",
   plot = excProb_plt,
   path = here("Figs/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 40,
   height = 20,
   units = "cm",
@@ -1435,7 +1458,7 @@ ggsave(
   filename = "ASDN.png",
   plot = p,
   path = here("Figs/Misc/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 40,
   height = 20,
   units = "cm",
@@ -1466,7 +1489,7 @@ ggsave(
   filename = "percWet_ASDN.png",
   plot = p,
   path = here("Figs/Misc/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 40,
   height = 20,
   units = "cm",
@@ -1506,7 +1529,7 @@ ggsave(
   filename = "a_cent_asdn.png",
   plot = p,
   path = here("Figs/Misc/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 40,
   height = 20,
   units = "cm",
@@ -1545,7 +1568,7 @@ ggsave(
   filename = "a_cent_perc_wet.png",
   plot = p,
   path = here("Figs/Misc/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 40,
   height = 20,
   units = "cm",
@@ -1763,7 +1786,7 @@ ggsave(
   filename = "doPCA.png",
   plot = do_pca_plt,
   path = here("Figs/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 20,
   height = 20,
   units = "cm",
@@ -1824,6 +1847,8 @@ pca_table_png
 # Other Clustering on DO Metrics
 
 ```{r}
+#| eval: false
+
 library(ggdendro)
 library(cluster)
 
@@ -1876,6 +1901,7 @@ do_distance <- dist(feature_matrix_scaled, method = "euclidean")
 ```
 
 ```{r}
+#| eval: false
 # Helper functions
 calculate_silhouette_widths <- function(
   hc,
@@ -2084,6 +2110,7 @@ plot_colored_dendrogram <- function(
 ```
 
 ```{r}
+#| eval: false
 # Principal component analysis
 # PCA is used only for two-dimensional visualization of the clusters.
 pca_result <- prcomp(feature_matrix_scaled)
@@ -2209,6 +2236,8 @@ plot_colored_dendrogram(
 ```
 
 ```{r}
+#| eval: false
+
 # Keep an index so you can join cluster labels back, then pull the numeric DO profile and drop incomplete days
 do_clean <- do_metrics_daily |>
   mutate(row_id = row_number()) |>
@@ -2299,6 +2328,8 @@ print(table(res_h$cluster))
 ```
 
 ```{r}
+#| eval: false
+
 # suppressPackageStartupMessages({
 #   library(mclust)
 #   library(diptest)
@@ -2422,6 +2453,7 @@ print(round(cb$bootmean, 2))
 
 # K-Means & PCA with & w/o Mean DO
 ```{r}
+#| eval: false
 majority_rule <- 3
 
 run_pca_kmeans <- function(data, predictors, k) {
@@ -2494,6 +2526,8 @@ table(comparison$Cluster_no_mean, comparison$Cluster_with_mean)
 
 # K-Means on Raw DO with & w/o Mean DO
 ```{r}
+#| eval: false
+
 run_kmeans_raw <- function(data, predictors, k) {
   raw_data <- data |>
     select(kg_name, Date, all_of(predictors)) |>
@@ -2538,6 +2572,8 @@ scores_raw_with_mean <- run_kmeans_raw(dailyDat, vars_with_mean, majority_rule)
 
 # Compare K-Means with & w/o PCA and with & w/o Mean DO
 ```{r}
+#| eval: false
+
 all_clusters <- scores_no_mean |>
   select(kg_name, Date, PCA_no_mean = Cluster) |>
   inner_join(
@@ -2577,6 +2613,8 @@ agreement_summary
 table(all_clusters$PCA_no_mean, all_clusters$Raw_no_mean)
 ```
 ```{r}
+#| eval: false
+
 library(ggalluvial)
 
 alluvial_data <- all_clusters |>
@@ -2658,7 +2696,7 @@ ggsave(
   filename = "cluster_alluvial_pca_mean_do_effect.png",
   plot = alluvial_plt_pca,
   path = here("Figs/Supplement/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 18,
   height = 15,
   units = "cm",
@@ -2733,7 +2771,7 @@ ggsave(
   filename = "cluster_alluvial_pca_vs_raw_disagreement.png",
   plot = alluvial_plt_method,
   path = here("Figs/Supplement/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 18,
   height = 15,
   units = "cm",
@@ -2744,6 +2782,8 @@ ggsave(
 # K-Means on Raw DO
 
 ```{r}
+#| eval: false
+
 # Prepare daily dissolved oxygen metrics
 do_metrics_daily <- dailyDat |>
   select(
@@ -3207,7 +3247,8 @@ kmeans_plt <- ggplot(pca_scores, aes(x = PC1, y = PC2)) +
     data = loadings,
     aes(x = PC1 * 1.1, y = PC2 * 1.1, label = var_label),
     size = 5,
-    direction = "both"
+    direction = "both",
+    seed = 42
   ) +
   scale_color_manual(values = cluster_colors) +
   scale_fill_manual(values = cluster_colors) +
@@ -3225,16 +3266,205 @@ kmeans_plt <- ggplot(pca_scores, aes(x = PC1, y = PC2)) +
   ) +
   theme(legend.box = "vertical")
 kmeans_plt
+
 # Save the plot
 ggsave(
   filename = "kmeansPCA.png",
   plot = kmeans_plt,
   path = here("Figs/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 20,
   height = 20,
   units = "cm",
-  dpi = "retina"
+  dpi = 600
+)
+
+state_labels <- tibble::tibble(
+  PC1 = c(2.6, -4.0, -1.2),
+  PC2 = c(-2.6, 6.6, -2.6),
+  Cluster = factor(c(1, 2, 3)),
+  label = c(
+    "State 1: Stable High DO & Low Amplitude",
+    "State 2: Transitional High Amplitude & wide range in DO",
+    "State 3: Hypoxic Low DO & Low Amplitude"
+  )
+)
+box_fills <- colorspace::lighten(cluster_colors[c("1", "2", "3")], amount = 0.8)
+
+
+kmeans_plt_labeled <- kmeans_plt +
+  ggtext::geom_textbox(
+    data = state_labels,
+    aes(x = PC1, y = PC2, label = label),
+    width = unit(4, "cm"),
+    halign = 0.5,
+    box.r = unit(0.5, "lines"),
+    box.colour = cluster_colors,
+    fill = box_fills,
+    family = "Helvetica"
+  )
+
+# Save the plot
+# ggsave(
+#   filename = "kmeansPCA_labeled.png",
+#   plot = kmeans_plt_labeled,
+#   path = here("Figs/"),
+#   device = ragg::agg_png,
+#   width = 20,
+#   height = 20,
+#   units = "cm",
+#   dpi = 600
+# )
+```
+
+
+```{r}
+# Descriptive names for k-means clusters
+state_names <- c(
+  "1" = "Oxygenated",
+  "2" = "Transitional",
+  "3" = "Hypoxic"
+)
+
+pca_scores <- pca_scores |>
+  dplyr::mutate(
+    DO_state = factor(
+      state_names[as.character(Cluster)],
+      levels = c("Oxygenated", "Transitional", "Hypoxic")
+    )
+  )
+
+# Rename colors so they correspond to the descriptive state names
+state_colors <- setNames(
+  cluster_colors[c("1", "2", "3")],
+  c("Oxygenated", "Transitional", "Hypoxic")
+)
+
+loadings <- loadings |>
+  dplyr::mutate(
+    len = sqrt(PC1^2 + PC2^2),
+    lab_x = PC1 + 1 * PC1 / len,
+    lab_y = PC2 + 1 * PC2 / len
+  )
+
+kmeans_plt <- ggplot(pca_scores, aes(x = PC1, y = PC2)) +
+  geom_point(
+    aes(
+      fill = DO_state,
+      shape = kg_name,
+      color = DO_state
+    ),
+    size = 3,
+    alpha = 0.6,
+    stroke = 0.3
+  ) +
+  stat_ellipse(
+    aes(color = DO_state),
+    geom = "polygon",
+    level = 0.95,
+    alpha = 0.2,
+    fill = NA
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_segment(
+    data = loadings,
+    aes(
+      x = 0,
+      y = 0,
+      xend = PC1,
+      yend = PC2
+    ),
+    inherit.aes = FALSE,
+    arrow = arrow(length = unit(0.2, "cm")),
+    color = "black"
+  ) +
+  geom_text_repel(
+    data = loadings,
+    aes(
+      x = PC1,
+      y = PC2,
+      label = var_label
+    ),
+    inherit.aes = FALSE,
+    size = 5,
+    direction = "both",
+    seed = 42
+  ) +
+  expand_limits(x = c(-5.5, 3.5)) +
+  scale_color_manual(values = state_colors) +
+  scale_fill_manual(values = state_colors) +
+  scale_shape_manual(
+    values = setNames(site_meta$shape, site_meta$kg_name),
+    breaks = levels(site_meta$kg_name)
+  ) +
+  labs(
+    x = pc1_label,
+    y = pc2_label,
+    shape = "Watershed",
+    color = "DO State",
+    fill = "DO State"
+  ) +
+  theme(
+    legend.box = "vertical"
+  )
+
+kmeans_plt
+
+state_labels <- tibble::tibble(
+  PC1 = c(1.6, -4.0, -1.6),
+  PC2 = c(-1.8, 5.6, -3),
+  DO_state = c("Oxygenated", "Transitional", "Hypoxic"),
+  label = c(
+    "**Oxygenated (State 1)**<br>High DO & low amplitude",
+    "**Transitional (State 2)**<br>High amplitude & wide<br>DO range",
+    "**Hypoxic (State 3)**<br>Low DO & low amplitude"
+  )
+)
+
+box_fills <- c(
+  "Oxygenated" = "#3b82f620",
+  "Transitional" = "#009e7320",
+  "Hypoxic" = "#e69f0020"
+)
+
+
+kmeans_plt_labeled <- kmeans_plt
+
+for (state in names(state_colors)) {
+  dat <- state_labels |>
+    dplyr::filter(DO_state == state)
+
+  kmeans_plt_labeled <- kmeans_plt_labeled +
+    ggtext::geom_textbox(
+      data = dat,
+      aes(
+        x = PC1,
+        y = PC2,
+        label = label
+      ),
+      inherit.aes = FALSE,
+      #  width = unit(4.1, "cm"),
+      halign = 0.5,
+      box.r = unit(0.5, "lines"),
+      box.colour = box_fills[state],
+      fill = box_fills[state],
+      family = "Helvetica"
+    )
+}
+
+# kmeans_plt_labeled
+
+# Save the plot
+ggsave(
+  filename = "kmeansPCA_labeled.png",
+  plot = kmeans_plt_labeled,
+  path = here("Figs/"),
+  device = ragg::agg_png,
+  width = 20,
+  height = 20,
+  units = "cm",
+  dpi = 600
 )
 ```
 
@@ -3304,7 +3534,7 @@ ggsave(
   filename = "site_cluster_metric.png",
   plot = site_cluster_plt,
   path = here("Figs/Supplement"),
-  device = "png",
+  device = ragg::agg_png,
   width = 40,
   height = 20,
   units = "cm",
@@ -3316,6 +3546,9 @@ ggsave(
 
 ```{r}
 library(vegan)
+# Set up cluster backend, vegan has to use PSOCK clusters for parallelization
+n_workers <- parallelly::availableCores(omit = 1)
+cl <- parallelly::makeClusterPSOCK(n_workers)
 # MRPP Validation
 mrpp_data <- pca_scores |> select(PC1:PC2) |> as.matrix()
 
@@ -3324,7 +3557,8 @@ mrpp_result <- mrpp(
   dat = mrpp_data,
   grouping = pca_scores$Cluster,
   permutations = 1000,
-  distance = "euclidean"
+  distance = "euclidean",
+  parallel = cl
 )
 
 # Group by Site instead of clusters
@@ -3332,8 +3566,12 @@ site_mrpp <- mrpp(
   dat = mrpp_data,
   grouping = pca_scores$kg_name,
   permutations = 1000,
-  distance = "euclidean"
+  distance = "euclidean",
+  parallel = cl
 )
+
+# Stop cluster
+parallel::stopCluster(cl)
 
 # Display results
 cli::cli_inform(c(
@@ -3410,17 +3648,17 @@ doDates <- clustered_dat |>
   ) |>
   mutate(
     WinterStart = case_when(
-      kg_name == "CFA-1" & Year == "2021" ~ as_date("2021-12-20"),
+      kg_name == "SP-3" & Year == "2021" ~ as_date("2021-12-20"),
       T ~ WinterStart
     ),
     WinterStart_preY = case_when(
-      kg_name == "CFA-1" & Year == "2022" ~ as_date("2021-12-20"),
+      kg_name == "SP-3" & Year == "2022" ~ as_date("2021-12-20"),
       T ~ WinterStart_preY
     )
   ) |>
   mutate(
     WinterStart_preY = case_when(
-      kg_name == "DFA-2" & Year == "2023" ~ NA,
+      kg_name == "SP-2" & Year == "2023" ~ NA,
       T ~ WinterStart_preY
     )
   )
@@ -3428,7 +3666,7 @@ doDates <- clustered_dat |>
 
 # Create separate data frame for the SHN pre-first-date grey box
 preFirstDate_SHN <- doDates |>
-  filter(kg_name == "DFA-2") |>
+  filter(kg_name == "SP-2") |>
   mutate(
     xmin = as.Date("2021-06-01"), # or your actual xlim min
     xmax = first_date,
@@ -3470,7 +3708,7 @@ ggsave(
   filename = "Average.png",
   plot = p,
   path = here("Figs/ClusterTimeseries"),
-  device = "png",
+  device = ragg::agg_png,
   width = 25.4,
   height = 25.4,
   units = "cm",
@@ -3483,7 +3721,7 @@ doDates <- doDates |>
 
 clustered_dat |>
   filter(year(Date) == 2024) |>
-  filter(!(kg_name == "CFA-4" & Date == as_date("2024-01-01"))) |>
+  filter(!(kg_name == "HF-4" & Date == as_date("2024-01-01"))) |>
   ggplot(aes(x = Date)) +
   geom_point(
     aes(y = avgDO.pctsat, color = Cluster),
@@ -3521,7 +3759,7 @@ ggsave(
   filename = "Average_2024.png",
   plot = p,
   path = here("Figs/ClusterTimeseries"),
-  device = "png",
+  device = ragg::agg_png,
   width = 25.4,
   height = 25.4,
   units = "cm",
@@ -3529,7 +3767,7 @@ ggsave(
 )
 
 clustered_dat |>
-  filter(!(kg_name == "CFA-4" & Date == as_date("2024-01-01"))) |>
+  filter(!(kg_name == "HF-4" & Date == as_date("2024-01-01"))) |>
   filter(year(Date) == 2024) |>
   ggplot(aes(x = Date)) +
   geom_point(
@@ -3578,7 +3816,7 @@ ggsave(
   filename = "Average_2024_PercentWet.png",
   plot = p,
   path = here("Figs/ClusterTimeseries"),
-  device = "png",
+  device = ragg::agg_png,
   width = 25.4,
   height = 25.4,
   units = "cm",
@@ -3590,17 +3828,19 @@ ggsave(
 
 ```{r}
 clustered_dat |>
-  filter(!(kg_name == "CFA-4" & Date == as_date("2024-01-01"))) |>
+  filter(!(Site == "TAL" & Date == as_date("2024-01-01"))) |>
   filter(
-    (kg_name %in% c("DFA-1", "DFA-2", "CFA-1", "CFA-4") & year(Date) == 2024) |
-      (kg_name %in% c("DSB-1", "CFA-2", "CFA-3") & year(Date) == 2023) |
-      (kg_name %in% c("DFB-1") & year(Date) == 2022)
+    (Site %in% c("KNZ", "TAL", "YMR") & year(Date) == 2024) |
+      (Site %in% c("SHN", "WHR", "PRF", "JDR") & year(Date) == 2023) |
+      (Site %in% c("GBJ") & year(Date) == 2022)
   ) |>
   mutate(
     Year = year(Date),
     SiteLabel = paste(kg_name, Year),
     fakeDate = as.Date(paste0("2000-", month(Date), "-", day(Date)))
   ) |>
+  arrange(kg_name, Year) |>
+  mutate(SiteLabel = factor(SiteLabel, levels = unique(SiteLabel))) |>
   ggplot(aes(x = fakeDate)) +
   geom_point(
     aes(y = avgDO.pctsat, color = Cluster),
@@ -3617,7 +3857,8 @@ clustered_dat |>
   facet_wrap(~SiteLabel, scales = "fixed", ncol = 2, drop = FALSE) +
   scale_color_manual(
     values = cluster_colors,
-    name = "State",
+    name = "",
+    labels = c("Oxygenated", "Transitional", "Hypoxic"),
     na.translate = FALSE
   ) +
   xlim(as_date("2000-01-01"), as_date("2000-12-01")) +
@@ -3633,13 +3874,13 @@ clustered_dat |>
   ) +
   labs(x = "") +
   theme(
+    text = element_text(size = 20, family = "Helvetica"),
+    strip.text = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 20),
+    legend.title = element_text(size = 20),
+    axis.title = element_text(size = 20),
+    axis.text = element_text(size = 20),
     axis.text.x = element_text(angle = 45, hjust = 1),
-    strip.text = element_text(size = 12),
-    text = element_text(size = 20), # overall text size
-    legend.text = element_text(size = 20), # legend entries
-    legend.title = element_text(size = 20), # legend title
-    axis.title = element_text(size = 20), # axis titles
-    axis.text = element_text(size = 20), # axis tick labels
     plot.title = element_text(size = 20, hjust = 0.5),
     legend.position = "bottom"
   ) -> p
@@ -3649,7 +3890,7 @@ ggsave(
   filename = "Average_YEAR_PercentWet.png",
   plot = p,
   path = here("Figs/ClusterTimeseries"),
-  device = "png",
+  device = ragg::agg_png,
   width = 40,
   height = 25.4,
   units = "cm",
@@ -3657,41 +3898,43 @@ ggsave(
 )
 
 
-# year_map <- c(
-#   "GP-1" = 2024,
-#   "GP-2" = 2023,
-#   "GP-3" = 2024,
-#   "EF-1" = 2024,
-#   "EF-2" = 2023,
-#   "EF-3" = 2023,
-#   "ND-2" = 2023,
-#   "ND-1" = 2022
-# )
 year_map <- c(
-  "DFA-1" = 2024,
-  "DFA-2" = 2023,
-  "CFA-1" = 2024,
-  "CFA-4" = 2024,
-  "CFA-3" = 2023,
-  "CFA-2" = 2023,
-  "DSB-1" = 2023,
-  "DFB-1" = 2022
+  "GP-1" = 2024,
+  "GP-2" = 2023,
+  "GP-3" = 2024,
+  "EF-1" = 2024,
+  "EF-2" = 2023,
+  "EF-3" = 2023,
+  "ND-2" = 2023,
+  "ND-1" = 2022
 )
+# year_map <- c(
+#   "SP-1" = 2024,
+#   "SP-2" = 2023,
+#   "SP-3" = 2024,
+#   "HF-4" = 2024,
+#   "HF-3" = 2023,
+#   "HF-2" = 2023,
+#   "SA-1" = 2023,
+#   "SA-2" = 2022
+# )
 clustered_dat |>
-  group_by(kg_name) |>
+  group_by(name) |>
   mutate(
     active_network_length_m = active_network_length_m /
       max(active_network_length_m, na.rm = T) *
       100
   ) |>
   ungroup() |>
-  filter(!(kg_name == "CFA-4" & Date == as_date("2024-01-01"))) |>
-  mutate(target_year = year_map[as.character(kg_name)]) |>
+  filter(!(name == "TAL" & Date == as_date("2024-01-01"))) |>
+  mutate(target_year = year_map[as.character(name)]) |>
   filter(year(Date) == target_year) |>
   mutate(
     Date = update(Date, year = 2000),
-    kg_name = paste0(kg_name, " (", target_year, ")")
+    kg_label = paste0(kg_name, " (", target_year, ")")
   ) |>
+  arrange(kg_name) |>
+  mutate(kg_label = factor(kg_label, levels = unique(kg_label))) |>
   ggplot(aes(x = Date)) +
   see::geom_point2(
     aes(y = avgDO.pctsat, color = Cluster),
@@ -3706,10 +3949,11 @@ clustered_dat |>
     alpha = 0.7,
     na.rm = TRUE
   ) +
-  facet_wrap(~kg_name, scales = "fixed", ncol = 2, drop = FALSE) +
+  facet_wrap(~kg_label, scales = "fixed", ncol = 2, drop = FALSE) +
   scale_color_manual(
     values = cluster_colors,
-    name = "State",
+    name = "",
+    labels = c("Oxygenated", "Transitional", "Hypoxic"),
     na.translate = FALSE
   ) +
   scale_x_date(
@@ -3729,11 +3973,12 @@ clustered_dat |>
     strip.text = element_text(face = "bold"),
     axis.text.x = element_text(angle = 45, hjust = 1)
   ) -> p
+p
 ggsave(
   filename = "Average_YEAR_ASDN.png",
   plot = p,
   path = here("Figs/ClusterTimeseries"),
-  device = "png",
+  device = ragg::agg_png,
   width = 40,
   height = 25.4,
   units = "cm",
@@ -3761,7 +4006,7 @@ ggsave(
   filename = "Amplitude.png",
   plot = p,
   path = here("Figs/ClusterTimeseries"),
-  device = "png",
+  device = ragg::agg_png,
   width = 25.4,
   height = 25.4,
   units = "cm",
@@ -3787,7 +4032,7 @@ ggsave(
   filename = "Minimum.png",
   plot = p,
   path = here("Figs/ClusterTimeseries"),
-  device = "png",
+  device = ragg::agg_png,
   width = 25.4,
   height = 25.4,
   units = "cm",
@@ -3813,7 +4058,7 @@ ggsave(
   filename = "Maximum.png",
   plot = p,
   path = here("Figs/ClusterTimeseries"),
-  device = "png",
+  device = ragg::agg_png,
   width = 25.4,
   height = 25.4,
   units = "cm",
@@ -3840,7 +4085,7 @@ ggsave(
   filename = "ExcProb.png",
   plot = p,
   path = here("Figs/ClusterTimeseries"),
-  device = "png",
+  device = ragg::agg_png,
   width = 25.4,
   height = 25.4,
   units = "cm",
@@ -3866,7 +4111,7 @@ ggsave(
   filename = "ProbHyp.png",
   plot = p,
   path = here("Figs/ClusterTimeseries"),
-  device = "png",
+  device = ragg::agg_png,
   width = 25.4,
   height = 25.4,
   units = "cm",
@@ -3878,14 +4123,14 @@ ggsave(
 
 site_colors <- tibble(
   kg_name = c(
-    "DSB-1",
-    "DFB-1",
-    "DFA-1",
-    "DFA-2",
-    "CFA-1",
-    "CFA-2",
-    "CFA-3",
-    "CFA-4"
+    "SA-1",
+    "SA-2",
+    "SP-1",
+    "SP-2",
+    "SP-3",
+    "HF-2",
+    "HF-3",
+    "HF-4"
   ),
   color = c(
     "#006475",
@@ -3900,7 +4145,7 @@ site_colors <- tibble(
 ) |>
   tibble::deframe()
 clustered_dat |>
-  filter(!(kg_name %in% c("DSB-1", "DFB-1"))) |>
+  filter(!(kg_name %in% c("SA-1", "SA-2"))) |>
   group_by(kg_name) |>
   mutate(
     headGradient_scaled = scales::rescale(headGradient_1d, to = c(0, 100))
@@ -3938,7 +4183,7 @@ ggsave(
   filename = "HeadGradient.png",
   plot = p,
   path = here("Figs/ClusterTimeseries"),
-  device = "png",
+  device = ragg::agg_png,
   width = 25.4,
   height = 25.4,
   units = "cm",
@@ -3985,7 +4230,7 @@ ggsave(
   filename = "ActiveUpstreamLength.png",
   plot = p,
   path = here("Figs/ClusterTimeseries"),
-  device = "png",
+  device = ragg::agg_png,
   width = 25.4,
   height = 25.4,
   units = "cm",
@@ -4018,7 +4263,8 @@ clustered_dat |>
   facet_wrap(~kg_name, scales = "fixed", ncol = 1, drop = FALSE) +
   scale_color_manual(
     values = cluster_colors,
-    name = "State",
+    name = "",
+    labels = c("Oxygenated", "Transitional", "Hypoxic"),
     na.translate = FALSE
   ) +
   scale_x_date(
@@ -4044,7 +4290,7 @@ ggsave(
   filename = "ASDN_Timeseries.png",
   plot = p,
   path = here("Figs/ClusterTimeseries"),
-  device = "png",
+  device = ragg::agg_png,
   width = 25.4,
   height = 25.4,
   units = "cm",
@@ -4084,7 +4330,7 @@ ggsave(
   filename = "PercentNetworkWet.png",
   plot = p,
   path = here("Figs/ClusterTimeseries"),
-  device = "png",
+  device = ragg::agg_png,
   width = 25.4,
   height = 25.4,
   units = "cm",
@@ -4124,7 +4370,7 @@ ggsave(
   filename = "PercentNetworkWet_FinalReport.png",
   plot = p,
   path = here("Figs/ClusterTimeseries"),
-  device = "png",
+  device = ragg::agg_png,
   width = 25.4,
   height = 25.4,
   units = "cm",
@@ -4162,7 +4408,7 @@ ggsave(
   filename = "AlphaCentrality.png",
   plot = p,
   path = here("Figs/ClusterTimeseries"),
-  device = "png",
+  device = ragg::agg_png,
   width = 25.4,
   height = 25.4,
   units = "cm",
@@ -4174,7 +4420,7 @@ ggsave(
 
 ```{r}
 site_plot_data <- clustered_dat |>
-  filter(!(kg_name %in% c("DSB-1", "DFB-1"))) |>
+  filter(!(kg_name %in% c("SA-1", "SA-2"))) |>
   select(kg_name, Date, avgDO.pctsat, headGradient_1d, Cluster) |>
   pivot_longer(
     cols = c(avgDO.pctsat, headGradient_1d),
@@ -4290,7 +4536,12 @@ cluster_freq |>
     fill = "black"
   ) +
   facet_wrap(~kg_name, ncol = 3) +
-  scale_fill_manual(values = cluster_colors, name = "Cluster") +
+  scale_fill_manual(
+    values = cluster_colors,
+    name = "State",
+    labels = c("Oxygenated", "Transitional", "Hypoxic"),
+    na.translate = FALSE
+  ) +
   scale_y_continuous(labels = scales::percent) +
   theme_minimal() +
   labs(
@@ -4315,7 +4566,7 @@ ggsave(
   filename = "clusterDist_PercWet.png",
   plot = p,
   path = here("Figs/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 25.4,
   height = 25.4,
   units = "cm",
@@ -4328,7 +4579,12 @@ cluster_freq |>
   ggplot(aes(x = Month, y = count, fill = Cluster)) +
   geom_bar(stat = "identity", position = "fill") +
   facet_wrap(~kg_name, nrow = 2) +
-  scale_fill_manual(values = cluster_colors, name = "Cluster") +
+  scale_fill_manual(
+    values = cluster_colors,
+    name = "State",
+    labels = c("Oxygenated", "Transitional", "Hypoxic"),
+    na.translate = FALSE
+  ) +
   scale_y_continuous(labels = scales::percent, expand = c(0, 0)) +
   theme_minimal() +
   labs(
@@ -4376,7 +4632,12 @@ cluster_freq_plot |>
   ggplot(aes(x = Month, y = count, fill = Cluster)) +
   geom_bar(stat = "identity", position = "fill") +
   facet_wrap(~kg_name, nrow = 2) +
-  scale_fill_manual(values = cluster_colors_plot, name = "State") +
+  scale_fill_manual(
+    values = cluster_colors_plot,
+    name = "",
+    labels = c("Oxygenated", "Transitional", "Hypoxic", "No Data"),
+    na.translate = FALSE
+  ) +
   scale_x_discrete(drop = FALSE) + # keep all months even if still missing
   scale_y_continuous(
     expand = c(0, 0),
@@ -4402,7 +4663,7 @@ ggsave(
   filename = "clusterDist.png",
   plot = p,
   path = here("Figs/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 40,
   height = 20,
   units = "cm",
@@ -5371,7 +5632,7 @@ acf_by_site |>
 ggsave(
   filename = "temporal_autocorr.png",
   path = here("Figs/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 40,
   height = 20,
   units = "cm",
@@ -5406,6 +5667,529 @@ avg_autocorr_length_by_site <- autocorr_length_by_series |>
 # Random Forest
 
 ```{r}
+write_csv(best_lags_data, here("Data/best_lags_rf_data.csv"))
+source(here("Code/Functions/split_density_plot.R"))
+```
+
+## 80/20 Random Split
+
+```{r}
+set.seed(42)
+
+split <- initial_split(best_lags_data, prop = 0.8, strata = Site)
+
+split_long <- best_lags_data |>
+  mutate(
+    Site = factor(Site, levels = site_meta$Site),
+    role = if_else(row_number() %in% split$in_id, "Training", "Testing"),
+    role = factor(role, levels = c("Training", "Testing"))
+  )
+
+ggplot(split_long, aes(x = Date, y = fct_rev(Site), color = role)) +
+  geom_point(shape = 15, size = 2) +
+  scale_color_manual(values = c(Training = "#85898A", Testing = "#0051BA")) +
+  labs(x = NULL, y = NULL, color = NULL, title = "Random 80/20 Split by Site")
+
+ggsave(
+  filename = "rnd_split_by_site.png",
+  path = here("Figs/Supplement/"),
+  device = ragg::agg_png,
+  width = 40,
+  height = 20,
+  units = "cm",
+  dpi = 600
+)
+split_density_plot(split_long, "Random 80/20 Split by Site")
+ggsave(
+  filename = "rnd_split_by_site_dens.png",
+  path = here("Figs/Supplement/"),
+  device = ragg::agg_png,
+  width = 40,
+  height = 20,
+  units = "cm",
+  dpi = 600
+)
+```
+
+## 80/20 Time Split
+
+```{r}
+split_long <- best_lags_data |>
+  group_by(Site) |>
+  mutate(
+    Site = factor(Site, levels = site_meta$Site),
+    cutoff = min(Date) + 0.8 * (max(Date) - min(Date)),
+    role = if_else(percent_rank(row_number()) <= 0.8, "Training", "Testing"),
+    role = factor(role, levels = c("Training", "Testing"))
+  ) |>
+  ungroup()
+
+ggplot(split_long, aes(x = Date, y = fct_rev(Site), color = role)) +
+  geom_point(shape = 15, size = 2) +
+  scale_color_manual(values = c(Training = "#85898A", Testing = "#0051BA")) +
+  labs(x = NULL, y = NULL, color = NULL, title = "80/20 Time Split by Site")
+
+ggsave(
+  filename = "time_split_by_site.png",
+  path = here("Figs/Supplement/"),
+  device = ragg::agg_png,
+  width = 40,
+  height = 20,
+  units = "cm",
+  dpi = 600
+)
+split_density_plot(split_long, "80/20 Time Split by Site")
+ggsave(
+  filename = "time_split_by_site_dens.png",
+  path = here("Figs/Supplement/"),
+  device = ragg::agg_png,
+  width = 40,
+  height = 20,
+  units = "cm",
+  dpi = 600
+)
+```
+
+## Blocked CV by Site
+```{r}
+blocked_cv_by_site <- function(data, site, v = 5) {
+  blocks <- data |>
+    mutate(.row = row_number()) |>
+    group_by({{ site }}) |>
+    mutate(.block = ntile(.row, v)) |>
+    ungroup() |>
+    pull(.block)
+
+  splits <- map(seq_len(v), function(i) {
+    make_splits(
+      list(analysis = which(blocks != i), assessment = which(blocks == i)),
+      data = data
+    )
+  })
+  manual_rset(splits, paste0("Block", seq_len(v)))
+}
+
+folds <- best_lags_data |>
+  mutate(Site = factor(Site, levels = site_meta$Site)) |>
+  arrange(Site, Date) |>
+  blocked_cv_by_site(Site, v = 5)
+
+folds |>
+  mutate(
+    n_assess = map_int(splits, \(s) nrow(assessment(s))),
+    n_sites = map_int(splits, \(s) n_distinct(assessment(s)$Site))
+  )
+
+folds |>
+  mutate(
+    range = map_chr(splits, function(s) {
+      d <- assessment(s)
+      paste(format(range(d$Date)), collapse = " to ")
+    })
+  ) |>
+  select(id, range)
+
+fold_long <- map2(folds$splits, folds$id, function(s, nm) {
+  s$data |>
+    mutate(
+      fold = nm,
+      role = if_else(row_number() %in% complement(s), "Testing", "Training"),
+      role = factor(role, levels = c("Training", "Testing"))
+    )
+}) |>
+  list_rbind()
+
+folds |>
+  mutate(
+    n_train = map_int(splits, \(s) nrow(analysis(s))),
+    n_test = map_int(splits, \(s) nrow(assessment(s))),
+    total = n_train + n_test,
+    pct_train = 100 * n_train / total,
+    pct_test = 100 * n_test / total
+  ) |>
+  select(id, n_train, n_test, pct_train, pct_test)
+
+fold_long |>
+  count(fold, Site, role) |>
+  group_by(fold, Site) |>
+  mutate(pct = 100 * n / sum(n)) |>
+  ungroup() |>
+  filter(role == "Testing") |>
+  select(fold, Site, n_test = n, pct_test = pct) |>
+  pivot_wider(names_from = fold, values_from = c(n_test, pct_test))
+
+ggplot(fold_long, aes(x = Date, y = fct_rev(fold), color = role)) +
+  geom_point(shape = 15, size = 1.2) +
+  facet_wrap(~Site) +
+  scale_color_manual(values = c(Training = "#85898A", Testing = "#0051BA")) +
+  labs(x = NULL, y = NULL, color = NULL, title = "Blocked CV by Site")
+
+ggsave(
+  filename = "blocked_cv_by_site.png",
+  path = here("Figs/Supplement/"),
+  device = ragg::agg_png,
+  width = 40,
+  height = 20,
+  units = "cm",
+  dpi = 600
+)
+
+split_density_plot(fold_long, "Blocked CV by Site", fold_col = "fold")
+ggsave(
+  filename = "blocked_cv_by_site_dens.png",
+  path = here("Figs/Supplement/"),
+  device = ragg::agg_png,
+  width = 40,
+  height = 20,
+  units = "cm",
+  dpi = 600
+)
+# ggplot(fold_long, aes(x = Date, y = fct_rev(Site), color = role)) +
+#   geom_point(shape = 15, size = 2) +
+#   facet_wrap(~fold, ncol = 1, strip.position = "left") +
+#   scale_color_manual(values = c(Training = "#85898A", Testing = "#0051BA")) +
+#   labs(x = NULL, y = NULL, color = NULL)
+```
+
+## LOSO
+
+```{r}
+make_fold_long <- function(folds) {
+  map2(folds$splits, folds$id, function(s, nm) {
+    s$data |>
+      mutate(
+        fold = nm,
+        role = if_else(row_number() %in% complement(s), "Testing", "Training"),
+        role = factor(role, levels = c("Training", "Testing"))
+      )
+  }) |>
+    list_rbind() |>
+    mutate(fold = factor(fold, levels = folds$id))
+}
+
+loso_cv <- function(data, site) {
+  sites <- data |> pull({{ site }})
+  lvls <- levels(factor(sites))
+
+  splits <- map(lvls, function(s) {
+    make_splits(
+      list(analysis = which(sites != s), assessment = which(sites == s)),
+      data = data
+    )
+  })
+  manual_rset(splits, lvls)
+}
+
+loso_folds <- best_lags_data |>
+  mutate(Site = factor(Site, levels = site_meta$Site)) |>
+  arrange(Site, Date) |>
+  loso_cv(Site)
+
+loso_long <- make_fold_long(loso_folds)
+
+loso_folds |>
+  mutate(
+    n_train = map_int(splits, \(s) nrow(analysis(s))),
+    n_test = map_int(splits, \(s) nrow(assessment(s))),
+    pct_test = 100 * n_test / (n_train + n_test)
+  ) |>
+  select(id, n_train, n_test, pct_test)
+
+ggplot(loso_long, aes(x = Date, y = fct_rev(fold), color = role)) +
+  geom_point(shape = 15, size = 1.2) +
+  facet_wrap(~Site) +
+  scale_color_manual(values = c(Training = "#85898A", Testing = "#0051BA")) +
+  labs(x = NULL, y = NULL, color = NULL, title = "Leave-One-Site-Out CV")
+
+ggsave(
+  filename = "loso_cv_by_site.png",
+  path = here("Figs/Supplement/"),
+  device = ragg::agg_png,
+  width = 40,
+  height = 20,
+  units = "cm",
+  dpi = 600
+)
+
+split_density_plot(loso_long, "Leave-One-Site-Out CV", fold_col = "fold")
+
+ggsave(
+  filename = "loso_cv_by_site_dens.png",
+  path = here("Figs/Supplement/"),
+  device = ragg::agg_png,
+  width = 40,
+  height = 20,
+  units = "cm",
+  dpi = 600
+)
+```
+
+## Nested Block & LOSO
+
+```{r}
+loso_blocked_cv <- function(data, site, v = 5) {
+  sites <- data |> pull({{ site }})
+  blocks <- data |>
+    mutate(.row = row_number()) |>
+    group_by({{ site }}) |>
+    mutate(.block = ntile(.row, v)) |>
+    ungroup() |>
+    pull(.block)
+
+  grid <- expand_grid(s = levels(factor(sites)), b = seq_len(v))
+
+  splits <- map2(grid$s, grid$b, function(si, bi) {
+    make_splits(
+      list(
+        analysis = which(sites != si & blocks != bi),
+        assessment = which(sites == si & blocks == bi)
+      ),
+      data = data
+    )
+  })
+  manual_rset(splits, paste0(grid$s, "_Block", grid$b))
+}
+
+loso_blocked_folds <- best_lags_data |>
+  mutate(Site = factor(Site, levels = site_meta$Site)) |>
+  arrange(Site, Date) |>
+  loso_blocked_cv(Site, v = 5)
+
+loso_blocked_long <- make_fold_long(loso_blocked_folds) |>
+  separate_wider_delim(
+    fold,
+    delim = "_",
+    names = c("site_out", "block"),
+    cols_remove = FALSE
+  ) |>
+  mutate(
+    site_out = factor(site_out, levels = site_meta$Site),
+    block = factor(block, levels = paste0("Block", 1:5))
+  )
+
+loso_blocked_folds |>
+  mutate(
+    n_train = map_int(splits, \(s) nrow(analysis(s))),
+    n_test = map_int(splits, \(s) nrow(assessment(s))),
+    pct_test = 100 * n_test / (n_train + n_test)
+  ) |>
+  select(id, n_train, n_test, pct_test) |>
+  print(n = 40)
+
+ggplot(loso_blocked_long, aes(x = Date, y = fct_rev(block), color = role)) +
+  geom_point(shape = 15, size = 1.2) +
+  facet_grid(rows = vars(site_out), cols = vars(Site), switch = "y") +
+  scale_color_manual(values = c(Training = "#85898A", Testing = "#0051BA")) +
+  labs(
+    x = NULL,
+    y = NULL,
+    color = NULL,
+    title = "Leave-One-Site-Out + Blocked CV",
+    subtitle = "Rows: held-out site   Columns: data site"
+  )
+
+ggsave(
+  filename = "loso_blocked_cv_by_site.png",
+  path = here("Figs/Supplement/"),
+  device = ragg::agg_png,
+  width = 50,
+  height = 40,
+  units = "cm",
+  dpi = 600
+)
+
+split_density_plot(
+  loso_blocked_long,
+  "Leave-One-Site-Out + Blocked CV",
+  fold_col = "site_out"
+)
+
+ggsave(
+  filename = "loso_blocked_cv_by_site_dens.png",
+  path = here("Figs/Supplement/"),
+  device = ragg::agg_png,
+  width = 40,
+  height = 40,
+  units = "cm",
+  dpi = 600
+)
+```
+
+## Rolling CV by Site
+
+```{r}
+rolling_cv_by_site <- function(
+  data,
+  site,
+  date,
+  v = 5,
+  cumulative = TRUE,
+  gap = 0
+) {
+  win <- data |>
+    group_by({{ site }}) |>
+    mutate(
+      .win = cut(
+        as.numeric({{ date }}),
+        breaks = seq(
+          min(as.numeric({{ date }})),
+          max(as.numeric({{ date }})),
+          length.out = v + 2
+        ),
+        include.lowest = TRUE,
+        labels = FALSE
+      )
+    ) |>
+    ungroup() |>
+    pull(.win)
+
+  splits <- map(seq_len(v), function(i) {
+    test <- which(win == i + 1)
+    train <- if (cumulative) {
+      which(win <= i - gap)
+    } else {
+      which(win == i - gap)
+    }
+    make_splits(list(analysis = train, assessment = test), data = data)
+  })
+  manual_rset(splits, paste0("Fold", seq_len(v)))
+}
+
+folds <- best_lags_data |>
+  mutate(Site = factor(Site, levels = site_meta$Site)) |>
+  arrange(Site, Date) |>
+  rolling_cv_by_site(Site, Date, v = 5)
+
+fold_long <- map2(folds$splits, folds$id, function(s, nm) {
+  s$data |>
+    mutate(
+      fold = nm,
+      role = if_else(row_number() %in% complement(s), "Testing", "Training"),
+      role = factor(role, levels = c("Training", "Testing"))
+    )
+}) |>
+  list_rbind()
+
+folds |>
+  mutate(
+    n_train = map_int(splits, \(s) nrow(analysis(s))),
+    n_test = map_int(splits, \(s) nrow(assessment(s))),
+    total = n_train + n_test,
+    pct_train = 100 * n_train / total,
+    pct_test = 100 * n_test / total
+  ) |>
+  select(id, n_train, n_test, pct_train, pct_test)
+
+fold_long |>
+  count(fold, Site, role) |>
+  group_by(fold, Site) |>
+  mutate(pct = 100 * n / sum(n)) |>
+  ungroup() |>
+  filter(role == "Testing") |>
+  select(fold, Site, n_test = n, pct_test = pct) |>
+  pivot_wider(names_from = fold, values_from = c(n_test, pct_test))
+
+ggplot(fold_long, aes(x = Date, y = fct_rev(fold), color = role)) +
+  geom_point(shape = 15, size = 1.2) +
+  facet_wrap(~Site) +
+  scale_color_manual(values = c(Training = "#85898A", Testing = "#0051BA")) +
+  labs(x = NULL, y = NULL, color = NULL, title = "Rolling CV by Site")
+
+ggsave(
+  filename = "rolling_cv_by_site.png",
+  path = here("Figs/Supplement/"),
+  device = ragg::agg_png,
+  width = 40,
+  height = 20,
+  units = "cm",
+  dpi = 600
+)
+
+split_density_plot(fold_long, "Rolling CV by Site", fold_col = "fold")
+ggsave(
+  filename = "rolling_cv_by_site_dens.png",
+  path = here("Figs/Supplement/"),
+  device = ragg::agg_png,
+  width = 40,
+  height = 20,
+  units = "cm",
+  dpi = 600
+)
+
+ggplot(fold_long, aes(x = Date, y = fct_rev(Site), color = role)) +
+  geom_point(shape = 15, size = 2) +
+  facet_wrap(~fold, ncol = 1, strip.position = "left") +
+  scale_color_manual(values = c(Training = "#85898A", Testing = "#0051BA")) +
+  labs(x = NULL, y = NULL, color = NULL)
+```
+
+## Rolling CV
+
+```{r}
+rolling_cv <- function(
+  data,
+  lookback = Inf,
+  assess_stop = 5,
+  step = 5,
+  skip = 14
+) {
+  data |>
+    arrange(Date) |>
+    sliding_period(
+      index = Date,
+      period = "month",
+      lookback = lookback,
+      assess_stop = assess_stop,
+      step = step,
+      skip = skip,
+      complete = TRUE
+    )
+}
+
+folds <- best_lags_data |>
+  rolling_cv()
+
+folds <- manual_rset(folds$splits, paste0("Fold", seq_along(folds$splits)))
+
+
+fold_long <- map2(folds$splits, folds$id, function(s, nm) {
+  s$data |>
+    mutate(
+      fold = nm,
+      role = if_else(row_number() %in% complement(s), "Testing", "Training"),
+      role = factor(role, levels = c("Training", "Testing"))
+    )
+}) |>
+  list_rbind()
+
+folds |>
+  mutate(
+    n_train = map_int(splits, \(s) nrow(analysis(s))),
+    n_test = map_int(splits, \(s) nrow(assessment(s))),
+    total = n_train + n_test,
+    pct_train = 100 * n_train / total,
+    pct_test = 100 * n_test / total
+  ) |>
+  select(id, n_train, n_test, pct_train, pct_test)
+
+fold_long |>
+  count(fold, Site, role) |>
+  group_by(fold, Site) |>
+  mutate(pct = 100 * n / sum(n)) |>
+  ungroup() |>
+  filter(role == "Testing") |>
+  select(fold, Site, n_test = n, pct_test = pct) |>
+  pivot_wider(names_from = fold, values_from = c(n_test, pct_test))
+
+ggplot(fold_long, aes(x = Date, y = fct_rev(fold), color = role)) +
+  geom_point(shape = 15, size = 1.2) +
+  facet_wrap(~Site) +
+  scale_color_manual(values = c(Training = "#85898A", Testing = "#0051BA")) +
+  labs(x = NULL, y = NULL, color = NULL, title = "Rolling CV")
+```
+
+
+```{r}
 source(here("Code/Functions/rf_testing.R"))
 
 rf_lagged_mod <- fit_full_model_new(
@@ -5418,7 +6202,8 @@ rf_lagged_mod <- fit_full_model_new(
 fitted_model <- extract_fit_parsnip(rf_lagged_mod$final_fit)$fit
 train_data <- rf_lagged_mod$train_data
 test_data <- rf_lagged_mod$test_data
-selected_vars <- rf_lagged_mod$selected_vars
+selected_vars <- rf_lagged_mod$selected_vars |>
+  write_tsv(here("Results/rf/best_lag_rounded_scaled_selected_vars.tsv"))
 tune_res <- rf_lagged_mod$tune_results
 best_params <- rf_lagged_mod$best_params
 
@@ -5450,74 +6235,6 @@ train_data |>
   ggplot(aes(value, fill = Cluster)) +
   geom_density(alpha = 0.4) +
   facet_wrap(~name, scales = "free")
-
-set.seed(42)
-random_split <- initial_split(
-  best_lags_data |> select(all_of(selected_vars)),
-  prop = 0.8
-)
-random_train <- training(random_split)
-random_test <- testing(random_split)
-
-tb_split_plt <- train_data |>
-  mutate(source = "Train") |>
-  bind_rows(test_data |> mutate(source = "Test")) |>
-  select(source, all_of(selected_vars)) |>
-  pivot_longer(-source, names_to = "variable", values_to = "value") |>
-  mutate(
-    variable = case_when(
-      variable %in% names(var_names) ~ var_names[variable],
-      TRUE ~ variable # Keep original if not found in var_names
-    )
-  ) |>
-  ggplot(aes(x = value, fill = source)) +
-  geom_density(alpha = 0.5, na.rm = TRUE) +
-  facet_wrap(~variable, scales = "free") +
-  labs(title = "Time Block Split") +
-  scale_fill_manual(values = c(Train = "#CB7223", Test = "#289A84")) +
-  theme(legend.title = element_blank())
-
-
-rnd_split_plt <- random_train |>
-  mutate(source = "Train") |>
-  bind_rows(random_test |> mutate(source = "Test")) |>
-  select(source, where(is.numeric)) |>
-  pivot_longer(-source, names_to = "variable", values_to = "value") |>
-  mutate(
-    variable = case_when(
-      variable %in% names(var_names) ~ var_names[variable],
-      TRUE ~ variable # Keep original if not found in var_names
-    )
-  ) |>
-  ggplot(aes(x = value, fill = source)) +
-  geom_density(alpha = 0.5, na.rm = TRUE) +
-  facet_wrap(~variable, scales = "free") +
-  labs(title = "Random 80/20 split") +
-  scale_fill_manual(values = c(Train = "#CB7223", Test = "#289A84")) +
-  theme(legend.title = element_blank())
-
-tb_split_plt
-rnd_split_plt
-ggsave(
-  filename = "tb_split_plt.png",
-  plot = tb_split_plt,
-  path = here("Figs/Supplement/"),
-  device = "png",
-  width = 40,
-  height = 20,
-  units = "cm",
-  dpi = 600
-)
-ggsave(
-  filename = "rnd_split_plt.png",
-  plot = rnd_split_plt,
-  path = here("Figs/Supplement/"),
-  device = "png",
-  width = 40,
-  height = 20,
-  units = "cm",
-  dpi = 600
-)
 ```
 
 
@@ -5819,7 +6536,7 @@ ggsave(
   filename = "rounded_lags_cluster_var_prop.png",
   plot = cluster_var_prop,
   path = here("Figs/RF_Models/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 40,
   height = 20,
   units = "cm",
@@ -5935,7 +6652,7 @@ ggsave(
   filename = "rounded_lags_region_shap.png",
   plot = region_cluster_var_imp,
   path = here("Figs/RF_Models/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 40,
   height = 20,
   units = "cm",
@@ -6057,7 +6774,7 @@ ggsave(
   filename = "shap_beeswarm.png",
   plot = shap_bee,
   path = here("Figs/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 45,
   height = 25,
   units = "cm",
@@ -6104,7 +6821,7 @@ ggsave(
   filename = "shap_beeswarm_region.png",
   plot = shap_bee_region,
   path = here("Figs/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 45,
   height = 40, # taller to fit region rows
   units = "cm",
@@ -6228,7 +6945,7 @@ ggsave(
   filename = "rounded_lags_shap_confmat.png",
   plot = shap_conf,
   path = here("Figs/RF_Models/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 40,
   height = 20,
   units = "cm",
@@ -6239,7 +6956,7 @@ ggsave(
   filename = "conf_mat.png",
   plot = conf_mat_plt,
   path = here("Figs/RF_Models/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 20,
   height = 20,
   units = "cm",
@@ -6316,7 +7033,7 @@ ggsave(
   filename = "conf_mat_loso.png",
   plot = conf_mat_loso_plt,
   path = here("Figs/RF_Models/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 20,
   height = 20,
   units = "cm",
@@ -6532,7 +7249,7 @@ ggsave(
   filename = "ale_plt.png",
   plot = ale_plt,
   here("Figs/"),
-  device = "png",
+  device = ragg::agg_png,
   width = 40,
   height = 20,
   units = "cm",

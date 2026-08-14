@@ -1,0 +1,130 @@
+---
+title: "Untitled"
+format: html
+---
+
+# Setup
+```{r}
+#| label: Load Libraries
+library(tidyverse)
+library(here)
+library(tidymodels)
+
+source(here("Code/Functions/blocked_cv_by_site.R"))
+source(here("Code/Functions/split_density_plot.R"))
+```
+
+```{r}
+#| label: Set Theme
+theme_set(
+  theme_bw() +
+    theme(
+      text = element_text(size = 20), # overall text size
+      legend.text = element_text(size = 20), # legend entries
+      legend.title = element_text(size = 20), # legend title
+      axis.title.x = element_text(size = 20, face = "bold"), # axis titles
+      axis.title.y = element_text(size = 20, face = "bold"), # axis titles
+      axis.text = element_text(size = 20), # axis tick labels
+      plot.title = element_text(size = 20, hjust = 0.5, face = "bold"),
+      legend.position = "bottom",
+      plot.tag = element_text(size = 20, face = "bold"),
+      strip.background = element_blank()
+    )
+)
+```
+
+# Load RF Data
+```{r}
+site_meta <- read_csv(here("Data/site_meta.csv")) |>
+  arrange(lon) |>
+  mutate(
+    Site = fct_reorder(Site, lon),
+    name = fct_reorder(name, lon),
+    kg_name = fct_reorder(kg_name, lon)
+  ) |>
+  relocate(Site, name, kg_name)
+
+rf_data <- read_csv(here("Data/best_lags_rf_data.csv")) |>
+  relocate(Site, name, kg_name, Date, Cluster)
+```
+
+# Blocked CV by Site
+```{r}
+#| label: Blocked CV
+
+folds <- rf_data |>
+  mutate(Site = factor(Site, levels = site_meta$Site)) |>
+  arrange(Site, Date) |>
+  blocked_cv_by_site(Site, v = 5)
+
+folds |>
+  mutate(
+    n_assess = map_int(splits, \(s) nrow(assessment(s))),
+    n_sites = map_int(splits, \(s) n_distinct(assessment(s)$Site))
+  )
+
+folds |>
+  mutate(
+    range = map_chr(splits, function(s) {
+      d <- assessment(s)
+      paste(format(range(d$Date)), collapse = " to ")
+    })
+  ) |>
+  select(id, range)
+
+fold_long <- map2(folds$splits, folds$id, function(s, nm) {
+  s$data |>
+    mutate(
+      fold = nm,
+      role = if_else(row_number() %in% complement(s), "Testing", "Training"),
+      role = factor(role, levels = c("Training", "Testing"))
+    )
+}) |>
+  list_rbind()
+
+folds |>
+  mutate(
+    n_train = map_int(splits, \(s) nrow(analysis(s))),
+    n_test = map_int(splits, \(s) nrow(assessment(s))),
+    total = n_train + n_test,
+    pct_train = 100 * n_train / total,
+    pct_test = 100 * n_test / total
+  ) |>
+  select(id, n_train, n_test, pct_train, pct_test)
+
+fold_long |>
+  count(fold, Site, role) |>
+  group_by(fold, Site) |>
+  mutate(pct = 100 * n / sum(n)) |>
+  ungroup() |>
+  filter(role == "Testing") |>
+  select(fold, Site, n_test = n, pct_test = pct) |>
+  pivot_wider(names_from = fold, values_from = c(n_test, pct_test))
+
+ggplot(fold_long, aes(x = Date, y = fct_rev(fold), color = role)) +
+  geom_point(shape = 15, size = 1.2) +
+  facet_wrap(~Site) +
+  scale_color_manual(values = c(Training = "#85898A", Testing = "#0051BA")) +
+  labs(x = NULL, y = NULL, color = NULL, title = "Blocked CV by Site")
+
+ggsave(
+  filename = "blocked_cv_by_site.png",
+  path = here("Figs/Supplement/"),
+  device = "png",
+  width = 40,
+  height = 20,
+  units = "cm",
+  dpi = 600
+)
+
+split_density_plot(fold_long, "Blocked CV by Site", fold_col = "fold")
+ggsave(
+  filename = "blocked_cv_by_site_dens.png",
+  path = here("Figs/Supplement/"),
+  device = "png",
+  width = 40,
+  height = 20,
+  units = "cm",
+  dpi = 600
+)
+```
